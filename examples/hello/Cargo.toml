@@ -1,0 +1,18 @@
+[package]
+name = "hello-example"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Minimal sutegi app: core only (no orm/ai/queue/derive), smallest binary."
+publish = false
+
+[[bin]]
+name = "hello"
+path = "src/main.rs"
+
+[dependencies]
+# Core only — proves you can compile away every optional pillar.
+sutegi = { path = "../../crates/sutegi", default-features = false, features = ["graceful"] }

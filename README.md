@@ -56,6 +56,81 @@ fn main() -> std::io::Result<()> {
 | `sutegi`      | Facade crate + `prelude`. |
 | `sutegi-cli`  | The `sutegi` command: scaffold apps/models/routes, `introspect` a live app. |
 
+## Compile only what you ship
+
+Only `sutegi-json` + `sutegi-http` + `sutegi-web` are always present. Every other
+pillar is an opt-in feature on the `sutegi` facade, so the binary carries exactly
+what you use:
+
+| Feature | Default? | Pulls in |
+|---------|:--------:|----------|
+| `orm`      | ✓ | schema + query builder + migrations |
+| `derive`   | ✓ | `#[derive(Model)]` (build-time syn/quote only) |
+| `validate` | ✓ | request / tool validation |
+| `ai`       | ✓ | `Tool`/`StreamTool` + `/__tools` |
+| `queue`    | ✓ | background jobs |
+| `sqlite`   |   | bundled, runnable SQLite execution |
+| `graceful` |   | SIGTERM/SIGINT draining (libc) |
+
+```toml
+# Minimal HTTP service — core only:
+sutegi = { version = "*", default-features = false }
+# Just routing + SQLite ORM:
+sutegi = { version = "*", default-features = false, features = ["sqlite"] }
+```
+
+Measured: the core-only `hello` example is **~362 KB**; the full `todo` example
+(every pillar + bundled SQLite) is **~1.28 MB**.
+
+## Running at scale (pods)
+
+Built-in operational endpoints (always on, no feature needed):
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /__health`  | liveness — always 200 while the process is up |
+| `GET /__ready`   | readiness — 200/503 from your `App::readiness(...)` probe |
+| `GET /__metrics` | Prometheus text (requests total, in-flight, by status class) |
+| `GET /__introspect` | full app surface (routes/models/tools/endpoints) |
+
+```rust
+App::new("api")
+    .workers(env_or("WORKERS", "8").parse().unwrap_or(8))   // 12-factor config
+    .readiness(move || db.lock().unwrap().query("SELECT 1", &[]).is_ok())
+    .get("/", "health", |_, _| text(200, "ok"))
+    .run_graceful("0.0.0.0:8080")?;   // SIGTERM → stop accepting → drain in-flight
+```
+
+`run_graceful` (the `graceful` feature) traps SIGTERM/SIGINT, stops accepting new
+connections, and lets in-flight requests finish before exit — exactly what a
+Kubernetes rolling update needs. (`run_until(addr, flag)` gives you manual
+control without the signal feature.)
+
+**Honest caveat on state.** The request/route/AI surface is stateless and scales
+horizontally today. But the in-process queue and (in-memory/file) SQLite are
+**per-pod** — a job dispatched on one pod runs there; a todo written on one pod
+isn't on another. For shared state across pods, point at a shared volume, or wait
+for the planned network-DB (Postgres) + durable-queue drivers.
+
+## Sail — local multi-instance dev
+
+A Laravel-Sail-style harness wraps Docker Compose so you run the same
+horizontally-scaled shape locally: N app replicas behind an nginx load balancer
+(configured `proxy_buffering off`, so SSE streams pass straight through).
+
+```bash
+./sail up 3            # build + 3 app replicas + LB on http://localhost:8080
+./sail curl /api/todos
+./sail logs
+./sail down
+./sail k8s apply       # or apply the Kubernetes manifests (deploy/k8s/)
+```
+
+`deploy/k8s/deployment.yaml` shows the production shape: 3 replicas, liveness/
+readiness probes on the built-ins, `terminationGracePeriodSeconds` + a `preStop`
+hook for clean draining, Prometheus scrape annotations, and small resource asks
+(the binary is tiny, so `requests: 32Mi`).
+
 ## The agent contract
 
 A sutegi app is drivable by an LLM with no source access and no integration code:
@@ -235,8 +310,10 @@ Early but increasingly capable. Typed models (`#[derive(Model)]`), a runnable
 SQLite ORM (opt-in `sqlite`), validation (requests + AI tool args), route groups
 + middleware, route-model binding, and a background job queue all work and are
 exercised by the `todo` example. Streaming responses (SSE + raw) and streaming
-AI tools are supported. HTTP is 1.1, connection-per-request, no TLS. Next:
-form-encoded bodies, keep-alive, a durable (SQLite-backed) queue driver,
-relations/joins in the query builder.
+AI tools are supported. Every pillar is an opt-in compile feature; the runtime
+ships health/readiness/metrics endpoints and graceful shutdown for pods, with a
+Sail-style Docker/k8s harness. HTTP is 1.1, connection-per-request, no TLS. Next:
+network DB (Postgres) + durable queue driver for true cross-pod state,
+form-encoded bodies, keep-alive, relations/joins in the query builder.
 
 MIT © 2026 Eneko Sarasola

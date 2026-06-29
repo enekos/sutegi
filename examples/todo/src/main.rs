@@ -122,6 +122,7 @@ fn main() -> std::io::Result<()> {
     let list_db = Arc::clone(&db);
     let show_db = Arc::clone(&db);
     let create_db = Arc::clone(&db);
+    let ready_db = Arc::clone(&db);
     let create_queue = Arc::clone(&queue);
     let stats_queue = Arc::clone(&queue);
 
@@ -132,6 +133,14 @@ fn main() -> std::io::Result<()> {
     });
 
     let app = App::new("todo-demo")
+        .workers(sutegi::env_or("WORKERS", "8").parse().unwrap_or(8))
+        // Readiness gates pod traffic on a live DB connection.
+        .readiness(move || {
+            ready_db
+                .lock()
+                .map(|db| db.query("SELECT 1", &[]).is_ok())
+                .unwrap_or(false)
+        })
         .register_model(sutegi::orm::schema_json(&Todo::schema()))
         .get("/", "Health check.", |_req, _p| text(200, "sutegi up"))
         .get("/__queue", "Background queue stats.", move |_req, _p| {
@@ -203,11 +212,13 @@ fn main() -> std::io::Result<()> {
             .add_stream(StreamAnswer),
     );
 
-    let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:8080".to_string());
+    // 12-factor config: bind 0.0.0.0 in a container; argv[1] still overrides.
+    let addr = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| format!("{}:{}", sutegi::env_or("HOST", "0.0.0.0"), sutegi::env_or("PORT", "8080")));
     println!("sutegi todo-demo on http://{addr}");
-    println!("  GET  /__introspect | /__tools | /__queue");
-    println!("  GET  /stream                       — SSE demo");
-    println!("  POST /__tools/stream_answer/stream  — streaming AI tool (SSE)");
-    println!("  /api/todos (GET, POST), /api/todos/:id (GET, route-model binding)");
-    app.run(&addr)
+    println!("  ops:  /__health | /__ready | /__metrics | /__introspect");
+    println!("  app:  /api/todos (GET, POST), /api/todos/:id, /stream, /__tools[/...]");
+    // Graceful shutdown: SIGTERM (pod stop) drains in-flight requests.
+    app.run_graceful(&addr)
 }

@@ -9,19 +9,30 @@ authors.workspace = true
 description = "sutegi — a zero-dependency, agent-native web framework for Rust. The forge."
 
 [dependencies]
+# --- core (always compiled): HTTP server, routing, JSON ---
 sutegi-json = { path = "../sutegi-json" }
 sutegi-http = { path = "../sutegi-http" }
 sutegi-web = { path = "../sutegi-web" }
-sutegi-orm = { path = "../sutegi-orm" }
-sutegi-validate = { path = "../sutegi-validate" }
-sutegi-queue = { path = "../sutegi-queue" }
-sutegi-ai = { path = "../sutegi-ai" }
+# --- optional pillars: pulled in only by their feature ---
+sutegi-orm = { path = "../sutegi-orm", optional = true }
+sutegi-validate = { path = "../sutegi-validate", optional = true }
+sutegi-queue = { path = "../sutegi-queue", optional = true }
+sutegi-ai = { path = "../sutegi-ai", optional = true }
 sutegi-macros = { path = "../sutegi-macros", optional = true }
 
 [features]
-default = ["derive"]
-# `#[derive(Model)]`. The macro's build-time deps (syn/quote) never reach your
-# binary; disable with `default-features = false` if you want to skip them.
-derive = ["dep:sutegi-macros"]
-# Opt in to the runnable, bundled SQLite execution layer in sutegi-orm.
-sqlite = ["sutegi-orm/sqlite"]
+# Batteries-included by default; opt out with `default-features = false` and
+# add back only what you need to shrink the binary.
+default = ["derive", "orm", "validate", "ai", "queue"]
+
+# Each pillar is an independent compile-time feature.
+orm = ["dep:sutegi-orm"]                                  # schema + query builder
+validate = ["dep:sutegi-validate"]                        # request / tool validation
+queue = ["dep:sutegi-queue"]                              # background jobs
+ai = ["dep:sutegi-ai", "validate"]                        # Tool/StreamTool + /__tools
+derive = ["dep:sutegi-macros", "orm"]                     # #[derive(Model)]
+sqlite = ["orm", "sutegi-orm/sqlite"]                     # runnable bundled SQLite
+graceful = ["sutegi-web/graceful"]                        # SIGTERM/SIGINT draining
+
+[package.metadata.docs.rs]
+all-features = true

@@ -8,6 +8,7 @@
 //! what the app can do without ever reading the source.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub use sutegi_http::{Body, Method, Request, Response, SseSink, StreamSink};
@@ -53,6 +54,56 @@ pub struct App {
     models: Vec<Json>,
     tools: Vec<Json>,
     workers: usize,
+    readiness: Option<Box<dyn Fn() -> bool + Send + Sync + 'static>>,
+}
+
+/// Process-wide request counters, exposed at `/__metrics` in Prometheus text
+/// format for pod scraping.
+#[derive(Default)]
+struct Metrics {
+    total: AtomicU64,
+    in_flight: AtomicI64,
+    c2xx: AtomicU64,
+    c4xx: AtomicU64,
+    c5xx: AtomicU64,
+    other: AtomicU64,
+}
+
+impl Metrics {
+    fn record(&self, status: u16) {
+        self.total.fetch_add(1, Ordering::Relaxed);
+        let bucket = match status / 100 {
+            2 => &self.c2xx,
+            4 => &self.c4xx,
+            5 => &self.c5xx,
+            _ => &self.other,
+        };
+        bucket.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn prometheus(&self) -> String {
+        let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        format!(
+            "# HELP sutegi_requests_total Total HTTP requests handled.\n\
+             # TYPE sutegi_requests_total counter\n\
+             sutegi_requests_total {}\n\
+             # HELP sutegi_requests_in_flight Requests currently being handled.\n\
+             # TYPE sutegi_requests_in_flight gauge\n\
+             sutegi_requests_in_flight {}\n\
+             # HELP sutegi_responses_total Responses by status class.\n\
+             # TYPE sutegi_responses_total counter\n\
+             sutegi_responses_total{{class=\"2xx\"}} {}\n\
+             sutegi_responses_total{{class=\"4xx\"}} {}\n\
+             sutegi_responses_total{{class=\"5xx\"}} {}\n\
+             sutegi_responses_total{{class=\"other\"}} {}\n",
+            load(&self.total),
+            self.in_flight.load(Ordering::Relaxed),
+            load(&self.c2xx),
+            load(&self.c4xx),
+            load(&self.c5xx),
+            load(&self.other),
+        )
+    }
 }
 
 impl App {
@@ -64,12 +115,21 @@ impl App {
             models: Vec::new(),
             tools: Vec::new(),
             workers: 8,
+            readiness: None,
         }
     }
 
     /// Set the worker thread count (default 8).
     pub fn workers(mut self, n: usize) -> App {
         self.workers = n;
+        self
+    }
+
+    /// Register a readiness probe used by `GET /__ready` (returns 503 when it
+    /// yields `false`). Use it to gate traffic on dependencies — e.g. a live DB
+    /// connection — so Kubernetes won't route to a pod that isn't ready.
+    pub fn readiness(mut self, check: impl Fn() -> bool + Send + Sync + 'static) -> App {
+        self.readiness = Some(Box::new(check));
         self
     }
 
@@ -181,46 +241,128 @@ impl App {
             ("routes", Json::arr(routes)),
             ("models", Json::arr(self.models.clone())),
             ("tools", Json::arr(self.tools.clone())),
+            (
+                "endpoints",
+                Json::obj(vec![
+                    ("introspect", Json::str("/__introspect")),
+                    ("health", Json::str("/__health")),
+                    ("ready", Json::str("/__ready")),
+                    ("metrics", Json::str("/__metrics")),
+                ]),
+            ),
         ])
     }
 
-    /// Bind to `addr` and serve forever.
-    pub fn run(self, addr: &str) -> std::io::Result<()> {
-        // Freeze the introspection document and move everything into the handler.
+    /// Build the request service closure (shared by every `run*` variant).
+    fn into_service(self) -> (usize, impl Fn(Request) -> Response + Send + Sync + 'static) {
         let introspect = self.introspection();
         let routes = Arc::new(self.routes);
         let middleware = Arc::new(self.middleware);
+        let readiness = Arc::new(self.readiness);
+        let metrics = Arc::new(Metrics::default());
         let workers = self.workers;
 
-        sutegi_http::serve(addr, workers, move |req| {
-            // 1. Middleware chain — first responder wins.
-            for mw in middleware.iter() {
-                if let Some(resp) = mw(&req) {
-                    return resp;
+        let service = move |req: Request| -> Response {
+            metrics.in_flight.fetch_add(1, Ordering::Relaxed);
+
+            // Inner closure so we can post-process (record metrics) on every path.
+            let resp = (|| {
+                // Operational endpoints first — pods hit these constantly.
+                match req.path.as_str() {
+                    "/__health" => return json(200, &Json::obj(vec![("status", Json::str("ok"))])),
+                    "/__ready" => {
+                        let ready = readiness.as_ref().as_ref().map(|f| f()).unwrap_or(true);
+                        let body = Json::obj(vec![("status", Json::str(if ready { "ready" } else { "not ready" }))]);
+                        return json(if ready { 200 } else { 503 }, &body);
+                    }
+                    "/__metrics" => {
+                        return Response::new(200)
+                            .with_header("content-type", "text/plain; version=0.0.4")
+                            .with_body(metrics.prometheus().into_bytes());
+                    }
+                    "/__introspect" => return json(200, &introspect),
+                    _ => {}
                 }
-            }
 
-            // 2. Built-in introspection endpoint.
-            if req.path == "/__introspect" {
-                return json(200, &introspect);
-            }
-
-            // 3. Route table (run group-scoped middleware before the handler).
-            if let Some((route, params)) = match_route(&routes, req.method, &req.path) {
-                for mw in &route.middleware {
+                // Global middleware chain — first responder wins.
+                for mw in middleware.iter() {
                     if let Some(resp) = mw(&req) {
                         return resp;
                     }
                 }
-                return (route.handler)(&req, &params);
-            }
 
-            // 4. Distinguish "no such path" from "wrong method".
-            if routes.iter().any(|r| match_pattern(&r.pattern, &req.path).is_some()) {
-                return text(405, "405 Method Not Allowed");
-            }
-            not_found()
-        })
+                // Route table (run group-scoped middleware before the handler).
+                if let Some((route, params)) = match_route(&routes, req.method, &req.path) {
+                    for mw in &route.middleware {
+                        if let Some(resp) = mw(&req) {
+                            return resp;
+                        }
+                    }
+                    return (route.handler)(&req, &params);
+                }
+
+                // Distinguish "no such path" from "wrong method".
+                if routes.iter().any(|r| match_pattern(&r.pattern, &req.path).is_some()) {
+                    return text(405, "405 Method Not Allowed");
+                }
+                not_found()
+            })();
+
+            metrics.record(resp.status);
+            metrics.in_flight.fetch_sub(1, Ordering::Relaxed);
+            resp
+        };
+
+        (workers, service)
+    }
+
+    /// Bind to `addr` and serve forever.
+    pub fn run(self, addr: &str) -> std::io::Result<()> {
+        let (workers, service) = self.into_service();
+        sutegi_http::serve(addr, workers, service)
+    }
+
+    /// Serve until `shutdown` is set, then drain in-flight requests and return.
+    /// Flip the flag from a signal handler (see [`App::run_graceful`]) or your
+    /// own logic for zero-drop rolling deploys.
+    pub fn run_until(self, addr: &str, shutdown: Arc<AtomicBool>) -> std::io::Result<()> {
+        let (workers, service) = self.into_service();
+        sutegi_http::serve_until(addr, workers, service, shutdown)
+    }
+
+    /// Serve until SIGTERM/SIGINT (what Kubernetes sends on pod termination),
+    /// then gracefully drain. Requires the `graceful` feature.
+    #[cfg(feature = "graceful")]
+    pub fn run_graceful(self, addr: &str) -> std::io::Result<()> {
+        let flag = Arc::new(AtomicBool::new(false));
+        crate::signal::install(Arc::clone(&flag));
+        self.run_until(addr, flag)
+    }
+}
+
+/// SIGTERM/SIGINT handling for graceful shutdown (only with the `graceful` feature).
+#[cfg(feature = "graceful")]
+mod signal {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, OnceLock};
+
+    static FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+    extern "C" fn on_signal(_sig: libc::c_int) {
+        // Signal-handler-safe: only an atomic store on an already-published Arc.
+        if let Some(flag) = FLAG.get() {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+
+    pub fn install(flag: Arc<AtomicBool>) {
+        let _ = FLAG.set(flag);
+        // SAFETY: registering a handler that only does an atomic store.
+        let handler = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        unsafe {
+            libc::signal(libc::SIGTERM, handler);
+            libc::signal(libc::SIGINT, handler);
+        }
     }
 }
 

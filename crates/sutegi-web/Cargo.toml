@@ -11,3 +11,9 @@ description = "Router, App builder, middleware, extractors, and runtime introspe
 [dependencies]
 sutegi-http = { path = "../sutegi-http" }
 sutegi-json = { path = "../sutegi-json" }
+# Only pulled in by the `graceful` feature, for SIGTERM/SIGINT handling.
+libc = { version = "0.2", optional = true }
+
+[features]
+# Install OS signal handlers (SIGTERM/SIGINT) for graceful shutdown in pods.
+graceful = ["dep:libc"]

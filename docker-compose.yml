@@ -1,0 +1,40 @@
+# sutegi Sail — local multi-instance dev. Bring it up with `./sail up`, which
+# scales the app to several replicas behind an nginx load balancer so you can
+# exercise the same horizontal-scaling shape you'd run in production.
+#
+#   ./sail up            # build + start (3 app replicas + lb on :8080)
+#   ./sail logs          # tail logs
+#   ./sail curl /api/todos
+#   ./sail down
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+      args:
+        APP: ${APP:-todo}
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8080"
+      WORKERS: "8"
+      DATABASE_PATH: ${DATABASE_PATH:-:memory:}
+    expose:
+      - "8080"
+    # Give the SIGTERM drain time to finish in-flight requests.
+    stop_grace_period: 30s
+
+  lb:
+    image: nginx:alpine
+    depends_on:
+      - app
+    ports:
+      - "8080:80"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
+
+# NOTE: state is per-replica. The in-process queue and (in-memory/file) SQLite
+# live inside each container, so a todo created on replica A is not visible on
+# replica B. For shared state across replicas/pods, point DATABASE_PATH at a
+# shared volume, or wait for the planned network-DB (Postgres) + durable-queue
+# drivers. The request/route/AI surface itself is fully stateless and scales now.

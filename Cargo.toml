@@ -12,6 +12,7 @@ members = [
     "crates/sutegi",
     "crates/sutegi-cli",
     "examples/todo",
+    "examples/hello",
 ]
 
 [workspace.package]

@@ -1,0 +1,64 @@
+# Multi-pod deployment for a sutegi app. Demonstrates the production shape:
+# 3 replicas, liveness/readiness probes against the built-in endpoints,
+# graceful drain on SIGTERM, Prometheus scrape annotations, and modest
+# resource asks (the binary is tiny, so requests can be small).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sutegi-todo
+  labels:
+    app: sutegi-todo
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: sutegi-todo
+  template:
+    metadata:
+      labels:
+        app: sutegi-todo
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /__metrics
+        prometheus.io/port: "8080"
+    spec:
+      # Allow in-flight requests to drain before SIGKILL.
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: app
+          image: sutegi-todo:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          env:
+            - { name: HOST, value: "0.0.0.0" }
+            - { name: PORT, value: "8080" }
+            - { name: WORKERS, value: "8" }
+          livenessProbe:
+            httpGet: { path: /__health, port: 8080 }
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /__ready, port: 8080 }
+            periodSeconds: 5
+            failureThreshold: 2
+          lifecycle:
+            preStop:
+              # Give the Service time to deregister this pod before we drain,
+              # so no new traffic arrives during shutdown.
+              exec:
+                command: ["sleep", "5"]
+          resources:
+            requests: { cpu: "50m", memory: "32Mi" }
+            limits: { cpu: "500m", memory: "128Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sutegi-todo
+spec:
+  selector:
+    app: sutegi-todo
+  ports:
+    - port: 80
+      targetPort: 8080

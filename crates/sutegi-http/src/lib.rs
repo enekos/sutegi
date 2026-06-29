@@ -7,8 +7,10 @@
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 /// HTTP request methods sutegi recognizes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -318,6 +320,48 @@ where
             let _ = handle_connection(stream, &*handler);
         });
     }
+    Ok(())
+}
+
+/// Like [`serve`], but stops accepting new connections once `shutdown` is set,
+/// then drains in-flight requests (by dropping the pool, which joins workers)
+/// and returns. This is what makes a sutegi process safe to roll in a pod: on
+/// SIGTERM you flip the flag, stop taking traffic, and let live requests finish
+/// within the termination grace period.
+pub fn serve_until<H>(
+    addr: &str,
+    workers: usize,
+    handler: H,
+    shutdown: Arc<AtomicBool>,
+) -> io::Result<()>
+where
+    H: Fn(Request) -> Response + Send + Sync + 'static,
+{
+    let listener = TcpListener::bind(addr)?;
+    listener.set_nonblocking(true)?;
+    let handler = Arc::new(handler);
+    let pool = ThreadPool::new(workers.max(1));
+
+    while !shutdown.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                // Hand the connection back to blocking mode for the worker.
+                let _ = stream.set_nonblocking(false);
+                let handler = Arc::clone(&handler);
+                pool.execute(move || {
+                    let _ = handle_connection(stream, &*handler);
+                });
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => {}
+        }
+    }
+
+    // Dropping the pool closes the job channel and joins workers, so any
+    // in-flight requests run to completion before we return.
+    drop(pool);
     Ok(())
 }
 
