@@ -1,0 +1,13 @@
+[package]
+name = "sutegi-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Router, App builder, middleware, extractors, and runtime introspection for sutegi."
+
+[dependencies]
+sutegi-http = { path = "../sutegi-http" }
+sutegi-json = { path = "../sutegi-json" }

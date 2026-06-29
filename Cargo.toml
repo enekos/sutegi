@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sutegi-json",
+    "crates/sutegi-http",
+    "crates/sutegi-web",
+    "crates/sutegi-orm",
+    "crates/sutegi-ai",
+    "crates/sutegi",
+    "crates/sutegi-cli",
+    "examples/todo",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+repository = "https://github.com/enekos/sutegi"
+authors = ["Eneko Sarasola"]
+
+# sutegi has ZERO third-party dependencies by design.
+# Everything (HTTP/1.1, JSON, routing, ORM query builder, CLI) is built on std only.
+# This keeps the release binary tiny and the surface fully auditable by humans and agents.
+
+[profile.release]
+opt-level = "z"     # optimize for size
+lto = true          # link-time optimization
+codegen-units = 1   # better cross-module size optimization
+panic = "abort"     # drop the unwind tables
+strip = true        # strip symbols

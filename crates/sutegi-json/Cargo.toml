@@ -1,0 +1,11 @@
+[package]
+name = "sutegi-json"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Tiny zero-dependency JSON value, serializer, and parser for the sutegi framework."
+
+[dependencies]

@@ -1,0 +1,11 @@
+[package]
+name = "sutegi-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Zero-dependency HTTP/1.1 parser and thread-pool server (std::net only) for sutegi."
+
+[dependencies]

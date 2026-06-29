@@ -1,0 +1,61 @@
+# Driving a sutegi app as an AI agent
+
+Every sutegi app is self-describing over plain JSON/HTTP. You do not need source
+access, an SDK, or any integration code. The loop is: **discover → manifest →
+invoke**.
+
+## 1. Discover the surface
+
+```
+GET /__introspect
+```
+
+Returns the full application surface:
+
+```json
+{
+  "framework": "sutegi",
+  "version": "0.1.0",
+  "name": "todo-demo",
+  "routes": [ { "method": "GET", "pattern": "/todos", "doc": "List all todos." } ],
+  "models": [ { "table": "todos", "columns": [ { "name": "id", "type": "integer", "primary": true } ] } ],
+  "tools":  [ { "name": "create_todo", "description": "...", "input_schema": { ... } } ]
+}
+```
+
+`routes` is the HTTP surface (with intent in `doc`), `models` is the data shape,
+`tools` is what you can call. Keys are sorted, so the document is stable to diff
+and cache.
+
+## 2. Get the tool manifest
+
+```
+GET /__tools
+```
+
+Returns an array of `{ name, description, input_schema }` — the exact shape
+expected by LLM tool-calling APIs (Anthropic-style). Feed it straight into your
+tool definitions.
+
+## 3. Invoke a tool
+
+```
+POST /__tools/<name>
+Content-Type: application/json
+
+{ "title": "ship sutegi" }
+```
+
+- `200` → the tool's JSON result.
+- `422 { "error": "missing required field 'title'" }` → arguments failed the
+  schema's `required` check. Fix and retry.
+- `400 { "error": "..." }` → the body was not valid JSON.
+
+## Conventions you can rely on
+
+- All framework endpoints are namespaced under `/__`.
+- All errors are `{ "error": string }`.
+- Tool argument schemas are real JSON Schema objects; honor `required`.
+- Numbers serialize without trailing `.0` when integral.
+
+That is the entire contract.

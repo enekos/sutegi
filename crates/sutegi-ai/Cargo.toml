@@ -1,0 +1,13 @@
+[package]
+name = "sutegi-ai"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "First-class LLM primitives for sutegi: tool-calling, structured output, and agent-facing endpoints."
+
+[dependencies]
+sutegi-web = { path = "../sutegi-web" }
+sutegi-json = { path = "../sutegi-json" }

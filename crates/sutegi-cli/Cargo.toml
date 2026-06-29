@@ -1,0 +1,16 @@
+[package]
+name = "sutegi-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The sutegi command-line tool: scaffold apps, models, and routes; introspect a running app."
+
+[[bin]]
+name = "sutegi"
+path = "src/main.rs"
+
+[dependencies]
+sutegi-json = { path = "../sutegi-json" }

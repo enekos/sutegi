@@ -1,0 +1,310 @@
+//! A minimal HTTP/1.1 server built directly on `std::net`.
+//!
+//! No async runtime, no `hyper`, no `tokio`. Connections are handled by a
+//! fixed thread pool. This is deliberately small: it keeps the binary tiny
+//! and the request lifecycle trivial to reason about — for a human reading
+//! the source, or an agent reasoning about the running app.
+
+use std::io::{self, BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+
+/// HTTP request methods sutegi recognizes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Method {
+    Get,
+    Post,
+    Put,
+    Patch,
+    Delete,
+    Head,
+    Options,
+    Other,
+}
+
+impl Method {
+    pub fn parse(s: &str) -> Method {
+        match s {
+            "GET" => Method::Get,
+            "POST" => Method::Post,
+            "PUT" => Method::Put,
+            "PATCH" => Method::Patch,
+            "DELETE" => Method::Delete,
+            "HEAD" => Method::Head,
+            "OPTIONS" => Method::Options,
+            _ => Method::Other,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Method::Get => "GET",
+            Method::Post => "POST",
+            Method::Put => "PUT",
+            Method::Patch => "PATCH",
+            Method::Delete => "DELETE",
+            Method::Head => "HEAD",
+            Method::Options => "OPTIONS",
+            Method::Other => "OTHER",
+        }
+    }
+}
+
+/// A parsed HTTP request.
+#[derive(Clone, Debug)]
+pub struct Request {
+    pub method: Method,
+    /// Path with query string stripped, e.g. `/users/42`.
+    pub path: String,
+    /// Raw query string without the `?`, e.g. `page=2&q=foo`.
+    pub query: String,
+    pub version: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl Request {
+    /// Case-insensitive header lookup.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// An HTTP response.
+#[derive(Clone, Debug)]
+pub struct Response {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl Response {
+    pub fn new(status: u16) -> Response {
+        Response {
+            status,
+            headers: Vec::new(),
+            body: Vec::new(),
+        }
+    }
+
+    pub fn with_header(mut self, name: &str, value: &str) -> Response {
+        self.headers.push((name.to_string(), value.to_string()));
+        self
+    }
+
+    pub fn with_body(mut self, body: impl Into<Vec<u8>>) -> Response {
+        self.body = body.into();
+        self
+    }
+}
+
+/// Parse a single request off a buffered stream. Returns `Ok(None)` if the
+/// peer closed the connection before sending anything.
+pub fn parse_request<R: BufRead>(reader: &mut R) -> io::Result<Option<Request>> {
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line)? == 0 {
+        return Ok(None);
+    }
+    let mut parts = request_line.trim_end().split_whitespace();
+    let method = Method::parse(parts.next().unwrap_or(""));
+    let target = parts.next().unwrap_or("/").to_string();
+    let version = parts.next().unwrap_or("HTTP/1.1").to_string();
+
+    let (path, query) = match target.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (target, String::new()),
+    };
+
+    let mut headers = Vec::new();
+    let mut content_length = 0usize;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            let k = k.trim().to_string();
+            let v = v.trim().to_string();
+            if k.eq_ignore_ascii_case("content-length") {
+                content_length = v.parse().unwrap_or(0);
+            }
+            headers.push((k, v));
+        }
+    }
+
+    let mut body = vec![0u8; content_length];
+    if content_length > 0 {
+        reader.read_exact(&mut body)?;
+    }
+
+    Ok(Some(Request {
+        method,
+        path,
+        query,
+        version,
+        headers,
+        body,
+    }))
+}
+
+/// Write a response to the stream. Always closes the connection (no keep-alive)
+/// to keep the server stateless and simple.
+pub fn write_response<W: Write>(w: &mut W, resp: &Response) -> io::Result<()> {
+    let reason = status_reason(resp.status);
+    let mut head = format!("HTTP/1.1 {} {}\r\n", resp.status, reason);
+    let mut has_content_type = false;
+    for (k, v) in &resp.headers {
+        if k.eq_ignore_ascii_case("content-type") {
+            has_content_type = true;
+        }
+        head.push_str(&format!("{}: {}\r\n", k, v));
+    }
+    if !has_content_type {
+        head.push_str("content-type: text/plain; charset=utf-8\r\n");
+    }
+    head.push_str(&format!("content-length: {}\r\n", resp.body.len()));
+    head.push_str("connection: close\r\n\r\n");
+    w.write_all(head.as_bytes())?;
+    w.write_all(&resp.body)?;
+    w.flush()
+}
+
+/// Map a status code to its canonical reason phrase (the common ones).
+pub fn status_reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        422 => "Unprocessable Entity",
+        500 => "Internal Server Error",
+        _ => "OK",
+    }
+}
+
+/// Bind to `addr` and serve requests with `handler` until the process exits.
+/// `handler` is shared across worker threads, so it must be `Send + Sync`.
+pub fn serve<H>(addr: &str, workers: usize, handler: H) -> io::Result<()>
+where
+    H: Fn(Request) -> Response + Send + Sync + 'static,
+{
+    let listener = TcpListener::bind(addr)?;
+    let handler = Arc::new(handler);
+    let pool = ThreadPool::new(workers.max(1));
+
+    for stream in listener.incoming() {
+        let stream = match stream {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let handler = Arc::clone(&handler);
+        pool.execute(move || {
+            let _ = handle_connection(stream, &*handler);
+        });
+    }
+    Ok(())
+}
+
+fn handle_connection<H>(stream: TcpStream, handler: &H) -> io::Result<()>
+where
+    H: Fn(Request) -> Response,
+{
+    let mut reader = BufReader::new(stream.try_clone()?);
+    if let Some(req) = parse_request(&mut reader)? {
+        let resp = handler(req);
+        let mut writer = stream;
+        write_response(&mut writer, &resp)?;
+    }
+    Ok(())
+}
+
+// ---- thread pool ----------------------------------------------------------
+
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+/// A fixed-size pool of worker threads pulling jobs off a shared channel.
+pub struct ThreadPool {
+    sender: Option<mpsc::Sender<Job>>,
+    workers: Vec<thread::JoinHandle<()>>,
+}
+
+impl ThreadPool {
+    pub fn new(size: usize) -> ThreadPool {
+        let (sender, receiver) = mpsc::channel::<Job>();
+        let receiver = Arc::new(Mutex::new(receiver));
+        let mut workers = Vec::with_capacity(size);
+        for _ in 0..size {
+            let receiver = Arc::clone(&receiver);
+            workers.push(thread::spawn(move || loop {
+                let job = receiver.lock().unwrap().recv();
+                match job {
+                    Ok(job) => job(),
+                    Err(_) => break, // channel closed: shut down
+                }
+            }));
+        }
+        ThreadPool {
+            sender: Some(sender),
+            workers,
+        }
+    }
+
+    pub fn execute<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(Box::new(f));
+        }
+    }
+}
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        // Dropping the sender closes the channel, so workers exit their loop.
+        drop(self.sender.take());
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_request_with_body() {
+        let raw = "POST /todos?x=1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
+        let mut reader = BufReader::new(raw.as_bytes());
+        let req = parse_request(&mut reader).unwrap().unwrap();
+        assert_eq!(req.method, Method::Post);
+        assert_eq!(req.path, "/todos");
+        assert_eq!(req.query, "x=1");
+        assert_eq!(req.body, b"hello");
+        assert_eq!(req.header("host"), Some("localhost"));
+    }
+
+    #[test]
+    fn writes_response_with_default_content_type() {
+        let resp = Response::new(200).with_body("hi");
+        let mut buf = Vec::new();
+        write_response(&mut buf, &resp).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(s.contains("content-length: 2\r\n"));
+        assert!(s.ends_with("\r\n\r\nhi"));
+    }
+}

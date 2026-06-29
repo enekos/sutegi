@@ -1,0 +1,16 @@
+[package]
+name = "sutegi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "sutegi — a zero-dependency, agent-native web framework for Rust. The forge."
+
+[dependencies]
+sutegi-json = { path = "../sutegi-json" }
+sutegi-http = { path = "../sutegi-http" }
+sutegi-web = { path = "../sutegi-web" }
+sutegi-orm = { path = "../sutegi-orm" }
+sutegi-ai = { path = "../sutegi-ai" }

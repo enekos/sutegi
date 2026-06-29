@@ -1,0 +1,17 @@
+[package]
+name = "todo-example"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Demo sutegi app: model + routes + AI tool + introspection."
+publish = false
+
+[[bin]]
+name = "todo"
+path = "src/main.rs"
+
+[dependencies]
+sutegi = { path = "../../crates/sutegi" }
