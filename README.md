@@ -187,6 +187,22 @@ let all  = Todo::all(&db)?;                     // Vec<Json>
 Rows come back as JSON objects. Enabling `sqlite` grows the binary to ~1.3 MB
 (bundled SQLite); the zero-dep core remains ~378 KB.
 
+The query layer covers reads and writes, all parameterized:
+
+```rust
+QueryBuilder::table("todos")
+    .filter_in("id", vec![Value::Int(1), Value::Int(2)])
+    .order_by("done", false).order_by("id", true)    // multi-column
+    .limit(20).offset(40).build();                    // paging
+QueryBuilder::table("todos").filter("done", "=", Value::Bool(true)).build_count();
+
+UpdateBuilder::table("todos").set("done", Value::Bool(true)).filter("id", "=", Value::Int(5)).build();
+DeleteBuilder::table("todos").filter("id", "=", Value::Int(5)).build();
+
+db.transaction(|tx| { tx.insert("todos", &[/* … */])?; Ok(()) })?;   // COMMIT, or ROLLBACK on Err
+let one: Option<Todo> = db.fetch_one(&Todo::query().filter("id", "=", Value::Int(1)))?;
+```
+
 ### Typed models with `#[derive(Model)]`
 
 ```rust
@@ -259,10 +275,18 @@ Two entry points, one structured error shape (`{ field: [messages] }`):
 ```rust
 // Laravel-style request validation
 let rules = Ruleset::new()
-    .field("title", &[Rule::Required, Rule::Str, Rule::MinLen(1), Rule::MaxLen(200)])
-    .field("done",  &[Rule::Bool]);
+    .field("title",    &[Rule::Required, Rule::Str, Rule::MinLen(1), Rule::MaxLen(200)])
+    .field("email",    &[Rule::Required, Rule::Email])
+    .field("age",      &[Rule::Integer, Rule::Between(18.0, 120.0)])
+    .field("website",  &[Rule::Url])
+    .field("slug",     &[Rule::AlphaNum])
+    .field("role",     &[Rule::In(vec!["admin".into(), "user".into()])])
+    .field("password_confirmation", &[Rule::Same("password".into())]);
 rules.validate(&body)?;          // Err(ValidationErrors) -> errs.to_json()
 ```
+
+Rules: `Required`, `Str`, `Integer`, `Number`, `Bool`, `Email`, `Url`, `Alpha`,
+`AlphaNum`, `Min`/`Max`, `Between`, `MinLen`/`MaxLen`, `In`, `Same`.
 
 AI tool arguments are validated automatically against each tool's declared
 `input_schema` (type, `required`, `enum`, bounds), so a malformed agent call

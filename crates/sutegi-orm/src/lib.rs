@@ -222,6 +222,36 @@ pub mod db {
             rows.iter().map(T::from_row).collect()
         }
 
+        /// Fetch the first matching row as a typed value, if any.
+        pub fn fetch_one<T: crate::FromRow>(&self, qb: &QueryBuilder) -> Result<Option<T>, String> {
+            let rows = self.select(qb)?;
+            rows.first().map(T::from_row).transpose()
+        }
+
+        /// Run a SELECT and return only the first row (as JSON), if any.
+        pub fn query_one(&self, sql: &str, params: &[Value]) -> Result<Option<Json>, String> {
+            Ok(self.query(sql, params)?.into_iter().next())
+        }
+
+        /// Run `f` inside a transaction: BEGIN, then COMMIT on `Ok` or ROLLBACK
+        /// on `Err`. Returns whatever `f` returns.
+        pub fn transaction<T>(
+            &self,
+            f: impl FnOnce(&Db) -> Result<T, String>,
+        ) -> Result<T, String> {
+            self.conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+            match f(self) {
+                Ok(value) => {
+                    self.conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+                    Ok(value)
+                }
+                Err(e) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        }
+
         /// Run an arbitrary SELECT and return rows as JSON objects.
         pub fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Json>, String> {
             let mut stmt = self.conn.prepare(sql).map_err(|e| e.to_string())?;
@@ -296,6 +326,39 @@ pub mod db {
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].get("title").unwrap(), &Json::str("ship sutegi"));
             assert_eq!(rows[0].get("id").unwrap(), &Json::int(1));
+        }
+
+        #[test]
+        fn update_delete_and_transaction() {
+            let db = Db::memory().unwrap();
+            db.migrate(&todos_schema()).unwrap();
+            db.insert("todos", &[("title", Value::Text("a".into())), ("done", Value::Bool(false))]).unwrap();
+
+            // UPDATE via builder.
+            let (sql, params) = crate::UpdateBuilder::table("todos")
+                .set("done", Value::Bool(true))
+                .filter("id", "=", Value::Int(1))
+                .build();
+            assert_eq!(db.execute(&sql, &params).unwrap(), 1);
+
+            // Rollback leaves state untouched.
+            let _ = db.transaction(|tx| {
+                tx.insert("todos", &[("title", Value::Text("b".into())), ("done", Value::Bool(false))])?;
+                Err::<(), String>("boom".into())
+            });
+            assert_eq!(db.select(&QueryBuilder::table("todos")).unwrap().len(), 1);
+
+            // Commit persists.
+            db.transaction(|tx| {
+                tx.insert("todos", &[("title", Value::Text("c".into())), ("done", Value::Bool(false))])?;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(db.select(&QueryBuilder::table("todos")).unwrap().len(), 2);
+
+            // DELETE via builder.
+            let (dsql, dparams) = crate::DeleteBuilder::table("todos").filter("id", "=", Value::Int(1)).build();
+            assert_eq!(db.execute(&dsql, &dparams).unwrap(), 1);
         }
     }
 }
@@ -417,8 +480,10 @@ pub struct QueryBuilder {
     table: String,
     columns: Vec<String>,
     wheres: Vec<(String, String, Value)>,
-    order: Option<(String, bool)>,
+    in_clauses: Vec<(String, Vec<Value>)>,
+    order: Vec<(String, bool)>,
     limit: Option<i64>,
+    offset: Option<i64>,
 }
 
 impl QueryBuilder {
@@ -427,8 +492,10 @@ impl QueryBuilder {
             table: table.to_string(),
             columns: Vec::new(),
             wheres: Vec::new(),
-            order: None,
+            in_clauses: Vec::new(),
+            order: Vec::new(),
             limit: None,
+            offset: None,
         }
     }
 
@@ -443,8 +510,15 @@ impl QueryBuilder {
         self
     }
 
+    /// Add a `WHERE col IN (?, ?, …)` clause. An empty list matches nothing.
+    pub fn filter_in(mut self, col: &str, values: Vec<Value>) -> QueryBuilder {
+        self.in_clauses.push((col.to_string(), values));
+        self
+    }
+
+    /// Add an `ORDER BY` term. Call multiple times for tie-breaking columns.
     pub fn order_by(mut self, col: &str, descending: bool) -> QueryBuilder {
-        self.order = Some((col.to_string(), descending));
+        self.order.push((col.to_string(), descending));
         self
     }
 
@@ -453,16 +527,104 @@ impl QueryBuilder {
         self
     }
 
-    /// Build the SQL string and the ordered list of bound parameters.
+    pub fn offset(mut self, n: i64) -> QueryBuilder {
+        self.offset = Some(n);
+        self
+    }
+
+    /// The `WHERE` clause shared by `build` and `build_count`.
+    fn where_clause(&self) -> (String, Vec<Value>) {
+        let mut clauses = Vec::new();
+        let mut params = Vec::new();
+        for (c, op, v) in &self.wheres {
+            params.push(v.clone());
+            clauses.push(format!("{} {} ?", c, op));
+        }
+        for (c, values) in &self.in_clauses {
+            if values.is_empty() {
+                // IN () is invalid SQL; encode "matches nothing".
+                clauses.push("0 = 1".to_string());
+                continue;
+            }
+            let marks = vec!["?"; values.len()].join(", ");
+            clauses.push(format!("{} IN ({})", c, marks));
+            params.extend(values.iter().cloned());
+        }
+        let sql = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", clauses.join(" AND "))
+        };
+        (sql, params)
+    }
+
+    /// Build the SELECT SQL and ordered bound parameters.
     pub fn build(&self) -> (String, Vec<Value>) {
         let cols = if self.columns.is_empty() {
             "*".to_string()
         } else {
             self.columns.join(", ")
         };
-        let mut sql = format!("SELECT {} FROM {}", cols, self.table);
-        let mut params = Vec::new();
+        let (where_sql, params) = self.where_clause();
+        let mut sql = format!("SELECT {} FROM {}{}", cols, self.table, where_sql);
 
+        if !self.order.is_empty() {
+            let terms: Vec<String> = self
+                .order
+                .iter()
+                .map(|(c, desc)| format!("{} {}", c, if *desc { "DESC" } else { "ASC" }))
+                .collect();
+            sql.push_str(&format!(" ORDER BY {}", terms.join(", ")));
+        }
+        if let Some(n) = self.limit {
+            sql.push_str(&format!(" LIMIT {}", n));
+        }
+        if let Some(n) = self.offset {
+            sql.push_str(&format!(" OFFSET {}", n));
+        }
+        (sql, params)
+    }
+
+    /// Build a `SELECT COUNT(*)` over the same table/filters (ignores
+    /// columns/order/limit), for pagination totals.
+    pub fn build_count(&self) -> (String, Vec<Value>) {
+        let (where_sql, params) = self.where_clause();
+        (format!("SELECT COUNT(*) AS count FROM {}{}", self.table, where_sql), params)
+    }
+}
+
+/// A parameterized `UPDATE` builder.
+#[derive(Clone, Debug)]
+pub struct UpdateBuilder {
+    table: String,
+    sets: Vec<(String, Value)>,
+    wheres: Vec<(String, String, Value)>,
+}
+
+impl UpdateBuilder {
+    pub fn table(table: &str) -> UpdateBuilder {
+        UpdateBuilder { table: table.to_string(), sets: Vec::new(), wheres: Vec::new() }
+    }
+    pub fn set(mut self, col: &str, value: Value) -> UpdateBuilder {
+        self.sets.push((col.to_string(), value));
+        self
+    }
+    pub fn filter(mut self, col: &str, op: &str, value: Value) -> UpdateBuilder {
+        self.wheres.push((col.to_string(), op.to_string(), value));
+        self
+    }
+    /// Returns `(sql, params)`. Params are SET values first, then WHERE values.
+    pub fn build(&self) -> (String, Vec<Value>) {
+        let mut params = Vec::new();
+        let assignments: Vec<String> = self
+            .sets
+            .iter()
+            .map(|(c, v)| {
+                params.push(v.clone());
+                format!("{} = ?", c)
+            })
+            .collect();
+        let mut sql = format!("UPDATE {} SET {}", self.table, assignments.join(", "));
         if !self.wheres.is_empty() {
             let clauses: Vec<String> = self
                 .wheres
@@ -472,22 +634,41 @@ impl QueryBuilder {
                     format!("{} {} ?", c, op)
                 })
                 .collect();
-            sql.push_str(" WHERE ");
-            sql.push_str(&clauses.join(" AND "));
+            sql.push_str(&format!(" WHERE {}", clauses.join(" AND ")));
         }
+        (sql, params)
+    }
+}
 
-        if let Some((col, desc)) = &self.order {
-            sql.push_str(&format!(
-                " ORDER BY {} {}",
-                col,
-                if *desc { "DESC" } else { "ASC" }
-            ));
+/// A parameterized `DELETE` builder.
+#[derive(Clone, Debug)]
+pub struct DeleteBuilder {
+    table: String,
+    wheres: Vec<(String, String, Value)>,
+}
+
+impl DeleteBuilder {
+    pub fn table(table: &str) -> DeleteBuilder {
+        DeleteBuilder { table: table.to_string(), wheres: Vec::new() }
+    }
+    pub fn filter(mut self, col: &str, op: &str, value: Value) -> DeleteBuilder {
+        self.wheres.push((col.to_string(), op.to_string(), value));
+        self
+    }
+    pub fn build(&self) -> (String, Vec<Value>) {
+        let mut params = Vec::new();
+        let mut sql = format!("DELETE FROM {}", self.table);
+        if !self.wheres.is_empty() {
+            let clauses: Vec<String> = self
+                .wheres
+                .iter()
+                .map(|(c, op, v)| {
+                    params.push(v.clone());
+                    format!("{} {} ?", c, op)
+                })
+                .collect();
+            sql.push_str(&format!(" WHERE {}", clauses.join(" AND ")));
         }
-
-        if let Some(n) = self.limit {
-            sql.push_str(&format!(" LIMIT {}", n));
-        }
-
         (sql, params)
     }
 }
@@ -528,5 +709,51 @@ mod tests {
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS todos"));
         assert!(sql.contains("id INTEGER PRIMARY KEY"));
         assert!(sql.contains("title TEXT NOT NULL"));
+    }
+
+    #[test]
+    fn select_with_in_offset_and_multi_order() {
+        let (sql, params) = QueryBuilder::table("todos")
+            .filter_in("id", vec![Value::Int(1), Value::Int(2)])
+            .order_by("done", false)
+            .order_by("id", true)
+            .limit(10)
+            .offset(20)
+            .build();
+        assert_eq!(
+            sql,
+            "SELECT * FROM todos WHERE id IN (?, ?) ORDER BY done ASC, id DESC LIMIT 10 OFFSET 20"
+        );
+        assert_eq!(params.len(), 2);
+    }
+
+    #[test]
+    fn empty_in_matches_nothing() {
+        let (sql, _) = QueryBuilder::table("t").filter_in("id", vec![]).build();
+        assert_eq!(sql, "SELECT * FROM t WHERE 0 = 1");
+    }
+
+    #[test]
+    fn count_ignores_columns() {
+        let (sql, _) = QueryBuilder::table("t")
+            .select(&["a", "b"])
+            .filter("done", "=", Value::Bool(true))
+            .build_count();
+        assert_eq!(sql, "SELECT COUNT(*) AS count FROM t WHERE done = ?");
+    }
+
+    #[test]
+    fn update_and_delete_builders() {
+        let (sql, params) = UpdateBuilder::table("todos")
+            .set("title", Value::Text("new".into()))
+            .set("done", Value::Bool(true))
+            .filter("id", "=", Value::Int(5))
+            .build();
+        assert_eq!(sql, "UPDATE todos SET title = ?, done = ? WHERE id = ?");
+        assert_eq!(params.len(), 3);
+
+        let (dsql, dparams) = DeleteBuilder::table("todos").filter("id", "=", Value::Int(5)).build();
+        assert_eq!(dsql, "DELETE FROM todos WHERE id = ?");
+        assert_eq!(dparams, vec![Value::Int(5)]);
     }
 }

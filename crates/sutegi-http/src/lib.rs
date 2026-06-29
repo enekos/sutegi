@@ -74,6 +74,32 @@ impl Request {
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
     }
+
+    /// The `Content-Type` header, if present.
+    pub fn content_type(&self) -> Option<&str> {
+        self.header("content-type")
+    }
+
+    /// Whether the body is declared as JSON.
+    pub fn is_json(&self) -> bool {
+        self.content_type()
+            .map(|ct| ct.contains("application/json"))
+            .unwrap_or(false)
+    }
+
+    /// Read a cookie by name from the `Cookie` header.
+    pub fn cookie(&self, name: &str) -> Option<String> {
+        let header = self.header("cookie")?;
+        for pair in header.split(';') {
+            let pair = pair.trim();
+            if let Some((k, v)) = pair.split_once('=') {
+                if k.trim() == name {
+                    return Some(v.trim().to_string());
+                }
+            }
+        }
+        None
+    }
 }
 
 /// A response body: either fully buffered, or streamed incrementally.
@@ -283,20 +309,37 @@ pub fn write_response<W: Write>(w: &mut W, resp: Response) -> io::Result<()> {
     }
 }
 
-/// Map a status code to its canonical reason phrase (the common ones).
+/// Map a status code to its canonical reason phrase.
 pub fn status_reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
         201 => "Created",
+        202 => "Accepted",
         204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
         422 => "Unprocessable Entity",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
-        _ => "OK",
+        501 => "Not Implemented",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        // Fall back to a class-appropriate phrase rather than a misleading "OK".
+        s if (200..300).contains(&s) => "OK",
+        s if (300..400).contains(&s) => "Redirect",
+        s if (400..500).contains(&s) => "Client Error",
+        _ => "Server Error",
     }
 }
 
@@ -454,6 +497,17 @@ mod tests {
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(s.contains("content-length: 2\r\n"));
         assert!(s.ends_with("\r\n\r\nhi"));
+    }
+
+    #[test]
+    fn request_content_type_and_cookies() {
+        let raw = "GET / HTTP/1.1\r\nContent-Type: application/json\r\nCookie: sid=abc; theme=dark\r\n\r\n";
+        let mut reader = BufReader::new(raw.as_bytes());
+        let req = parse_request(&mut reader).unwrap().unwrap();
+        assert!(req.is_json());
+        assert_eq!(req.cookie("sid").as_deref(), Some("abc"));
+        assert_eq!(req.cookie("theme").as_deref(), Some("dark"));
+        assert_eq!(req.cookie("missing"), None);
     }
 
     #[test]

@@ -83,7 +83,8 @@ pub fn env_or(key: &str, default: &str) -> String {
 pub mod prelude {
     pub use sutegi_json::Json;
     pub use sutegi_web::{
-        json, json_body, mw, not_found, query_params, sse, stream, text, App, Group, Method, Mw,
+        cors, cors_preflight, form_body, html, json, json_body, logger, mw, no_content,
+        not_found, query_params, redirect, sse, status, stream, text, App, Group, Method, Mw,
         Params, Request, Response, SseSink, StreamSink,
     };
 
@@ -92,7 +93,9 @@ pub mod prelude {
     #[cfg(feature = "orm")]
     pub use sutegi_orm::row::FromRow;
     #[cfg(feature = "orm")]
-    pub use sutegi_orm::{ColType, Column, Model, QueryBuilder, TableSchema, Value};
+    pub use sutegi_orm::{
+        ColType, Column, DeleteBuilder, Model, QueryBuilder, TableSchema, UpdateBuilder, Value,
+    };
     #[cfg(feature = "queue")]
     pub use sutegi_queue::{Job, Queue};
     #[cfg(feature = "validate")]

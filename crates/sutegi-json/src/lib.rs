@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::{self, Write};
+use std::ops::Index;
 
 /// A JSON value.
 #[derive(Clone, Debug, PartialEq)]
@@ -85,6 +86,49 @@ impl Json {
         }
     }
 
+    /// Read an integer payload (only if the number is integral).
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Json::Num(n) if n.fract() == 0.0 && n.is_finite() => Some(*n as i64),
+            _ => None,
+        }
+    }
+
+    /// Borrow the array payload, if this is an array.
+    pub fn as_array(&self) -> Option<&Vec<Json>> {
+        match self {
+            Json::Arr(a) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// Borrow the object payload, if this is an object.
+    pub fn as_object(&self) -> Option<&BTreeMap<String, Json>> {
+        match self {
+            Json::Obj(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// Whether this value is `null`.
+    pub fn is_null(&self) -> bool {
+        matches!(self, Json::Null)
+    }
+
+    /// Resolve a JSON Pointer-ish path (`/a/b/0`) — slash-separated keys, with
+    /// numeric segments indexing arrays. Returns `None` if any step is missing.
+    pub fn pointer(&self, path: &str) -> Option<&Json> {
+        let mut node = self;
+        for seg in path.split('/').filter(|s| !s.is_empty()) {
+            node = match node {
+                Json::Obj(m) => m.get(seg)?,
+                Json::Arr(a) => a.get(seg.parse::<usize>().ok()?)?,
+                _ => return None,
+            };
+        }
+        Some(node)
+    }
+
     /// Serialize to a pretty, indented string (used by `/__introspect`).
     pub fn to_pretty(&self) -> String {
         let mut out = String::new();
@@ -144,6 +188,80 @@ impl Json {
             return Err(format!("trailing characters at position {}", p.pos));
         }
         Ok(v)
+    }
+}
+
+// --- ergonomic conversions ---
+
+impl From<&str> for Json {
+    fn from(s: &str) -> Json {
+        Json::Str(s.to_string())
+    }
+}
+impl From<String> for Json {
+    fn from(s: String) -> Json {
+        Json::Str(s)
+    }
+}
+impl From<bool> for Json {
+    fn from(b: bool) -> Json {
+        Json::Bool(b)
+    }
+}
+impl From<i64> for Json {
+    fn from(n: i64) -> Json {
+        Json::Num(n as f64)
+    }
+}
+impl From<i32> for Json {
+    fn from(n: i32) -> Json {
+        Json::Num(n as f64)
+    }
+}
+impl From<f64> for Json {
+    fn from(n: f64) -> Json {
+        Json::Num(n)
+    }
+}
+impl From<usize> for Json {
+    fn from(n: usize) -> Json {
+        Json::Num(n as f64)
+    }
+}
+impl<T: Into<Json>> From<Vec<T>> for Json {
+    fn from(v: Vec<T>) -> Json {
+        Json::Arr(v.into_iter().map(Into::into).collect())
+    }
+}
+impl<T: Into<Json>> From<Option<T>> for Json {
+    fn from(o: Option<T>) -> Json {
+        match o {
+            Some(v) => v.into(),
+            None => Json::Null,
+        }
+    }
+}
+
+/// A shared `null` so `Index` can return a reference for missing keys.
+static NULL: Json = Json::Null;
+
+/// `json["key"]` — returns `Null` (not a panic) for non-objects or missing keys,
+/// so deep access like `json["a"]["b"]` is safe to chain.
+impl Index<&str> for Json {
+    type Output = Json;
+    fn index(&self, key: &str) -> &Json {
+        self.get(key).unwrap_or(&NULL)
+    }
+}
+
+/// `json[i]` — returns `Null` for non-arrays or out-of-range indices.
+impl Index<usize> for Json {
+    type Output = Json;
+    fn index(&self, i: usize) -> &Json {
+        match self {
+            Json::Arr(a) => a.get(i).unwrap_or(&NULL),
+            _ => &NULL,
+        }
     }
 }
 
@@ -406,5 +524,35 @@ mod tests {
     fn integers_render_without_decimal() {
         assert_eq!(Json::num(42).to_string(), "42");
         assert_eq!(Json::Num(1.5).to_string(), "1.5");
+    }
+
+    #[test]
+    fn index_and_pointer() {
+        let v = Json::parse(r#"{"a":{"b":[10,20]}}"#).unwrap();
+        // Index returns Null for missing rather than panicking.
+        assert_eq!(v["a"]["b"][1].as_i64(), Some(20));
+        assert!(v["a"]["missing"].is_null());
+        assert!(v["nope"][5].is_null());
+        // JSON Pointer-ish path.
+        assert_eq!(v.pointer("/a/b/0").and_then(Json::as_i64), Some(10));
+        assert!(v.pointer("/a/x").is_none());
+    }
+
+    #[test]
+    fn from_conversions() {
+        let j: Json = vec![1i64, 2, 3].into();
+        assert_eq!(j, Json::arr(vec![Json::num(1), Json::num(2), Json::num(3)]));
+        let o: Json = Some("hi").into();
+        assert_eq!(o, Json::str("hi"));
+        let n: Json = Option::<&str>::None.into();
+        assert!(n.is_null());
+    }
+
+    #[test]
+    fn typed_accessors() {
+        let v = Json::parse(r#"{"n":7,"arr":[1],"obj":{"k":1}}"#).unwrap();
+        assert_eq!(v["n"].as_i64(), Some(7));
+        assert_eq!(v["arr"].as_array().map(Vec::len), Some(1));
+        assert!(v["obj"].as_object().is_some());
     }
 }

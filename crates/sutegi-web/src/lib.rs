@@ -31,6 +31,9 @@ pub type MwFn = dyn Fn(&Request) -> Option<Response> + Send + Sync + 'static;
 /// A reference-counted, shareable middleware (build with [`mw`]).
 pub type Mw = std::sync::Arc<MwFn>;
 
+/// An after-middleware: transforms the outgoing response (e.g. adds headers).
+pub type AfterMiddleware = Box<dyn Fn(&Request, Response) -> Response + Send + Sync + 'static>;
+
 /// Wrap a closure as a shareable group middleware.
 pub fn mw(f: impl Fn(&Request) -> Option<Response> + Send + Sync + 'static) -> Mw {
     std::sync::Arc::new(f)
@@ -55,6 +58,7 @@ pub struct App {
     tools: Vec<Json>,
     workers: usize,
     readiness: Option<Box<dyn Fn() -> bool + Send + Sync + 'static>>,
+    after: Vec<AfterMiddleware>,
 }
 
 /// Process-wide request counters, exposed at `/__metrics` in Prometheus text
@@ -116,7 +120,18 @@ impl App {
             tools: Vec::new(),
             workers: 8,
             readiness: None,
+            after: Vec::new(),
         }
+    }
+
+    /// Register an after-middleware that transforms every outgoing response
+    /// (e.g. [`cors`] to add CORS headers). Applied in registration order.
+    pub fn after(
+        mut self,
+        transform: impl Fn(&Request, Response) -> Response + Send + Sync + 'static,
+    ) -> App {
+        self.after.push(Box::new(transform));
+        self
     }
 
     /// Set the worker thread count (default 8).
@@ -258,6 +273,7 @@ impl App {
         let introspect = self.introspection();
         let routes = Arc::new(self.routes);
         let middleware = Arc::new(self.middleware);
+        let after = Arc::new(self.after);
         let readiness = Arc::new(self.readiness);
         let metrics = Arc::new(Metrics::default());
         let workers = self.workers;
@@ -307,6 +323,9 @@ impl App {
                 }
                 not_found()
             })();
+
+            // After-middleware: transform the outgoing response (CORS, etc.).
+            let resp = after.iter().fold(resp, |r, hook| hook(&req, r));
 
             metrics.record(resp.status);
             metrics.in_flight.fetch_sub(1, Ordering::Relaxed);
@@ -469,6 +488,61 @@ pub fn not_found() -> Response {
     text(404, "404 Not Found")
 }
 
+/// A `text/html` response.
+pub fn html(status: u16, body: &str) -> Response {
+    Response::new(status)
+        .with_header("content-type", "text/html; charset=utf-8")
+        .with_body(body.as_bytes().to_vec())
+}
+
+/// A `302 Found` redirect to `location`.
+pub fn redirect(location: &str) -> Response {
+    Response::new(302).with_header("location", location)
+}
+
+/// An empty response with just a status code.
+pub fn status(code: u16) -> Response {
+    Response::new(code)
+}
+
+/// A `204 No Content`.
+pub fn no_content() -> Response {
+    Response::new(204)
+}
+
+/// A pre-middleware that logs `METHOD /path` for each request and continues.
+pub fn logger() -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static {
+    |req: &Request| {
+        println!("[{}] {}", req.method.as_str(), req.path);
+        None
+    }
+}
+
+/// A pre-middleware that answers CORS preflight (`OPTIONS`) with `204` and the
+/// permitted origin. Pair with [`cors`] (an after-middleware) for full CORS.
+pub fn cors_preflight(origin: &str) -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static {
+    let origin = origin.to_string();
+    move |req: &Request| {
+        if req.method == Method::Options {
+            Some(
+                Response::new(204)
+                    .with_header("access-control-allow-origin", &origin)
+                    .with_header("access-control-allow-methods", "GET,POST,PUT,DELETE,OPTIONS")
+                    .with_header("access-control-allow-headers", "*"),
+            )
+        } else {
+            None
+        }
+    }
+}
+
+/// An after-middleware that stamps `Access-Control-Allow-Origin` onto every
+/// response. Register with [`App::after`].
+pub fn cors(origin: &str) -> impl Fn(&Request, Response) -> Response + Send + Sync + 'static {
+    let origin = origin.to_string();
+    move |_req: &Request, resp: Response| resp.with_header("access-control-allow-origin", &origin)
+}
+
 /// A streaming response: `producer` writes (and flushes) bytes over time via a
 /// [`StreamSink`]. Sets the given `content_type`; no `Content-Length`.
 pub fn stream(
@@ -512,8 +586,21 @@ pub fn json_body(req: &Request) -> Result<Json, String> {
 
 /// Parse the query string into a map (`a=1&b=2` → `{a:1, b:2}`).
 pub fn query_params(req: &Request) -> BTreeMap<String, String> {
+    parse_urlencoded(&req.query)
+}
+
+/// Parse an `application/x-www-form-urlencoded` request body into a map.
+pub fn form_body(req: &Request) -> BTreeMap<String, String> {
+    match std::str::from_utf8(&req.body) {
+        Ok(s) => parse_urlencoded(s),
+        Err(_) => BTreeMap::new(),
+    }
+}
+
+/// Shared `key=value&...` parser used by query strings and form bodies.
+fn parse_urlencoded(input: &str) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
-    for pair in req.query.split('&') {
+    for pair in input.split('&') {
         if pair.is_empty() {
             continue;
         }
@@ -587,6 +674,29 @@ mod tests {
     #[test]
     fn root_matches() {
         assert!(match_pattern("/", "/").is_some());
+    }
+
+    #[test]
+    fn parses_form_body() {
+        let req = Request {
+            method: Method::Post,
+            path: "/x".into(),
+            query: String::new(),
+            version: "HTTP/1.1".into(),
+            headers: vec![],
+            body: b"title=hello+world&done=true".to_vec(),
+        };
+        let form = form_body(&req);
+        assert_eq!(form.get("title").map(String::as_str), Some("hello world"));
+        assert_eq!(form.get("done").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn response_helpers() {
+        assert_eq!(redirect("/login").status, 302);
+        assert_eq!(no_content().status, 204);
+        let h = html(200, "<p>hi</p>");
+        assert!(h.headers.iter().any(|(k, v)| k == "content-type" && v.contains("text/html")));
     }
 
     #[test]

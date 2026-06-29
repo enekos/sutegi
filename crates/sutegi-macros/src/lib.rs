@@ -40,6 +40,8 @@ struct FieldInfo {
     scalar: Scalar,
     optional: bool,
     primary: bool,
+    /// Not a column: excluded from schema/persistence, default-initialized on load.
+    skip: bool,
 }
 
 #[proc_macro_derive(Model, attributes(model))]
@@ -69,9 +71,8 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             })?;
         }
     }
-    let table = table.ok_or_else(|| {
-        syn::Error::new_spanned(&input, "missing #[model(table = \"...\")] on the struct")
-    })?;
+    // Default the table name to the snake_case, pluralized struct name.
+    let table = table.unwrap_or_else(|| pluralize(&to_snake(&name.to_string())));
 
     let fields = match &input.data {
         Data::Struct(s) => match &s.fields {
@@ -96,6 +97,7 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         let ident = field.ident.clone().unwrap();
         let mut column = ident.to_string();
         let mut primary = false;
+        let mut skip = false;
 
         for attr in &field.attrs {
             if attr.path().is_ident("model") {
@@ -103,29 +105,38 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                     if meta.path.is_ident("primary") {
                         primary = true;
                         Ok(())
+                    } else if meta.path.is_ident("skip") {
+                        skip = true;
+                        Ok(())
                     } else if meta.path.is_ident("column") {
                         let lit: syn::LitStr = meta.value()?.parse()?;
                         column = lit.value();
                         Ok(())
                     } else {
-                        Err(meta.error("unknown #[model(...)] key on field (expected `primary` or `column`)"))
+                        Err(meta.error("unknown #[model(...)] key on field (expected `primary`, `skip`, or `column`)"))
                     }
                 })?;
             }
         }
 
+        if skip {
+            // Type is irrelevant for skipped fields; they're default-initialized.
+            infos.push(FieldInfo { ident, column, scalar: Scalar::Text, optional: false, primary: false, skip: true });
+            continue;
+        }
+
         let (scalar, optional) = classify(&field.ty).ok_or_else(|| {
             syn::Error::new_spanned(
                 &field.ty,
-                "unsupported field type for #[derive(Model)] (use i64/i32, f64/f32, String, bool, or Option<…> of those)",
+                "unsupported field type for #[derive(Model)] (use i64/i32, f64/f32, String, bool, or Option<…> of those, or mark it #[model(skip)])",
             )
         })?;
 
-        infos.push(FieldInfo { ident, column, scalar, optional, primary });
+        infos.push(FieldInfo { ident, column, scalar, optional, primary, skip: false });
     }
 
-    // ---- schema() columns ----
-    let column_defs = infos.iter().map(|f| {
+    // ---- schema() columns ---- (skipped fields are not columns)
+    let column_defs = infos.iter().filter(|f| !f.skip).map(|f| {
         let col = &f.column;
         let ty = match f.scalar {
             Scalar::Int => quote!(::sutegi::orm::ColType::Integer),
@@ -144,6 +155,10 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let from_row_inits = infos.iter().map(|f| {
         let ident = &f.ident;
         let col = &f.column;
+        if f.skip {
+            // Not loaded from a row — initialize to the type's default.
+            return quote! { #ident: ::core::default::Default::default() };
+        }
         let extractor = match (f.scalar, f.optional) {
             (Scalar::Int, false) => quote!(::sutegi::orm::row::get_i64),
             (Scalar::Real, false) => quote!(::sutegi::orm::row::get_f64),
@@ -165,8 +180,8 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         }
     });
 
-    // ---- to_values() pairs ----
-    let to_values = infos.iter().map(|f| {
+    // ---- to_values() pairs ---- (skipped fields are not persisted)
+    let to_values = infos.iter().filter(|f| !f.skip).map(|f| {
         let ident = &f.ident;
         let col = &f.column;
         let wrap = value_wrapper(f.scalar);
@@ -182,8 +197,8 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         }
     });
 
-    // ---- to_json() pairs ----
-    let to_json = infos.iter().map(|f| {
+    // ---- to_json() pairs ---- (skipped fields are not serialized)
+    let to_json = infos.iter().filter(|f| !f.skip).map(|f| {
         let ident = &f.ident;
         let col = &f.column;
         let to = json_wrapper(f.scalar);
@@ -276,6 +291,33 @@ fn last_segment(ty: &Type) -> Option<String> {
         p.path.segments.last().map(|s| s.ident.to_string())
     } else {
         None
+    }
+}
+
+/// `CamelCase` → `camel_case` (for default table names).
+fn to_snake(name: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in name.chars().enumerate() {
+        if c.is_uppercase() {
+            if i != 0 {
+                out.push('_');
+            }
+            out.extend(c.to_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Naive English pluralization, matching the CLI's convention.
+fn pluralize(word: &str) -> String {
+    if word.ends_with('s') {
+        word.to_string()
+    } else if word.ends_with('y') {
+        format!("{}ies", &word[..word.len() - 1])
+    } else {
+        format!("{}s", word)
     }
 }
 

@@ -112,6 +112,36 @@ impl StreamTool for StreamAnswer {
     }
 }
 
+#[cfg(test)]
+mod derive_tests {
+    use sutegi::prelude::*;
+
+    // No #[model(table)] → table inferred as snake_case + plural ("articles").
+    #[derive(Model)]
+    struct Article {
+        #[model(primary)]
+        id: i64,
+        title: String,
+        #[model(skip)]
+        cached: bool, // not a column; default-initialized on load
+    }
+
+    #[test]
+    fn auto_table_name_and_skip() {
+        let schema = Article::schema();
+        assert_eq!(schema.table, "articles");
+        assert_eq!(schema.columns.len(), 2); // `cached` is skipped
+
+        let a = Article { id: 1, title: "x".into(), cached: true };
+        assert_eq!(a.to_values().len(), 2); // skipped field not persisted
+
+        let row = sutegi::json::Json::parse(r#"{"id":5,"title":"y"}"#).unwrap();
+        let got = <Article as FromRow>::from_row(&row).unwrap();
+        assert_eq!(got.id, 5);
+        assert!(!got.cached); // default-initialized
+    }
+}
+
 fn main() -> std::io::Result<()> {
     let db = Db::memory().expect("open db");
     Todo::migrate(&db).expect("migrate");

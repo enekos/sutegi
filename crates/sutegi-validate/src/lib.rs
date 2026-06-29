@@ -62,16 +62,26 @@ pub enum Rule {
     Number,
     Bool,
     Email,
+    /// Letters only.
+    Alpha,
+    /// Letters and digits only.
+    AlphaNum,
+    /// An `http(s)://host…` URL.
+    Url,
     /// Minimum numeric value.
     Min(f64),
     /// Maximum numeric value.
     Max(f64),
+    /// Inclusive numeric range `[min, max]`.
+    Between(f64, f64),
     /// Minimum length (string chars or array items).
     MinLen(usize),
     /// Maximum length (string chars or array items).
     MaxLen(usize),
     /// Value (as a string) must be one of these.
     In(Vec<String>),
+    /// Must equal the value of another field (e.g. password confirmation).
+    Same(String),
 }
 
 /// A set of `field -> rules` mappings, validated against a JSON object.
@@ -108,7 +118,14 @@ impl Ruleset {
 
             let value = value.unwrap();
             for rule in rules {
-                check_rule(name, rule, value, &mut errors);
+                // `Same` needs sibling-field access, so it's handled here.
+                if let Rule::Same(other) = rule {
+                    if data.get(other) != Some(value) {
+                        errors.add(name, format!("The {} must match {}.", name, other));
+                    }
+                } else {
+                    check_rule(name, rule, value, &mut errors);
+                }
             }
         }
         errors.into_result()
@@ -145,6 +162,39 @@ fn check_rule(field: &str, rule: &Rule, value: &Json, errors: &mut ValidationErr
                 errors.add(field, format!("The {} must be a valid email address.", field));
             }
         }
+        Rule::Alpha => {
+            let ok = value
+                .as_str()
+                .map(|s| !s.is_empty() && s.chars().all(|c| c.is_alphabetic()))
+                .unwrap_or(false);
+            if !ok {
+                errors.add(field, format!("The {} may only contain letters.", field));
+            }
+        }
+        Rule::AlphaNum => {
+            let ok = value
+                .as_str()
+                .map(|s| !s.is_empty() && s.chars().all(|c| c.is_alphanumeric()))
+                .unwrap_or(false);
+            if !ok {
+                errors.add(field, format!("The {} may only contain letters and numbers.", field));
+            }
+        }
+        Rule::Url => {
+            let ok = value.as_str().map(is_url).unwrap_or(false);
+            if !ok {
+                errors.add(field, format!("The {} must be a valid URL.", field));
+            }
+        }
+        Rule::Between(min, max) => {
+            if let Some(n) = value.as_f64() {
+                if n < *min || n > *max {
+                    errors.add(field, format!("The {} must be between {} and {}.", field, min, max));
+                }
+            }
+        }
+        // Handled in `Ruleset::validate` (needs sibling-field access).
+        Rule::Same(_) => {}
         Rule::Min(min) => {
             if let Some(n) = value.as_f64() {
                 if n < *min {
@@ -208,6 +258,16 @@ fn is_email(s: &str) -> bool {
         && !domain.starts_with('.')
         && !domain.ends_with('.')
         && !s.contains(char::is_whitespace)
+}
+
+/// A minimal URL check: `http(s)://` followed by a non-empty, space-free host.
+fn is_url(s: &str) -> bool {
+    let rest = match s.strip_prefix("https://").or_else(|| s.strip_prefix("http://")) {
+        Some(r) => r,
+        None => return false,
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    !host.is_empty() && !host.contains(char::is_whitespace)
 }
 
 // ---- JSON Schema subset validator -----------------------------------------
@@ -358,6 +418,38 @@ mod tests {
             ("role", Json::str("admin")),
         ]);
         assert!(rules.validate(&data).is_ok());
+    }
+
+    #[test]
+    fn new_rules() {
+        let rules = Ruleset::new()
+            .field("slug", &[Rule::AlphaNum])
+            .field("site", &[Rule::Url])
+            .field("age", &[Rule::Between(0.0, 120.0)])
+            .field("password", &[Rule::Required])
+            .field("password_confirmation", &[Rule::Same("password".into())]);
+
+        let bad = Json::obj(vec![
+            ("slug", Json::str("no spaces!")),
+            ("site", Json::str("ftp://x")),
+            ("age", Json::num(200)),
+            ("password", Json::str("secret")),
+            ("password_confirmation", Json::str("typo")),
+        ]);
+        let j = rules.validate(&bad).unwrap_err().to_json();
+        assert!(j.get("slug").is_some());
+        assert!(j.get("site").is_some());
+        assert!(j.get("age").is_some());
+        assert!(j.get("password_confirmation").is_some());
+
+        let good = Json::obj(vec![
+            ("slug", Json::str("hello123")),
+            ("site", Json::str("https://join.com/path")),
+            ("age", Json::num(30)),
+            ("password", Json::str("secret")),
+            ("password_confirmation", Json::str("secret")),
+        ]);
+        assert!(rules.validate(&good).is_ok());
     }
 
     #[test]
