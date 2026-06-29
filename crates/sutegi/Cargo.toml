@@ -13,4 +13,9 @@ sutegi-json = { path = "../sutegi-json" }
 sutegi-http = { path = "../sutegi-http" }
 sutegi-web = { path = "../sutegi-web" }
 sutegi-orm = { path = "../sutegi-orm" }
+sutegi-validate = { path = "../sutegi-validate" }
 sutegi-ai = { path = "../sutegi-ai" }
+
+[features]
+# Opt in to the runnable, bundled SQLite execution layer in sutegi-orm.
+sqlite = ["sutegi-orm/sqlite"]

@@ -13,6 +13,7 @@
 use std::sync::Arc;
 
 use sutegi_json::Json;
+pub use sutegi_validate::{validate_schema, ValidationErrors};
 use sutegi_web::{json, json_body, App, Params, Request, Response};
 
 /// A callable unit of work an agent can invoke. The `parameters` schema is a
@@ -40,6 +41,11 @@ impl ToolRegistry {
         self
     }
 
+    /// Look up a tool by name.
+    pub fn tool(&self, name: &str) -> Option<&dyn Tool> {
+        self.tools.iter().find(|t| t.name() == name).map(|b| b.as_ref())
+    }
+
     /// One manifest entry per tool, in the `{name, description, input_schema}`
     /// shape that maps directly onto LLM tool-calling APIs.
     pub fn schema_entries(&self) -> Vec<Json> {
@@ -60,15 +66,17 @@ impl ToolRegistry {
         Json::arr(self.schema_entries())
     }
 
-    /// Invoke a tool by name, validating arguments against its declared
-    /// required fields before dispatch.
+    /// Invoke a tool by name, validating arguments against its full JSON
+    /// Schema (`type`, `required`, `enum`, bounds, …) before dispatch. On
+    /// validation failure, the error string is a compact JSON object so
+    /// programmatic callers still get structured detail.
     pub fn call(&self, name: &str, args: Json) -> Result<Json, String> {
         let tool = self
-            .tools
-            .iter()
-            .find(|t| t.name() == name)
+            .tool(name)
             .ok_or_else(|| format!("unknown tool '{}'", name))?;
-        validate_against(&tool.parameters(), &args)?;
+        if let Err(errs) = validate_schema(&tool.parameters(), &args) {
+            return Err(errs.to_json().to_string());
+        }
         tool.call(args)
     }
 }
@@ -100,7 +108,26 @@ pub fn mount(mut app: App, registry: ToolRegistry) -> App {
                     return json(400, &Json::obj(vec![("error", Json::str(e))]));
                 }
             };
-            match invoke.call(&name, args) {
+            let tool = match invoke.tool(&name) {
+                Some(t) => t,
+                None => {
+                    return json(
+                        404,
+                        &Json::obj(vec![("error", Json::str(format!("unknown tool '{}'", name)))]),
+                    );
+                }
+            };
+            // Type-aware validation against the tool's declared input schema.
+            if let Err(errs) = validate_schema(&tool.parameters(), &args) {
+                return json(
+                    422,
+                    &Json::obj(vec![
+                        ("error", Json::str("validation failed")),
+                        ("errors", errs.to_json()),
+                    ]),
+                );
+            }
+            match tool.call(args) {
                 Ok(out) => json(200, &out),
                 Err(e) => json(422, &Json::obj(vec![("error", Json::str(e))])),
             }
@@ -108,23 +135,6 @@ pub fn mount(mut app: App, registry: ToolRegistry) -> App {
     );
 
     app
-}
-
-/// Validate a JSON value against the `required` list of a JSON Schema object.
-/// Deliberately lightweight: presence checking is what catches the common
-/// agent mistake (omitting a required field); full type validation is left to
-/// the tool body, which has the real domain context.
-pub fn validate_against(schema: &Json, value: &Json) -> Result<(), String> {
-    if let Some(Json::Arr(required)) = schema.get("required") {
-        for field in required {
-            if let Json::Str(name) = field {
-                if value.get(name).is_none() {
-                    return Err(format!("missing required field '{}'", name));
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Helpers to construct JSON Schema fragments for tool `parameters`, so

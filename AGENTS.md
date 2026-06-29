@@ -47,8 +47,10 @@ Content-Type: application/json
 ```
 
 - `200` → the tool's JSON result.
-- `422 { "error": "missing required field 'title'" }` → arguments failed the
-  schema's `required` check. Fix and retry.
+- `422 { "error": "validation failed", "errors": { "<field>": ["..."] } }` →
+  arguments failed the tool's JSON Schema (type, `required`, `enum`, bounds).
+  The `errors` map is keyed by dotted field path — fix those fields and retry.
+- `404 { "error": "unknown tool '<name>'" }` → no such tool.
 - `400 { "error": "..." }` → the body was not valid JSON.
 
 ## Conventions you can rely on

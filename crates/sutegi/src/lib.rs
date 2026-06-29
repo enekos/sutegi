@@ -26,6 +26,7 @@ pub use sutegi_ai as ai;
 pub use sutegi_http as http;
 pub use sutegi_json as json;
 pub use sutegi_orm as orm;
+pub use sutegi_validate as validate;
 pub use sutegi_web as web;
 
 /// The common imports for building an app.
@@ -33,7 +34,11 @@ pub mod prelude {
     pub use sutegi_ai::{schema, Tool, ToolRegistry};
     pub use sutegi_json::Json;
     pub use sutegi_orm::{ColType, Column, Model, QueryBuilder, TableSchema, Value};
+    pub use sutegi_validate::{validate_schema, Rule, Ruleset, ValidationErrors};
     pub use sutegi_web::{
         json, json_body, not_found, query_params, text, App, Method, Params, Request, Response,
     };
+
+    #[cfg(feature = "sqlite")]
+    pub use sutegi_orm::db::Db;
 }

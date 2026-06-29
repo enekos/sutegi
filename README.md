@@ -48,8 +48,9 @@ fn main() -> std::io::Result<()> {
 | `sutegi-json` | JSON value, serializer, parser (deterministic key order). |
 | `sutegi-http` | HTTP/1.1 parsing + thread-pool server on `std::net`. |
 | `sutegi-web`  | Router, `App` builder, middleware, extractors, `/__introspect`. |
-| `sutegi-orm`  | Typed schema, fluent parameterized query builder, migration emitter. |
-| `sutegi-ai`   | `Tool` trait, registry, LLM manifest, `/__tools` endpoints. |
+| `sutegi-orm`  | Typed schema, fluent parameterized query builder, migration emitter, optional runnable SQLite layer (`sqlite` feature). |
+| `sutegi-validate` | Laravel-`Validator`-style rule sets **and** a JSON Schema subset validator, with structured errors. |
+| `sutegi-ai`   | `Tool` trait, registry, LLM manifest, `/__tools` endpoints (args validated against each tool's schema). |
 | `sutegi`      | Facade crate + `prelude`. |
 | `sutegi-cli`  | The `sutegi` command: scaffold apps/models/routes, `introspect` a live app. |
 
@@ -63,6 +64,47 @@ A sutegi app is drivable by an LLM with no source access and no integration code
    validation rejects malformed calls with a clear error.
 
 See [`AGENTS.md`](./AGENTS.md) for the full agent-facing contract.
+
+## Database (the `sqlite` feature)
+
+The core ships **no** database driver — the query builder just emits
+`(sql, params)`, keeping the default binary tiny. Opt in to a runnable, bundled
+SQLite layer with `--features sqlite`:
+
+```rust
+use sutegi::prelude::*;          // brings in Db when the feature is on
+
+let db = Db::memory()?;          // or Db::open("app.db")?
+Todo::migrate(&db)?;             // CREATE TABLE from the model schema
+
+let id = Todo::create(&db, &[("title", Value::Text("ship sutegi".into()))])?;
+let one  = Todo::find(&db, Value::Int(id))?;   // Option<Json>
+let all  = Todo::all(&db)?;                     // Vec<Json>
+```
+
+Rows come back as JSON objects (no derive macro needed) — consistent with the
+"machine-readable everything" stance. Enabling `sqlite` grows the binary to
+~1.3 MB (bundled SQLite); the zero-dep core remains ~378 KB.
+
+## Validation
+
+Two entry points, one structured error shape (`{ field: [messages] }`):
+
+```rust
+// Laravel-style request validation
+let rules = Ruleset::new()
+    .field("title", &[Rule::Required, Rule::Str, Rule::MinLen(1), Rule::MaxLen(200)])
+    .field("done",  &[Rule::Bool]);
+rules.validate(&body)?;          // Err(ValidationErrors) -> errs.to_json()
+```
+
+AI tool arguments are validated automatically against each tool's declared
+`input_schema` (type, `required`, `enum`, bounds), so a malformed agent call
+gets a precise `422`:
+
+```json
+{ "error": "validation failed", "errors": { "title": ["expected type 'string'"] } }
+```
 
 ## CLI
 
@@ -78,9 +120,10 @@ so an LLM can extend a sutegi app correctly with minimal context.
 
 ## Status
 
-Early. The query builder emits SQL but ships no bundled driver (keeping the
-binary tiny is the point); wire your own, or a future optional `rusqlite`
-feature. HTTP is 1.1, connection-per-request, no TLS. See the roadmap in the
-thinking-os project page.
+Early but usable. The ORM now runs against SQLite behind the opt-in `sqlite`
+feature (migrate / `all` / `find` / `create`); validation covers requests and
+AI tool args. HTTP is 1.1, connection-per-request, no TLS. Booleans round-trip
+through SQLite as `0`/`1` (no native bool). Next: typed row mapping / a derive
+macro, form-encoded bodies, keep-alive.
 
 MIT © 2026 Eneko Sarasola
