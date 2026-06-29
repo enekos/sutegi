@@ -86,6 +86,32 @@ impl Tool for CreateTodo {
     }
 }
 
+/// A streaming AI tool: emits its answer token-by-token over SSE. This is the
+/// shape an agent consumes for live LLM output (`POST /__tools/stream_answer/stream`).
+struct StreamAnswer;
+
+impl StreamTool for StreamAnswer {
+    fn name(&self) -> &str {
+        "stream_answer"
+    }
+    fn description(&self) -> &str {
+        "Stream an answer token-by-token as Server-Sent Events."
+    }
+    fn parameters(&self) -> Json {
+        schema::object(vec![("prompt", schema::string("the prompt"))], &["prompt"])
+    }
+    fn run(&self, args: Json, sink: &mut SseSink) -> std::io::Result<()> {
+        let prompt = args.get("prompt").and_then(|j| j.as_str()).unwrap_or("");
+        let reply = format!("you asked: {} — here is your streamed reply.", prompt);
+        for token in reply.split(' ') {
+            sink.data(token)?;
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+        sink.event("done", "{}")?;
+        Ok(())
+    }
+}
+
 fn main() -> std::io::Result<()> {
     let db = Db::memory().expect("open db");
     Todo::migrate(&db).expect("migrate");
@@ -110,6 +136,15 @@ fn main() -> std::io::Result<()> {
         .get("/", "Health check.", |_req, _p| text(200, "sutegi up"))
         .get("/__queue", "Background queue stats.", move |_req, _p| {
             json(200, &stats_queue.stats().to_json())
+        })
+        .get("/stream", "SSE demo: stream three ticks then a done event.", |_req, _p| {
+            sse(|sink| {
+                for i in 1..=3 {
+                    sink.data(&format!("tick {}", i))?;
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                }
+                sink.event("done", "bye")
+            })
         })
         .group("/api", vec![logger], move |g| {
             let list_db = Arc::clone(&list_db);
@@ -160,15 +195,19 @@ fn main() -> std::io::Result<()> {
 
     let app = sutegi::ai::mount(
         app,
-        ToolRegistry::new().add(CreateTodo {
-            db: Arc::clone(&db),
-            queue: Arc::clone(&queue),
-        }),
+        ToolRegistry::new()
+            .add(CreateTodo {
+                db: Arc::clone(&db),
+                queue: Arc::clone(&queue),
+            })
+            .add_stream(StreamAnswer),
     );
 
     let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:8080".to_string());
     println!("sutegi todo-demo on http://{addr}");
     println!("  GET  /__introspect | /__tools | /__queue");
+    println!("  GET  /stream                       — SSE demo");
+    println!("  POST /__tools/stream_answer/stream  — streaming AI tool (SSE)");
     println!("  /api/todos (GET, POST), /api/todos/:id (GET, route-model binding)");
     app.run(&addr)
 }

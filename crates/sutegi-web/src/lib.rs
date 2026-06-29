@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-pub use sutegi_http::{Method, Request, Response};
+pub use sutegi_http::{Body, Method, Request, Response, SseSink, StreamSink};
 use sutegi_json::Json;
 
 /// Path parameters captured from a route pattern (`:name` segments).
@@ -325,6 +325,36 @@ pub fn json(status: u16, value: &Json) -> Response {
 /// A canned 404.
 pub fn not_found() -> Response {
     text(404, "404 Not Found")
+}
+
+/// A streaming response: `producer` writes (and flushes) bytes over time via a
+/// [`StreamSink`]. Sets the given `content_type`; no `Content-Length`.
+pub fn stream(
+    status: u16,
+    content_type: &str,
+    producer: impl FnOnce(&mut StreamSink) -> std::io::Result<()> + Send + 'static,
+) -> Response {
+    Response::new(status)
+        .with_header("content-type", content_type)
+        .with_stream(move |w| {
+            let mut sink = StreamSink::new(w);
+            producer(&mut sink)
+        })
+}
+
+/// A Server-Sent Events response. `producer` pushes events through an
+/// [`SseSink`] (`data` / `event` / `comment`), each flushed immediately — the
+/// natural transport for streaming LLM tokens to a browser or agent.
+pub fn sse(
+    producer: impl FnOnce(&mut SseSink) -> std::io::Result<()> + Send + 'static,
+) -> Response {
+    Response::new(200)
+        .with_header("content-type", "text/event-stream")
+        .with_header("cache-control", "no-cache")
+        .with_stream(move |w| {
+            let mut sink = SseSink::new(w);
+            producer(&mut sink)
+        })
 }
 
 // ---- extractors -----------------------------------------------------------

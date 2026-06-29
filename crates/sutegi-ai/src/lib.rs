@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use sutegi_json::Json;
 pub use sutegi_validate::{validate_schema, ValidationErrors};
-use sutegi_web::{json, json_body, App, Params, Request, Response};
+use sutegi_web::{json, json_body, sse, App, Params, Request, Response, SseSink};
 
 /// A callable unit of work an agent can invoke. The `parameters` schema is a
 /// JSON Schema object describing the expected argument shape.
@@ -25,19 +25,39 @@ pub trait Tool: Send + Sync + 'static {
     fn call(&self, args: Json) -> Result<Json, String>;
 }
 
+/// A tool that streams its output as Server-Sent Events — the shape an agent
+/// uses for token-by-token LLM responses. Invoked at `POST /__tools/:name/stream`.
+pub trait StreamTool: Send + Sync + 'static {
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
+    fn parameters(&self) -> Json;
+    /// Produce the stream. Push events via `sink` (each is flushed immediately).
+    fn run(&self, args: Json, sink: &mut SseSink) -> std::io::Result<()>;
+}
+
 /// A collection of tools, exposable as a manifest and invokable by name.
 #[derive(Default)]
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
+    stream_tools: Vec<Box<dyn StreamTool>>,
 }
 
 impl ToolRegistry {
     pub fn new() -> ToolRegistry {
-        ToolRegistry { tools: Vec::new() }
+        ToolRegistry {
+            tools: Vec::new(),
+            stream_tools: Vec::new(),
+        }
     }
 
     pub fn add(mut self, tool: impl Tool) -> ToolRegistry {
         self.tools.push(Box::new(tool));
+        self
+    }
+
+    /// Register a streaming (SSE) tool.
+    pub fn add_stream(mut self, tool: impl StreamTool) -> ToolRegistry {
+        self.stream_tools.push(Box::new(tool));
         self
     }
 
@@ -46,19 +66,25 @@ impl ToolRegistry {
         self.tools.iter().find(|t| t.name() == name).map(|b| b.as_ref())
     }
 
-    /// One manifest entry per tool, in the `{name, description, input_schema}`
-    /// shape that maps directly onto LLM tool-calling APIs.
+    /// Look up a streaming tool by name.
+    pub fn stream_tool(&self, name: &str) -> Option<&dyn StreamTool> {
+        self.stream_tools.iter().find(|t| t.name() == name).map(|b| b.as_ref())
+    }
+
+    /// One manifest entry per tool, in the `{name, description, input_schema,
+    /// streaming}` shape that maps directly onto LLM tool-calling APIs. The
+    /// `streaming` flag tells an agent to call `/__tools/:name/stream` (SSE)
+    /// instead of `/__tools/:name`.
     pub fn schema_entries(&self) -> Vec<Json> {
-        self.tools
+        let mut entries: Vec<Json> = self
+            .tools
             .iter()
-            .map(|t| {
-                Json::obj(vec![
-                    ("name", Json::str(t.name())),
-                    ("description", Json::str(t.description())),
-                    ("input_schema", t.parameters()),
-                ])
-            })
-            .collect()
+            .map(|t| manifest_entry(t.name(), t.description(), t.parameters(), false))
+            .collect();
+        for t in &self.stream_tools {
+            entries.push(manifest_entry(t.name(), t.description(), t.parameters(), true));
+        }
+        entries
     }
 
     /// The full manifest as a JSON array.
@@ -134,7 +160,59 @@ pub fn mount(mut app: App, registry: ToolRegistry) -> App {
         },
     );
 
+    // Streaming tool invocation over Server-Sent Events.
+    let stream_reg = Arc::clone(&registry);
+    app = app.post(
+        "/__tools/:name/stream",
+        "Invoke a streaming AI tool by name; response is text/event-stream (SSE).",
+        move |req: &Request, p: &Params| -> Response {
+            let name = p.get("name").cloned().unwrap_or_default();
+            let args = match json_body(req) {
+                Ok(v) => v,
+                Err(e) => return json(400, &Json::obj(vec![("error", Json::str(e))])),
+            };
+            // Validate up front, while we can still send a normal JSON error.
+            match stream_reg.stream_tool(&name) {
+                None => {
+                    return json(
+                        404,
+                        &Json::obj(vec![("error", Json::str(format!("unknown streaming tool '{}'", name)))]),
+                    )
+                }
+                Some(tool) => {
+                    if let Err(errs) = validate_schema(&tool.parameters(), &args) {
+                        return json(
+                            422,
+                            &Json::obj(vec![
+                                ("error", Json::str("validation failed")),
+                                ("errors", errs.to_json()),
+                            ]),
+                        );
+                    }
+                }
+            }
+            // Hand off to the SSE stream; re-resolve the tool inside the producer.
+            let reg = Arc::clone(&stream_reg);
+            sse(move |sink: &mut SseSink| {
+                if let Some(tool) = reg.stream_tool(&name) {
+                    tool.run(args, sink)
+                } else {
+                    Ok(())
+                }
+            })
+        },
+    );
+
     app
+}
+
+fn manifest_entry(name: &str, description: &str, parameters: Json, streaming: bool) -> Json {
+    Json::obj(vec![
+        ("name", Json::str(name)),
+        ("description", Json::str(description)),
+        ("input_schema", parameters),
+        ("streaming", Json::Bool(streaming)),
+    ])
 }
 
 /// Helpers to construct JSON Schema fragments for tool `parameters`, so

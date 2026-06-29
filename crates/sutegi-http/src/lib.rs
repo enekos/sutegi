@@ -74,12 +74,22 @@ impl Request {
     }
 }
 
+/// A response body: either fully buffered, or streamed incrementally.
+///
+/// Streaming leans on the connection-per-request, `Connection: close` model:
+/// we omit `Content-Length`, write the headers, then hand the raw socket to a
+/// producer closure that flushes bytes over time. The client reads until the
+/// connection closes (a valid HTTP/1.1 framing). No chunked encoding, no async.
+pub enum Body {
+    Full(Vec<u8>),
+    Stream(Box<dyn FnOnce(&mut dyn Write) -> io::Result<()> + Send + 'static>),
+}
+
 /// An HTTP response.
-#[derive(Clone, Debug)]
 pub struct Response {
     pub status: u16,
     pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
+    pub body: Body,
 }
 
 impl Response {
@@ -87,7 +97,7 @@ impl Response {
         Response {
             status,
             headers: Vec::new(),
-            body: Vec::new(),
+            body: Body::Full(Vec::new()),
         }
     }
 
@@ -97,8 +107,89 @@ impl Response {
     }
 
     pub fn with_body(mut self, body: impl Into<Vec<u8>>) -> Response {
-        self.body = body.into();
+        self.body = Body::Full(body.into());
         self
+    }
+
+    /// Stream the body: `producer` is given the raw writer and flushes chunks
+    /// as they become available. Prefer the higher-level `StreamSink` /
+    /// `SseSink` wrappers (see `sutegi-web`'s `stream()` / `sse()`).
+    pub fn with_stream(
+        mut self,
+        producer: impl FnOnce(&mut dyn Write) -> io::Result<()> + Send + 'static,
+    ) -> Response {
+        self.body = Body::Stream(Box::new(producer));
+        self
+    }
+
+    /// Whether this response streams (no `Content-Length`).
+    pub fn is_stream(&self) -> bool {
+        matches!(self.body, Body::Stream(_))
+    }
+}
+
+/// A flushing sink for raw streamed bytes. Every `write` is flushed so the
+/// client sees data immediately.
+pub struct StreamSink<'a> {
+    w: &'a mut dyn Write,
+}
+
+impl<'a> StreamSink<'a> {
+    pub fn new(w: &'a mut dyn Write) -> StreamSink<'a> {
+        StreamSink { w }
+    }
+
+    pub fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.w.write_all(bytes)?;
+        self.w.flush()
+    }
+
+    pub fn write_str(&mut self, s: &str) -> io::Result<()> {
+        self.write(s.as_bytes())
+    }
+}
+
+/// A flushing sink that formats Server-Sent Events (`text/event-stream`).
+/// Each call emits one event frame and flushes — exactly what LLM token
+/// streaming wants.
+pub struct SseSink<'a> {
+    w: &'a mut dyn Write,
+}
+
+impl<'a> SseSink<'a> {
+    pub fn new(w: &'a mut dyn Write) -> SseSink<'a> {
+        SseSink { w }
+    }
+
+    /// Send a `data:` event (multi-line data is split across `data:` lines).
+    pub fn data(&mut self, data: &str) -> io::Result<()> {
+        for line in data.split('\n') {
+            write!(self.w, "data: {}\n", line)?;
+        }
+        self.w.write_all(b"\n")?;
+        self.w.flush()
+    }
+
+    /// Send a named event.
+    pub fn event(&mut self, event: &str, data: &str) -> io::Result<()> {
+        write!(self.w, "event: {}\n", event)?;
+        for line in data.split('\n') {
+            write!(self.w, "data: {}\n", line)?;
+        }
+        self.w.write_all(b"\n")?;
+        self.w.flush()
+    }
+
+    /// Send a comment line (`: ...`) — useful as a keep-alive heartbeat.
+    pub fn comment(&mut self, text: &str) -> io::Result<()> {
+        write!(self.w, ": {}\n\n", text)?;
+        self.w.flush()
+    }
+
+    /// Suggest a client reconnection delay (ms).
+    pub fn retry(&mut self, millis: u64) -> io::Result<()> {
+        write!(self.w, "retry: {}\n\n", millis)?;
+        self.w.flush()
     }
 }
 
@@ -156,8 +247,9 @@ pub fn parse_request<R: BufRead>(reader: &mut R) -> io::Result<Option<Request>> 
 }
 
 /// Write a response to the stream. Always closes the connection (no keep-alive)
-/// to keep the server stateless and simple.
-pub fn write_response<W: Write>(w: &mut W, resp: &Response) -> io::Result<()> {
+/// to keep the server stateless and simple. Takes the response by value so a
+/// streaming body's `FnOnce` producer can be invoked.
+pub fn write_response<W: Write>(w: &mut W, resp: Response) -> io::Result<()> {
     let reason = status_reason(resp.status);
     let mut head = format!("HTTP/1.1 {} {}\r\n", resp.status, reason);
     let mut has_content_type = false;
@@ -170,11 +262,23 @@ pub fn write_response<W: Write>(w: &mut W, resp: &Response) -> io::Result<()> {
     if !has_content_type {
         head.push_str("content-type: text/plain; charset=utf-8\r\n");
     }
-    head.push_str(&format!("content-length: {}\r\n", resp.body.len()));
-    head.push_str("connection: close\r\n\r\n");
-    w.write_all(head.as_bytes())?;
-    w.write_all(&resp.body)?;
-    w.flush()
+
+    match resp.body {
+        Body::Full(bytes) => {
+            head.push_str(&format!("content-length: {}\r\n", bytes.len()));
+            head.push_str("connection: close\r\n\r\n");
+            w.write_all(head.as_bytes())?;
+            w.write_all(&bytes)?;
+            w.flush()
+        }
+        Body::Stream(producer) => {
+            // No content-length: framing is "read until close".
+            head.push_str("connection: close\r\n\r\n");
+            w.write_all(head.as_bytes())?;
+            w.flush()?;
+            producer(w)
+        }
+    }
 }
 
 /// Map a status code to its canonical reason phrase (the common ones).
@@ -225,7 +329,7 @@ where
     if let Some(req) = parse_request(&mut reader)? {
         let resp = handler(req);
         let mut writer = stream;
-        write_response(&mut writer, &resp)?;
+        write_response(&mut writer, resp)?;
     }
     Ok(())
 }
@@ -301,10 +405,29 @@ mod tests {
     fn writes_response_with_default_content_type() {
         let resp = Response::new(200).with_body("hi");
         let mut buf = Vec::new();
-        write_response(&mut buf, &resp).unwrap();
+        write_response(&mut buf, resp).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(s.contains("content-length: 2\r\n"));
         assert!(s.ends_with("\r\n\r\nhi"));
+    }
+
+    #[test]
+    fn streams_without_content_length() {
+        let resp = Response::new(200)
+            .with_header("content-type", "text/event-stream")
+            .with_stream(|w| {
+                let mut sink = SseSink::new(w);
+                sink.data("one")?;
+                sink.data("two")?;
+                Ok(())
+            });
+        let mut buf = Vec::new();
+        write_response(&mut buf, resp).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("content-type: text/event-stream\r\n"));
+        assert!(!s.to_lowercase().contains("content-length"));
+        assert!(s.contains("data: one\n\n"));
+        assert!(s.contains("data: two\n\n"));
     }
 }

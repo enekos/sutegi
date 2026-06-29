@@ -53,6 +53,27 @@ Content-Type: application/json
 - `404 { "error": "unknown tool '<name>'" }` → no such tool.
 - `400 { "error": "..." }` → the body was not valid JSON.
 
+## 4. Streaming tools (SSE)
+
+Manifest entries with `"streaming": true` are invoked at a different endpoint
+and return a Server-Sent Events stream instead of a single JSON body:
+
+```
+POST /__tools/<name>/stream
+Content-Type: application/json
+
+{ "prompt": "…" }
+```
+
+- Response is `text/event-stream`; read it incrementally. Frames look like
+  `data: <chunk>\n\n`, with a final `event: done` frame.
+- Validation still runs first: a bad argument object returns a normal JSON
+  `422` *before* the stream opens, so you can distinguish "rejected" from
+  "stream ended".
+
+Non-streaming tools (`"streaming": false`) use `POST /__tools/<name>` and return
+one JSON result, as in §3.
+
 ## Conventions you can rely on
 
 - All framework endpoints are namespaced under `/__`.

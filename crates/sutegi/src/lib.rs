@@ -70,15 +70,15 @@ pub mod binding {
 
 /// The common imports for building an app.
 pub mod prelude {
-    pub use sutegi_ai::{schema, Tool, ToolRegistry};
+    pub use sutegi_ai::{schema, StreamTool, Tool, ToolRegistry};
     pub use sutegi_json::Json;
     pub use sutegi_orm::row::FromRow;
     pub use sutegi_orm::{ColType, Column, Model, QueryBuilder, TableSchema, Value};
     pub use sutegi_queue::{Job, Queue};
     pub use sutegi_validate::{validate_schema, Rule, Ruleset, ValidationErrors};
     pub use sutegi_web::{
-        json, json_body, mw, not_found, query_params, text, App, Group, Method, Mw, Params,
-        Request, Response,
+        json, json_body, mw, not_found, query_params, sse, stream, text, App, Group, Method, Mw,
+        Params, Request, Response, SseSink, StreamSink,
     };
 
     #[cfg(feature = "derive")]

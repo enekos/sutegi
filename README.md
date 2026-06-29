@@ -47,7 +47,7 @@ fn main() -> std::io::Result<()> {
 |-------|----------------|
 | `sutegi-json` | JSON value, serializer, parser (deterministic key order). |
 | `sutegi-http` | HTTP/1.1 parsing + thread-pool server on `std::net`. |
-| `sutegi-web`  | Router, `App` builder, middleware, extractors, `/__introspect`. |
+| `sutegi-web`  | Router, `App` builder, middleware, groups, extractors, streaming (`sse`/`stream`), `/__introspect`. |
 | `sutegi-orm`  | Typed schema, fluent parameterized query builder, migration emitter, optional runnable SQLite layer (`sqlite` feature). |
 | `sutegi-macros` | `#[derive(Model)]` — schema, typed JSON hydration, inserts. Compile-time only (syn/quote never reach your binary). |
 | `sutegi-validate` | Laravel-`Validator`-style rule sets **and** a JSON Schema subset validator, with structured errors. |
@@ -172,6 +172,51 @@ gets a precise `422`:
 { "error": "validation failed", "errors": { "title": ["expected type 'string'"] } }
 ```
 
+## Streaming (SSE & raw)
+
+Because the server is blocking thread-per-connection, streaming is trivial: a
+handler just writes and flushes over time, and the worker thread provides
+natural backpressure. No async, no chunked encoding (framing is "read until
+close", valid HTTP/1.1).
+
+```rust
+// Server-Sent Events — the natural transport for LLM tokens.
+.get("/stream", "SSE demo", |_req, _p| sse(|sink| {
+    for i in 1..=3 {
+        sink.data(&format!("tick {i}"))?;     // each frame is flushed immediately
+        std::thread::sleep(std::time::Duration::from_millis(80));
+    }
+    sink.event("done", "bye")
+}))
+
+// Or raw byte streaming (NDJSON, large exports, …):
+.get("/export", "stream rows", |_req, _p| stream(200, "application/x-ndjson", |sink| {
+    for row in rows() { sink.write_str(&format!("{}\n", row.to_json()))?; }
+    Ok(())
+}))
+```
+
+Streaming tools for agents implement `StreamTool` and are invoked over SSE at
+`POST /__tools/:name/stream`:
+
+```rust
+struct StreamAnswer;
+impl StreamTool for StreamAnswer {
+    fn name(&self) -> &str { "stream_answer" }
+    fn description(&self) -> &str { "Stream an answer token-by-token." }
+    fn parameters(&self) -> Json { schema::object(vec![("prompt", schema::string("…"))], &["prompt"]) }
+    fn run(&self, args: Json, sink: &mut SseSink) -> std::io::Result<()> {
+        for tok in answer(&args).split(' ') { sink.data(tok)?; }
+        sink.event("done", "{}")
+    }
+}
+// registry.add_stream(StreamAnswer)
+```
+
+The `/__tools` manifest marks these with `"streaming": true`, so an agent knows
+to hit the SSE endpoint. Argument validation happens *before* the stream opens,
+so malformed calls still get a normal JSON `422`.
+
 ## CLI
 
 ```bash
@@ -189,8 +234,9 @@ so an LLM can extend a sutegi app correctly with minimal context.
 Early but increasingly capable. Typed models (`#[derive(Model)]`), a runnable
 SQLite ORM (opt-in `sqlite`), validation (requests + AI tool args), route groups
 + middleware, route-model binding, and a background job queue all work and are
-exercised by the `todo` example. HTTP is 1.1, connection-per-request, no TLS.
-Next: form-encoded bodies, keep-alive, a durable (SQLite-backed) queue driver,
+exercised by the `todo` example. Streaming responses (SSE + raw) and streaming
+AI tools are supported. HTTP is 1.1, connection-per-request, no TLS. Next:
+form-encoded bodies, keep-alive, a durable (SQLite-backed) queue driver,
 relations/joins in the query builder.
 
 MIT © 2026 Eneko Sarasola
