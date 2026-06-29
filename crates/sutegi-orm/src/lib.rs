@@ -127,6 +127,25 @@ pub trait Model {
     fn create(conn: &db::Db, values: &[(&str, Value)]) -> Result<i64, String> {
         conn.insert(Self::table(), values)
     }
+
+    /// Typed variant of [`all`](Model::all): hydrate every row into `Self`.
+    #[cfg(feature = "sqlite")]
+    fn all_typed(conn: &db::Db) -> Result<Vec<Self>, String>
+    where
+        Self: Sized + FromRow,
+    {
+        conn.fetch::<Self>(&Self::query())
+    }
+
+    /// Typed variant of [`find`](Model::find): hydrate the matching row.
+    #[cfg(feature = "sqlite")]
+    fn find_typed(conn: &db::Db, id: Value) -> Result<Option<Self>, String>
+    where
+        Self: Sized + FromRow,
+    {
+        let rows = conn.fetch::<Self>(&Self::query().filter(Self::primary_key(), "=", id).limit(1))?;
+        Ok(rows.into_iter().next())
+    }
 }
 
 /// A thin, runnable SQLite execution layer over the query builder. Available
@@ -195,6 +214,12 @@ pub mod db {
         pub fn select(&self, qb: &QueryBuilder) -> Result<Vec<Json>, String> {
             let (sql, params) = qb.build();
             self.query(&sql, &params)
+        }
+
+        /// Run a query builder and hydrate each row into a typed `FromRow`.
+        pub fn fetch<T: crate::FromRow>(&self, qb: &QueryBuilder) -> Result<Vec<T>, String> {
+            let rows = self.select(qb)?;
+            rows.iter().map(T::from_row).collect()
         }
 
         /// Run an arbitrary SELECT and return rows as JSON objects.
@@ -272,6 +297,76 @@ pub mod db {
             assert_eq!(rows[0].get("title").unwrap(), &Json::str("ship sutegi"));
             assert_eq!(rows[0].get("id").unwrap(), &Json::int(1));
         }
+    }
+}
+
+/// Hydration from a JSON row (as produced by the `sqlite` layer or any JSON
+/// source) into a typed struct. Implemented by `#[derive(Model)]`.
+pub trait FromRow: Sized {
+    fn from_row(row: &sutegi_json::Json) -> Result<Self, String>;
+}
+
+/// Column extractors used by generated `FromRow` impls. They tolerate the
+/// SQLite quirks (booleans stored as `0`/`1`, integers arriving as floats),
+/// which is what makes typed round-tripping clean.
+pub mod row {
+    pub use crate::FromRow;
+    use sutegi_json::Json;
+
+    fn col<'a>(row: &'a Json, name: &str) -> Result<&'a Json, String> {
+        row.get(name).ok_or_else(|| format!("missing column '{}'", name))
+    }
+
+    fn is_absent(row: &Json, name: &str) -> bool {
+        matches!(row.get(name), None | Some(Json::Null))
+    }
+
+    pub fn get_i64(row: &Json, name: &str) -> Result<i64, String> {
+        match col(row, name)? {
+            Json::Num(n) => Ok(*n as i64),
+            Json::Bool(b) => Ok(*b as i64),
+            Json::Str(s) => s.trim().parse().map_err(|_| format!("column '{}' is not an integer", name)),
+            _ => Err(format!("column '{}' is not an integer", name)),
+        }
+    }
+
+    pub fn get_f64(row: &Json, name: &str) -> Result<f64, String> {
+        match col(row, name)? {
+            Json::Num(n) => Ok(*n),
+            Json::Str(s) => s.trim().parse().map_err(|_| format!("column '{}' is not a number", name)),
+            _ => Err(format!("column '{}' is not a number", name)),
+        }
+    }
+
+    pub fn get_string(row: &Json, name: &str) -> Result<String, String> {
+        match col(row, name)? {
+            Json::Str(s) => Ok(s.clone()),
+            Json::Num(n) => Ok(n.to_string()),
+            Json::Bool(b) => Ok(b.to_string()),
+            _ => Err(format!("column '{}' is not text", name)),
+        }
+    }
+
+    pub fn get_bool(row: &Json, name: &str) -> Result<bool, String> {
+        match col(row, name)? {
+            Json::Bool(b) => Ok(*b),
+            Json::Num(n) => Ok(*n != 0.0),
+            Json::Str(s) => Ok(matches!(s.trim(), "1" | "true" | "TRUE" | "yes")),
+            _ => Err(format!("column '{}' is not a boolean", name)),
+        }
+    }
+
+    pub fn opt_i64(row: &Json, name: &str) -> Result<Option<i64>, String> {
+        if is_absent(row, name) { Ok(None) } else { get_i64(row, name).map(Some) }
+    }
+    pub fn opt_f64(row: &Json, name: &str) -> Result<Option<f64>, String> {
+        if is_absent(row, name) { Ok(None) } else { get_f64(row, name).map(Some) }
+    }
+    pub fn opt_string(row: &Json, name: &str) -> Result<Option<String>, String> {
+        if is_absent(row, name) { Ok(None) } else { get_string(row, name).map(Some) }
+    }
+    pub fn opt_bool(row: &Json, name: &str) -> Result<Option<bool>, String> {
+        if is_absent(row, name) { Ok(None) } else { get_bool(row, name).map(Some) }
     }
 }
 

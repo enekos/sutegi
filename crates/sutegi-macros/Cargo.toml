@@ -1,0 +1,20 @@
+[package]
+name = "sutegi-macros"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Derive macros for sutegi (#[derive(Model)]). Compile-time only — adds nothing to your runtime binary."
+
+[lib]
+proc-macro = true
+
+# These are build-time-only dependencies of the derive macro. They run inside
+# the compiler and are NOT linked into your application binary, so sutegi's
+# zero-runtime-dependency / tiny-binary guarantee is preserved.
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"

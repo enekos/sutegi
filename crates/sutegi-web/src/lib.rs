@@ -24,11 +24,24 @@ pub type Handler = Box<dyn Fn(&Request, &Params) -> Response + Send + Sync + 'st
 /// short-circuits (e.g. auth rejection); `None` lets the request continue.
 pub type Middleware = Box<dyn Fn(&Request) -> Option<Response> + Send + Sync + 'static>;
 
+/// The shareable form of a middleware, used by route groups.
+pub type MwFn = dyn Fn(&Request) -> Option<Response> + Send + Sync + 'static;
+
+/// A reference-counted, shareable middleware (build with [`mw`]).
+pub type Mw = std::sync::Arc<MwFn>;
+
+/// Wrap a closure as a shareable group middleware.
+pub fn mw(f: impl Fn(&Request) -> Option<Response> + Send + Sync + 'static) -> Mw {
+    std::sync::Arc::new(f)
+}
+
 struct Route {
     method: Method,
     pattern: String,
     doc: String,
     handler: Handler,
+    /// Group-scoped middleware run before this route's handler.
+    middleware: Vec<Mw>,
 }
 
 /// The application: a builder you configure with routes, models, tools, and
@@ -74,7 +87,20 @@ impl App {
             pattern: pattern.to_string(),
             doc: doc.to_string(),
             handler: Box::new(handler),
+            middleware: Vec::new(),
         });
+        self
+    }
+
+    /// Register a group of routes sharing a path `prefix` and group-scoped
+    /// `middleware`. Laravel-style: `app.group("/api", vec![mw(auth)], |g| g.get(...))`.
+    pub fn group(mut self, prefix: &str, middleware: Vec<Mw>, build: impl FnOnce(Group) -> Group) -> App {
+        let group = build(Group {
+            prefix: prefix.to_string(),
+            middleware,
+            routes: Vec::new(),
+        });
+        self.routes.extend(group.routes);
         self
     }
 
@@ -179,8 +205,13 @@ impl App {
                 return json(200, &introspect);
             }
 
-            // 3. Route table.
+            // 3. Route table (run group-scoped middleware before the handler).
             if let Some((route, params)) = match_route(&routes, req.method, &req.path) {
+                for mw in &route.middleware {
+                    if let Some(resp) = mw(&req) {
+                        return resp;
+                    }
+                }
                 return (route.handler)(&req, &params);
             }
 
@@ -190,6 +221,60 @@ impl App {
             }
             not_found()
         })
+    }
+}
+
+/// A builder for a group of routes sharing a prefix and middleware. Created via
+/// [`App::group`]. Patterns added here are prefixed; group middleware runs
+/// before each route's handler.
+pub struct Group {
+    prefix: String,
+    middleware: Vec<Mw>,
+    routes: Vec<Route>,
+}
+
+impl Group {
+    pub fn route(
+        mut self,
+        method: Method,
+        pattern: &str,
+        doc: &str,
+        handler: impl Fn(&Request, &Params) -> Response + Send + Sync + 'static,
+    ) -> Group {
+        self.routes.push(Route {
+            method,
+            pattern: join_prefix(&self.prefix, pattern),
+            doc: doc.to_string(),
+            handler: Box::new(handler),
+            middleware: self.middleware.clone(),
+        });
+        self
+    }
+
+    pub fn get(self, p: &str, doc: &str, h: impl Fn(&Request, &Params) -> Response + Send + Sync + 'static) -> Group {
+        self.route(Method::Get, p, doc, h)
+    }
+    pub fn post(self, p: &str, doc: &str, h: impl Fn(&Request, &Params) -> Response + Send + Sync + 'static) -> Group {
+        self.route(Method::Post, p, doc, h)
+    }
+    pub fn put(self, p: &str, doc: &str, h: impl Fn(&Request, &Params) -> Response + Send + Sync + 'static) -> Group {
+        self.route(Method::Put, p, doc, h)
+    }
+    pub fn delete(self, p: &str, doc: &str, h: impl Fn(&Request, &Params) -> Response + Send + Sync + 'static) -> Group {
+        self.route(Method::Delete, p, doc, h)
+    }
+}
+
+/// Join a group prefix and a route pattern into a single normalized path.
+fn join_prefix(prefix: &str, pattern: &str) -> String {
+    let p = prefix.trim_end_matches('/');
+    let s = pattern.trim_start_matches('/');
+    if p.is_empty() {
+        format!("/{}", s)
+    } else if s.is_empty() {
+        p.to_string()
+    } else {
+        format!("{}/{}", p, s)
     }
 }
 

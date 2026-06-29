@@ -6,6 +6,8 @@ members = [
     "crates/sutegi-web",
     "crates/sutegi-orm",
     "crates/sutegi-validate",
+    "crates/sutegi-queue",
+    "crates/sutegi-macros",
     "crates/sutegi-ai",
     "crates/sutegi",
     "crates/sutegi-cli",

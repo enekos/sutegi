@@ -1,0 +1,12 @@
+[package]
+name = "sutegi-queue"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Zero-dependency in-process job queue for sutegi: background workers, retries, delayed dispatch, introspectable stats."
+
+[dependencies]
+sutegi-json = { path = "../sutegi-json" }

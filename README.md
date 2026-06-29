@@ -49,7 +49,9 @@ fn main() -> std::io::Result<()> {
 | `sutegi-http` | HTTP/1.1 parsing + thread-pool server on `std::net`. |
 | `sutegi-web`  | Router, `App` builder, middleware, extractors, `/__introspect`. |
 | `sutegi-orm`  | Typed schema, fluent parameterized query builder, migration emitter, optional runnable SQLite layer (`sqlite` feature). |
+| `sutegi-macros` | `#[derive(Model)]` — schema, typed JSON hydration, inserts. Compile-time only (syn/quote never reach your binary). |
 | `sutegi-validate` | Laravel-`Validator`-style rule sets **and** a JSON Schema subset validator, with structured errors. |
+| `sutegi-queue` | Zero-dep in-process job queue: background workers, retries, delayed dispatch, introspectable stats. |
 | `sutegi-ai`   | `Tool` trait, registry, LLM manifest, `/__tools` endpoints (args validated against each tool's schema). |
 | `sutegi`      | Facade crate + `prelude`. |
 | `sutegi-cli`  | The `sutegi` command: scaffold apps/models/routes, `introspect` a live app. |
@@ -82,9 +84,73 @@ let one  = Todo::find(&db, Value::Int(id))?;   // Option<Json>
 let all  = Todo::all(&db)?;                     // Vec<Json>
 ```
 
-Rows come back as JSON objects (no derive macro needed) — consistent with the
-"machine-readable everything" stance. Enabling `sqlite` grows the binary to
-~1.3 MB (bundled SQLite); the zero-dep core remains ~378 KB.
+Rows come back as JSON objects. Enabling `sqlite` grows the binary to ~1.3 MB
+(bundled SQLite); the zero-dep core remains ~378 KB.
+
+### Typed models with `#[derive(Model)]`
+
+```rust
+#[derive(Model)]
+#[model(table = "todos")]
+struct Todo {
+    #[model(primary)]
+    id: i64,
+    title: String,
+    done: bool,          // round-trips cleanly (SQLite stores 0/1, you get a bool)
+    note: Option<String>,// Option<T> => nullable column
+}
+
+let todos: Vec<Todo> = Todo::all_typed(&db)?;     // hydrated structs
+let one: Option<Todo> = Todo::find_typed(&db, Value::Int(1))?;
+let id = Todo::create(&db, &Todo { id: 0, title: "x".into(), done: false, note: None }.to_values()[1..])?;
+let body: Json = one.unwrap().to_json();          // booleans serialize as real booleans
+```
+
+The derive generates the schema, `FromRow` hydration, `to_values()` (inserts),
+and `to_json()`. Its build-time deps don't affect your runtime binary; turn it
+off with `default-features = false` if you prefer hand-written models.
+
+### Route groups + middleware
+
+```rust
+let auth = mw(|req: &Request| {
+    if req.header("authorization").is_some() { None }          // continue
+    else { Some(text(401, "unauthorized")) }                   // short-circuit
+});
+
+App::new("api")
+    .group("/api", vec![auth], |g| {
+        g.get("/todos", "List", list)
+         .post("/todos", "Create", create)
+    })
+```
+
+Group middleware runs before each route in the group; patterns are prefixed.
+
+### Route-model binding (with `sqlite`)
+
+```rust
+// GET /api/todos/:id  — hydrate a Todo from the path param, or return 404/500.
+move |_req, p| match sutegi::binding::model::<Todo>(&db.lock().unwrap(), p, "id") {
+    Ok(todo) => json(200, &todo.to_json()),
+    Err(resp) => resp,
+}
+```
+
+### Background jobs
+
+```rust
+struct Notify { to: String }
+impl Job for Notify {
+    fn name(&self) -> &str { "notify" }
+    fn handle(&self) -> Result<(), String> { /* send … */ Ok(()) }
+    fn tries(&self) -> u32 { 3 }     // retried on Err
+}
+
+let queue = Queue::new(4);           // Arc<Queue>, 4 workers
+queue.dispatch(Notify { to: "a@b.com".into() });
+let stats = queue.stats();           // { dispatched, processed, failed, retried } — JSON-able
+```
 
 ## Validation
 
@@ -120,10 +186,11 @@ so an LLM can extend a sutegi app correctly with minimal context.
 
 ## Status
 
-Early but usable. The ORM now runs against SQLite behind the opt-in `sqlite`
-feature (migrate / `all` / `find` / `create`); validation covers requests and
-AI tool args. HTTP is 1.1, connection-per-request, no TLS. Booleans round-trip
-through SQLite as `0`/`1` (no native bool). Next: typed row mapping / a derive
-macro, form-encoded bodies, keep-alive.
+Early but increasingly capable. Typed models (`#[derive(Model)]`), a runnable
+SQLite ORM (opt-in `sqlite`), validation (requests + AI tool args), route groups
++ middleware, route-model binding, and a background job queue all work and are
+exercised by the `todo` example. HTTP is 1.1, connection-per-request, no TLS.
+Next: form-encoded bodies, keep-alive, a durable (SQLite-backed) queue driver,
+relations/joins in the query builder.
 
 MIT © 2026 Eneko Sarasola
