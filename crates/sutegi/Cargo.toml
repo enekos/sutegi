@@ -18,6 +18,7 @@ sutegi-orm = { path = "../sutegi-orm", optional = true }
 sutegi-validate = { path = "../sutegi-validate", optional = true }
 sutegi-queue = { path = "../sutegi-queue", optional = true }
 sutegi-ai = { path = "../sutegi-ai", optional = true }
+sutegi-hex = { path = "../sutegi-hex", optional = true }
 sutegi-macros = { path = "../sutegi-macros", optional = true }
 
 [features]
@@ -33,6 +34,7 @@ ai = ["dep:sutegi-ai", "validate"]                        # Tool/StreamTool + /_
 derive = ["dep:sutegi-macros", "orm"]                     # #[derive(Model)]
 sqlite = ["orm", "sutegi-orm/sqlite"]                     # runnable bundled SQLite
 graceful = ["sutegi-web/graceful"]                        # SIGTERM/SIGINT draining
+hex = ["dep:sutegi-hex"]                                  # hexagonal-architecture primitives
 
 [package.metadata.docs.rs]
 all-features = true

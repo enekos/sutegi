@@ -53,6 +53,7 @@ fn main() -> std::io::Result<()> {
 | `sutegi-validate` | Laravel-`Validator`-style rule sets **and** a JSON Schema subset validator, with structured errors. |
 | `sutegi-queue` | Zero-dep in-process job queue: background workers, retries, delayed dispatch, introspectable stats. |
 | `sutegi-ai`   | `Tool` trait, registry, LLM manifest, `/__tools` endpoints (args validated against each tool's schema). |
+| `sutegi-hex`  | Opinionated hexagonal/clean-architecture primitives: `AppError`, `UseCase` ports, `respond` adapter glue. |
 | `sutegi`      | Facade crate + `prelude`. |
 | `sutegi-cli`  | The `sutegi` command: scaffold apps/models/routes, `introspect` a live app. |
 
@@ -71,6 +72,7 @@ what you use:
 | `queue`    | ✓ | background jobs |
 | `sqlite`   |   | bundled, runnable SQLite execution |
 | `graceful` |   | SIGTERM/SIGINT draining (libc) |
+| `hex`      |   | hexagonal/clean-architecture primitives |
 
 ```toml
 # Minimal HTTP service — core only:
@@ -130,6 +132,29 @@ horizontally-scaled shape locally: N app replicas behind an nginx load balancer
 readiness probes on the built-ins, `terminationGracePeriodSeconds` + a `preStop`
 hook for clean draining, Prometheus scrape annotations, and small resource asks
 (the binary is tiny, so `requests: 32Mi`).
+
+## Architecture: building clean apps (hexagonal)
+
+For non-trivial apps, sutegi ships an opinionated **ports & adapters** structure
+(the `hex` feature). The dependency rule — *source dependencies point inward* —
+keeps your domain free of HTTP/SQL, makes business logic unit-testable without a
+server, and lets you expose one use case over many transports.
+
+```
+inbound adapters (HTTP, AI tools) ──▶ application (use cases) ──▶ ports (traits)
+                                              │                        ▲
+                                              ▼                        │
+                                          domain (pure)      outbound adapters (SQLite, …)
+```
+
+`sutegi::hex` provides `AppError` (with a canonical HTTP mapping), the `UseCase`
+port trait, and `respond()`/`respond_created()` glue. The
+[`examples/hexagonal`](./examples/hexagonal) app is a full worked reference:
+domain → ports → use cases → adapters, with the **same `CreateTodo` use case
+exposed via both HTTP and an AI tool**, and **two interchangeable repositories
+(in-memory ↔ SQLite)** selected at the composition root (`REPO=memory|sqlite`).
+
+Full guide: **[docs/HEXAGONAL.md](./docs/HEXAGONAL.md)**.
 
 ## The agent contract
 

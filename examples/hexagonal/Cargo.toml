@@ -1,0 +1,17 @@
+[package]
+name = "hexagonal-example"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Hexagonal / clean-architecture sutegi app: domain, ports, use cases, and swappable adapters."
+publish = false
+
+[[bin]]
+name = "hexagonal"
+path = "src/main.rs"
+
+[dependencies]
+sutegi = { path = "../../crates/sutegi", features = ["hex", "sqlite", "graceful"] }

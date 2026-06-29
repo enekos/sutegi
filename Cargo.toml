@@ -8,11 +8,13 @@ members = [
     "crates/sutegi-validate",
     "crates/sutegi-queue",
     "crates/sutegi-macros",
+    "crates/sutegi-hex",
     "crates/sutegi-ai",
     "crates/sutegi",
     "crates/sutegi-cli",
     "examples/todo",
     "examples/hello",
+    "examples/hexagonal",
 ]
 
 [workspace.package]

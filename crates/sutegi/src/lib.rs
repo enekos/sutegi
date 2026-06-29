@@ -29,6 +29,8 @@ pub use sutegi_web as web;
 // --- optional pillars ---
 #[cfg(feature = "ai")]
 pub use sutegi_ai as ai;
+#[cfg(feature = "hex")]
+pub use sutegi_hex as hex;
 #[cfg(feature = "orm")]
 pub use sutegi_orm as orm;
 #[cfg(feature = "queue")]
@@ -101,4 +103,7 @@ pub mod prelude {
 
     #[cfg(feature = "sqlite")]
     pub use sutegi_orm::db::Db;
+
+    #[cfg(feature = "hex")]
+    pub use sutegi_hex::{respond, respond_created, AppError, AppResult, IntoJson, UseCase};
 }
