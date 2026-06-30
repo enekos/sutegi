@@ -9,4 +9,4 @@ authors.workspace = true
 description = "Zero-dependency in-process job queue for sutegi: background workers, retries, delayed dispatch, introspectable stats."
 
 [dependencies]
-sutegi-json = { path = "../sutegi-json", version = "0.1.0" }
+sutegi-json = { path = "../sutegi-json", version = "0.2.0" }

@@ -9,8 +9,8 @@ authors.workspace = true
 description = "Router, App builder, middleware, extractors, and runtime introspection for sutegi."
 
 [dependencies]
-sutegi-http = { path = "../sutegi-http", version = "0.1.0" }
-sutegi-json = { path = "../sutegi-json", version = "0.1.0" }
+sutegi-http = { path = "../sutegi-http", version = "0.2.0" }
+sutegi-json = { path = "../sutegi-json", version = "0.2.0" }
 # Only pulled in by the `graceful` feature, for SIGTERM/SIGINT handling.
 libc = { version = "0.2", optional = true }
 

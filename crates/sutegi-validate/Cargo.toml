@@ -9,4 +9,4 @@ authors.workspace = true
 description = "Zero-dependency validation for sutegi: Laravel-style rule sets and a JSON Schema subset validator with structured errors."
 
 [dependencies]
-sutegi-json = { path = "../sutegi-json", version = "0.1.0" }
+sutegi-json = { path = "../sutegi-json", version = "0.2.0" }
