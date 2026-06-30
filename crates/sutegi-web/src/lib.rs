@@ -11,8 +11,9 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
-pub use sutegi_http::{Body, Method, Request, Response, SseSink, StreamSink};
+pub use sutegi_http::{Body, Limits, Method, Request, Response, SseSink, StreamSink};
 use sutegi_json::Json;
+use std::time::Duration;
 
 /// Path parameters captured from a route pattern (`:name` segments).
 pub type Params = BTreeMap<String, String>;
@@ -59,6 +60,7 @@ pub struct App {
     workers: usize,
     readiness: Option<Box<dyn Fn() -> bool + Send + Sync + 'static>>,
     after: Vec<AfterMiddleware>,
+    limits: Limits,
 }
 
 /// Process-wide request counters, exposed at `/__metrics` in Prometheus text
@@ -121,7 +123,26 @@ impl App {
             workers: 8,
             readiness: None,
             after: Vec::new(),
+            limits: Limits::default(),
         }
+    }
+
+    /// Replace the server resource limits (body/header caps, socket timeout).
+    pub fn limits(mut self, limits: Limits) -> App {
+        self.limits = limits;
+        self
+    }
+
+    /// Max accepted request-body size in bytes (HTTP 413 above it).
+    pub fn max_body(mut self, bytes: usize) -> App {
+        self.limits.max_body = bytes;
+        self
+    }
+
+    /// Per-socket read/write timeout (slowloris protection); `None` disables it.
+    pub fn request_timeout(mut self, timeout: Option<Duration>) -> App {
+        self.limits.timeout = timeout;
+        self
     }
 
     /// Register an after-middleware that transforms every outgoing response
@@ -269,7 +290,8 @@ impl App {
     }
 
     /// Build the request service closure (shared by every `run*` variant).
-    fn into_service(self) -> (usize, impl Fn(Request) -> Response + Send + Sync + 'static) {
+    fn into_service(self) -> (usize, Limits, impl Fn(Request) -> Response + Send + Sync + 'static) {
+        let limits = self.limits;
         let introspect = self.introspection();
         let routes = Arc::new(self.routes);
         let middleware = Arc::new(self.middleware);
@@ -332,21 +354,21 @@ impl App {
             resp
         };
 
-        (workers, service)
+        (workers, limits, service)
     }
 
     /// Bind to `addr` and serve forever.
     pub fn run(self, addr: &str) -> std::io::Result<()> {
-        let (workers, service) = self.into_service();
-        sutegi_http::serve(addr, workers, service)
+        let (workers, limits, service) = self.into_service();
+        sutegi_http::serve(addr, workers, limits, service)
     }
 
     /// Serve until `shutdown` is set, then drain in-flight requests and return.
     /// Flip the flag from a signal handler (see [`App::run_graceful`]) or your
     /// own logic for zero-drop rolling deploys.
     pub fn run_until(self, addr: &str, shutdown: Arc<AtomicBool>) -> std::io::Result<()> {
-        let (workers, service) = self.into_service();
-        sutegi_http::serve_until(addr, workers, service, shutdown)
+        let (workers, limits, service) = self.into_service();
+        sutegi_http::serve_until(addr, workers, limits, service, shutdown)
     }
 
     /// Serve until SIGTERM/SIGINT (what Kubernetes sends on pod termination),
@@ -543,6 +565,78 @@ pub fn cors(origin: &str) -> impl Fn(&Request, Response) -> Response + Send + Sy
     move |_req: &Request, resp: Response| resp.with_header("access-control-allow-origin", &origin)
 }
 
+/// A pre-middleware requiring `Authorization: Bearer <token>`; else `401`.
+pub fn bearer(token: &str) -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static {
+    let expected = format!("Bearer {}", token);
+    move |req: &Request| match req.header("authorization") {
+        Some(h) if h == expected => None,
+        _ => Some(text(401, "401 Unauthorized").with_header("www-authenticate", "Bearer")),
+    }
+}
+
+/// A pre-middleware requiring HTTP Basic auth for `user`/`pass`; else `401`.
+pub fn basic(user: &str, pass: &str) -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static {
+    let expected = format!("Basic {}", base64_encode(format!("{}:{}", user, pass).as_bytes()));
+    move |req: &Request| match req.header("authorization") {
+        Some(h) if h == expected => None,
+        _ => Some(text(401, "401 Unauthorized").with_header("www-authenticate", "Basic realm=\"sutegi\"")),
+    }
+}
+
+/// An after-middleware adding a baseline set of security headers (nosniff,
+/// frame-deny, referrer-policy, HSTS). Register with [`App::after`].
+pub fn secure_headers() -> impl Fn(&Request, Response) -> Response + Send + Sync + 'static {
+    |_req: &Request, resp: Response| {
+        resp.with_header("x-content-type-options", "nosniff")
+            .with_header("x-frame-options", "DENY")
+            .with_header("referrer-policy", "no-referrer")
+            .with_header("strict-transport-security", "max-age=31536000; includeSubDomains")
+    }
+}
+
+/// A per-client-IP token-bucket rate limiter (pre-middleware). Allows bursts up
+/// to `max_requests`, refilling over `per`; returns `429` when exhausted.
+pub fn rate_limit(
+    max_requests: u32,
+    per: Duration,
+) -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static {
+    let buckets: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, (f64, std::time::Instant)>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let capacity = max_requests as f64;
+    let refill_per_sec = if per.as_secs_f64() > 0.0 { capacity / per.as_secs_f64() } else { capacity };
+    move |req: &Request| {
+        let key = req.peer_ip().unwrap_or_else(|| "unknown".to_string());
+        let now = std::time::Instant::now();
+        let mut map = buckets.lock().unwrap();
+        let entry = map.entry(key).or_insert((capacity, now));
+        let elapsed = now.duration_since(entry.1).as_secs_f64();
+        entry.0 = (entry.0 + elapsed * refill_per_sec).min(capacity);
+        entry.1 = now;
+        if entry.0 >= 1.0 {
+            entry.0 -= 1.0;
+            None
+        } else {
+            Some(text(429, "429 Too Many Requests").with_header("retry-after", "1"))
+        }
+    }
+}
+
+/// Minimal standard base64 encoder (used by `basic`).
+fn base64_encode(input: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        out.push(T[(b0 >> 2) as usize] as char);
+        out.push(T[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(if chunk.len() > 1 { T[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(b2 & 0x3f) as usize] as char } else { '=' });
+    }
+    out
+}
+
 /// A streaming response: `producer` writes (and flushes) bytes over time via a
 /// [`StreamSink`]. Sets the given `content_type`; no `Content-Length`.
 pub fn stream(
@@ -685,10 +779,36 @@ mod tests {
             version: "HTTP/1.1".into(),
             headers: vec![],
             body: b"title=hello+world&done=true".to_vec(),
+            peer: None,
         };
         let form = form_body(&req);
         assert_eq!(form.get("title").map(String::as_str), Some("hello world"));
         assert_eq!(form.get("done").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn security_middleware() {
+        let mut req = Request {
+            method: Method::Get,
+            path: "/".into(),
+            query: String::new(),
+            version: "HTTP/1.1".into(),
+            headers: vec![],
+            body: vec![],
+            peer: Some("1.2.3.4:55000".into()),
+        };
+        let guard = bearer("s3cr3t");
+        assert_eq!(guard(&req).map(|r| r.status), Some(401)); // no header
+        req.headers.push(("Authorization".into(), "Bearer s3cr3t".into()));
+        assert!(guard(&req).is_none()); // authorized
+
+        // Rate limit: 2 requests allowed, 3rd blocked.
+        let rl = rate_limit(2, std::time::Duration::from_secs(60));
+        assert!(rl(&req).is_none());
+        assert!(rl(&req).is_none());
+        assert_eq!(rl(&req).map(|r| r.status), Some(429));
+
+        assert_eq!(req.peer_ip().as_deref(), Some("1.2.3.4"));
     }
 
     #[test]
@@ -708,6 +828,7 @@ mod tests {
             version: "HTTP/1.1".into(),
             headers: vec![],
             body: vec![],
+            peer: None,
         };
         let q = query_params(&req);
         assert_eq!(q.get("q").map(String::as_str), Some("hello world"));

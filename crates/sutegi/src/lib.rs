@@ -83,9 +83,10 @@ pub fn env_or(key: &str, default: &str) -> String {
 pub mod prelude {
     pub use sutegi_json::Json;
     pub use sutegi_web::{
-        cors, cors_preflight, form_body, html, json, json_body, logger, mw, no_content,
-        not_found, query_params, redirect, sse, status, stream, text, App, Group, Method, Mw,
-        Params, Request, Response, SseSink, StreamSink,
+        basic, bearer, cors, cors_preflight, form_body, html, json, json_body, logger, mw,
+        no_content, not_found, query_params, rate_limit, redirect, secure_headers, sse, status,
+        stream, text, App, Group, Limits, Method, Mw, Params, Request, Response, SseSink,
+        StreamSink,
     };
 
     #[cfg(feature = "ai")]

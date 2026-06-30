@@ -64,9 +64,23 @@ pub struct Request {
     pub version: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// The peer socket address (`ip:port`), if known. Set by the server.
+    pub peer: Option<String>,
 }
 
 impl Request {
+    /// The client's IP (port stripped), e.g. for rate limiting / logging.
+    pub fn peer_ip(&self) -> Option<String> {
+        let p = self.peer.as_ref()?;
+        if let Some(end) = p.find(']') {
+            Some(p[..=end].to_string()) // [ipv6]
+        } else if let Some(i) = p.rfind(':') {
+            Some(p[..i].to_string()) // ipv4:port
+        } else {
+            Some(p.clone())
+        }
+    }
+
     /// Case-insensitive header lookup.
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
@@ -221,9 +235,38 @@ impl<'a> SseSink<'a> {
     }
 }
 
-/// Parse a single request off a buffered stream. Returns `Ok(None)` if the
-/// peer closed the connection before sending anything.
-pub fn parse_request<R: BufRead>(reader: &mut R) -> io::Result<Option<Request>> {
+/// Server resource limits — the difference between "demo" and "won't fall over".
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    /// Reject request bodies larger than this (HTTP 413). Default 2 MiB.
+    pub max_body: usize,
+    /// Reject requests whose headers exceed this many bytes (HTTP 413).
+    pub max_header_bytes: usize,
+    /// Per-socket read/write timeout (slowloris protection). Default 30s.
+    pub timeout: Option<Duration>,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits {
+            max_body: 2 * 1024 * 1024,
+            max_header_bytes: 64 * 1024,
+            timeout: Some(Duration::from_secs(30)),
+        }
+    }
+}
+
+/// The outcome of parsing: a request, or a refusal the server turns into 413.
+pub enum Incoming {
+    Request(Request),
+    TooLarge,
+}
+
+/// Parse a single request off a buffered stream, enforcing `limits`. Returns
+/// `Ok(None)` if the peer closed before sending anything, or
+/// `Ok(Some(Incoming::TooLarge))` if headers/body exceed the limits (so the
+/// server can reply 413 without allocating an attacker-chosen buffer).
+pub fn parse_request<R: BufRead>(reader: &mut R, limits: &Limits) -> io::Result<Option<Incoming>> {
     let mut request_line = String::new();
     if reader.read_line(&mut request_line)? == 0 {
         return Ok(None);
@@ -240,10 +283,16 @@ pub fn parse_request<R: BufRead>(reader: &mut R) -> io::Result<Option<Request>> 
 
     let mut headers = Vec::new();
     let mut content_length = 0usize;
+    let mut header_bytes = request_line.len();
     loop {
         let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
             break;
+        }
+        header_bytes += n;
+        if header_bytes > limits.max_header_bytes {
+            return Ok(Some(Incoming::TooLarge));
         }
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
@@ -259,19 +308,24 @@ pub fn parse_request<R: BufRead>(reader: &mut R) -> io::Result<Option<Request>> 
         }
     }
 
+    // Refuse oversized bodies before allocating an attacker-controlled buffer.
+    if content_length > limits.max_body {
+        return Ok(Some(Incoming::TooLarge));
+    }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
         reader.read_exact(&mut body)?;
     }
 
-    Ok(Some(Request {
+    Ok(Some(Incoming::Request(Request {
         method,
         path,
         query,
         version,
         headers,
         body,
-    }))
+        peer: None,
+    })))
 }
 
 /// Write a response to the stream. Always closes the connection (no keep-alive)
@@ -345,7 +399,7 @@ pub fn status_reason(status: u16) -> &'static str {
 
 /// Bind to `addr` and serve requests with `handler` until the process exits.
 /// `handler` is shared across worker threads, so it must be `Send + Sync`.
-pub fn serve<H>(addr: &str, workers: usize, handler: H) -> io::Result<()>
+pub fn serve<H>(addr: &str, workers: usize, limits: Limits, handler: H) -> io::Result<()>
 where
     H: Fn(Request) -> Response + Send + Sync + 'static,
 {
@@ -360,7 +414,7 @@ where
         };
         let handler = Arc::clone(&handler);
         pool.execute(move || {
-            let _ = handle_connection(stream, &*handler);
+            let _ = handle_connection(stream, &*handler, &limits);
         });
     }
     Ok(())
@@ -374,6 +428,7 @@ where
 pub fn serve_until<H>(
     addr: &str,
     workers: usize,
+    limits: Limits,
     handler: H,
     shutdown: Arc<AtomicBool>,
 ) -> io::Result<()>
@@ -392,7 +447,7 @@ where
                 let _ = stream.set_nonblocking(false);
                 let handler = Arc::clone(&handler);
                 pool.execute(move || {
-                    let _ = handle_connection(stream, &*handler);
+                    let _ = handle_connection(stream, &*handler, &limits);
                 });
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -408,15 +463,33 @@ where
     Ok(())
 }
 
-fn handle_connection<H>(stream: TcpStream, handler: &H) -> io::Result<()>
+fn handle_connection<H>(stream: TcpStream, handler: &H, limits: &Limits) -> io::Result<()>
 where
     H: Fn(Request) -> Response,
 {
+    // Slowloris protection: bound how long a slow client can hold this worker.
+    if let Some(t) = limits.timeout {
+        let _ = stream.set_read_timeout(Some(t));
+        let _ = stream.set_write_timeout(Some(t));
+    }
+    let peer = stream.peer_addr().ok().map(|a| a.to_string());
     let mut reader = BufReader::new(stream.try_clone()?);
-    if let Some(req) = parse_request(&mut reader)? {
-        let resp = handler(req);
-        let mut writer = stream;
-        write_response(&mut writer, resp)?;
+
+    match parse_request(&mut reader, limits)? {
+        Some(Incoming::Request(mut req)) => {
+            req.peer = peer;
+            // Panic isolation: a panicking handler returns 500 instead of
+            // silently killing this worker thread.
+            let resp = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(req)))
+                .unwrap_or_else(|_| Response::new(500).with_body(&b"500 Internal Server Error"[..]));
+            let mut writer = stream;
+            write_response(&mut writer, resp)?;
+        }
+        Some(Incoming::TooLarge) => {
+            let mut writer = stream;
+            write_response(&mut writer, Response::new(413).with_body(&b"413 Payload Too Large"[..]))?;
+        }
+        None => {}
     }
     Ok(())
 }
@@ -480,7 +553,10 @@ mod tests {
     fn parses_request_with_body() {
         let raw = "POST /todos?x=1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
         let mut reader = BufReader::new(raw.as_bytes());
-        let req = parse_request(&mut reader).unwrap().unwrap();
+        let req = match parse_request(&mut reader, &Limits::default()).unwrap().unwrap() {
+            Incoming::Request(r) => r,
+            Incoming::TooLarge => panic!("unexpected 413"),
+        };
         assert_eq!(req.method, Method::Post);
         assert_eq!(req.path, "/todos");
         assert_eq!(req.query, "x=1");
@@ -500,10 +576,24 @@ mod tests {
     }
 
     #[test]
+    fn rejects_oversized_body() {
+        let raw = "POST / HTTP/1.1\r\nContent-Length: 5000\r\n\r\n";
+        let mut reader = BufReader::new(raw.as_bytes());
+        let limits = Limits { max_body: 100, ..Limits::default() };
+        assert!(matches!(
+            parse_request(&mut reader, &limits).unwrap(),
+            Some(Incoming::TooLarge)
+        ));
+    }
+
+    #[test]
     fn request_content_type_and_cookies() {
         let raw = "GET / HTTP/1.1\r\nContent-Type: application/json\r\nCookie: sid=abc; theme=dark\r\n\r\n";
         let mut reader = BufReader::new(raw.as_bytes());
-        let req = parse_request(&mut reader).unwrap().unwrap();
+        let req = match parse_request(&mut reader, &Limits::default()).unwrap().unwrap() {
+            Incoming::Request(r) => r,
+            Incoming::TooLarge => panic!("unexpected 413"),
+        };
         assert!(req.is_json());
         assert_eq!(req.cookie("sid").as_deref(), Some("abc"));
         assert_eq!(req.cookie("theme").as_deref(), Some("dark"));
