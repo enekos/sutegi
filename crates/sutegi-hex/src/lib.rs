@@ -181,6 +181,59 @@ pub fn respond_created<T: IntoJson>(result: AppResult<T>) -> Response {
     }
 }
 
+// ---- CQRS ----------------------------------------------------------------
+
+/// A **command** — a write intent. Consumes itself (one-shot) and returns its
+/// result. The write side of CQRS; pair with [`Query`] for reads.
+pub trait Command: Send + Sync {
+    type Output;
+    fn execute(self) -> AppResult<Self::Output>;
+}
+
+/// A **query** — a read intent. Borrows itself (idempotent, repeatable) and
+/// returns data. The read side of CQRS.
+pub trait Query: Send + Sync {
+    type Output;
+    fn execute(&self) -> AppResult<Self::Output>;
+}
+
+/// A domain **event** — something that happened. Dispatch via an [`EventBus`]
+/// so side effects (read-model updates, notifications) are decoupled from the
+/// command that caused them.
+pub trait Event: std::any::Any + Send + Sync + 'static {}
+
+/// A type-keyed event bus. Register handlers with [`EventBus::on`] and fan an
+/// event out to all handlers for its type with [`EventBus::dispatch`].
+#[derive(Default)]
+pub struct EventBus {
+    handlers: std::collections::HashMap<std::any::TypeId, Vec<Box<dyn Fn(&dyn std::any::Any) + Send + Sync>>>,
+}
+
+impl EventBus {
+    pub fn new() -> EventBus {
+        EventBus::default()
+    }
+
+    /// Register a handler for events of type `E`.
+    pub fn on<E: Event, F: Fn(&E) + Send + Sync + 'static>(&mut self, handler: F) {
+        let entry = self.handlers.entry(std::any::TypeId::of::<E>()).or_default();
+        entry.push(Box::new(move |any| {
+            if let Some(event) = any.downcast_ref::<E>() {
+                handler(event);
+            }
+        }));
+    }
+
+    /// Dispatch an event to every handler registered for its type.
+    pub fn dispatch<E: Event>(&self, event: &E) {
+        if let Some(handlers) = self.handlers.get(&std::any::TypeId::of::<E>()) {
+            for handler in handlers {
+                handler(event);
+            }
+        }
+    }
+}
+
 /// An optional generic **outbound-port** convention for persistence. Real ports
 /// are usually domain-specific (e.g. `TodoRepository`); this is here for the
 /// simple CRUD case. Define your own trait when the domain needs richer queries.
@@ -199,6 +252,40 @@ mod tests {
     fn error_maps_to_http() {
         assert_eq!(AppError::not_found("x").status(), 404);
         assert_eq!(AppError::invalid("x").kind(), "invalid");
+    }
+
+    #[test]
+    fn cqrs_command_query_and_events() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        struct CreateThing { name: String }
+        impl Command for CreateThing {
+            type Output = String;
+            fn execute(self) -> AppResult<String> {
+                if self.name.is_empty() { return Err(AppError::invalid("empty")); }
+                Ok(format!("created:{}", self.name))
+            }
+        }
+        assert_eq!(CreateThing { name: "x".into() }.execute().unwrap(), "created:x");
+        assert!(CreateThing { name: String::new() }.execute().is_err());
+
+        struct CountThings;
+        impl Query for CountThings {
+            type Output = i64;
+            fn execute(&self) -> AppResult<i64> { Ok(42) }
+        }
+        assert_eq!(CountThings.execute().unwrap(), 42);
+
+        struct ThingCreated;
+        impl Event for ThingCreated {}
+        let hits = Arc::new(AtomicU32::new(0));
+        let h = Arc::clone(&hits);
+        let mut bus = EventBus::new();
+        bus.on::<ThingCreated, _>(move |_e| { h.fetch_add(1, Ordering::Relaxed); });
+        bus.dispatch(&ThingCreated);
+        bus.dispatch(&ThingCreated);
+        assert_eq!(hits.load(Ordering::Relaxed), 2);
     }
 
     #[test]

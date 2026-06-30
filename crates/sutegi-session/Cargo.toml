@@ -1,0 +1,17 @@
+[package]
+name = "sutegi-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Signed-cookie sessions for sutegi (HMAC-SHA256). Opt-in via the `auth` feature."
+
+# HMAC/SHA256 from the audited RustCrypto crates — don't roll your own crypto.
+# Only pulled in when you enable sutegi's `auth` feature.
+[dependencies]
+sutegi-json = { path = "../sutegi-json", version = "0.1.0" }
+sutegi-web = { path = "../sutegi-web", version = "0.1.0" }
+hmac = "0.12"
+sha2 = "0.10"

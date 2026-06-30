@@ -9,6 +9,7 @@ members = [
     "crates/sutegi-queue",
     "crates/sutegi-macros",
     "crates/sutegi-hex",
+    "crates/sutegi-session",
     "crates/sutegi-ai",
     "crates/sutegi",
     "crates/sutegi-cli",

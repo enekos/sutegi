@@ -35,6 +35,8 @@ pub use sutegi_hex as hex;
 pub use sutegi_orm as orm;
 #[cfg(feature = "queue")]
 pub use sutegi_queue as queue;
+#[cfg(feature = "auth")]
+pub use sutegi_session as session;
 #[cfg(feature = "validate")]
 pub use sutegi_validate as validate;
 
@@ -109,5 +111,11 @@ pub mod prelude {
     pub use sutegi_orm::db::Db;
 
     #[cfg(feature = "hex")]
-    pub use sutegi_hex::{respond, respond_created, AppError, AppResult, IntoJson, UseCase};
+    pub use sutegi_hex::{
+        respond, respond_created, AppError, AppResult, Command, Event, EventBus, IntoJson, Query,
+        UseCase,
+    };
+
+    #[cfg(feature = "auth")]
+    pub use sutegi_session::{Session, Sessions};
 }
