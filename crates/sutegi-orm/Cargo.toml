@@ -10,7 +10,7 @@ description = "Zero-dependency SQL query builder, model/schema layer, and migrat
 
 [dependencies]
 rusqlite = { version = "0.40.1", features = ["bundled"], optional = true }
-sutegi-json = { path = "../sutegi-json" }
+sutegi-json = { path = "../sutegi-json", version = "0.1.0" }
 
 # `sqlite` is OFF by default: the zero-dependency core stays tiny. Enable it
 # (`--features sqlite`) to get a runnable, bundled SQLite execution layer.

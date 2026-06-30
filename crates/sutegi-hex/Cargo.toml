@@ -9,5 +9,5 @@ authors.workspace = true
 description = "Opinionated hexagonal / clean-architecture primitives for sutegi: AppError, UseCase ports, and adapter glue."
 
 [dependencies]
-sutegi-json = { path = "../sutegi-json" }
-sutegi-web = { path = "../sutegi-web" }
+sutegi-json = { path = "../sutegi-json", version = "0.1.0" }
+sutegi-web = { path = "../sutegi-web", version = "0.1.0" }
