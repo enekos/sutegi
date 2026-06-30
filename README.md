@@ -386,6 +386,29 @@ sutegi introspect          # pretty-print a running app's /__introspect
 Scaffolding follows rigid conventions on purpose — one right shape per artifact —
 so an LLM can extend a sutegi app correctly with minimal context.
 
+## Benchmarks
+
+Hot-path microbenchmarks via [aatxe](https://github.com/enekos/aatxe) (adaptive,
+CV-gated sampling; emits a statistical `RunReport`). Run with `make bench`
+(needs the `aatxe` repo cloned as a sibling). Indicative `--release` numbers
+from a dev machine:
+
+| Bench | Median | ops/sec |
+|-------|-------:|--------:|
+| `validate_ruleset` (2 fields) | 69 ns | 14.4 M |
+| `http_parse_request` | 1.01 µs | 994 K |
+| `json_serialize` | 1.14 µs | 877 K |
+| `sqlite_insert` (in-mem) | 1.78 µs | 561 K |
+| `query_builder` | 1.96 µs | 510 K |
+| `json_parse` (~150 B) | 2.42 µs | 414 K |
+| `sqlite_select_20` | 5.75 µs | 174 K |
+| **`e2e_request`** (full TCP round-trip) | **112 µs** | **~8.9 K** |
+
+`e2e_request` is a complete connect → GET → response → close cycle from a single
+sequential client (sutegi is connection-per-request); real throughput scales
+with concurrency across the worker pool. Numbers are machine-dependent — run
+`make bench` for yours.
+
 ## Status
 
 Early but increasingly capable. Typed models (`#[derive(Model)]`), a runnable

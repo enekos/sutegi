@@ -1,0 +1,21 @@
+# Standalone bench runner — its own workspace so it doesn't perturb sutegi's
+# build/test/publish. Uses Eneko's aatxe statistical-microbenchmark SDK
+# (path dependency on the sibling repo). Run with: `make bench` (see below) or
+#   cargo run --release --bin sutegi-bench
+[workspace]
+
+[package]
+name = "sutegi-benches"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "sutegi-bench"
+path = "src/main.rs"
+
+[dependencies]
+# The framework under test, with the runnable SQLite layer for DB benches.
+sutegi = { path = "../crates/sutegi", features = ["sqlite"] }
+# aatxe statistical microbench SDK (adaptive sampling, CV-gated, JSON RunReport).
+aatxe-bench = { path = "../../aatxe/sdk/rust" }
