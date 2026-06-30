@@ -17,6 +17,9 @@ members = [
     "examples/hello",
     "examples/hexagonal",
 ]
+# The bench runner is its own workspace (depends on the external aatxe SDK by
+# path); excluded so normal builds / tests / publish never touch it.
+exclude = ["benches"]
 
 [workspace.package]
 version = "0.1.0"
