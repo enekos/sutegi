@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%E2%9A%92%EF%B8%8F%3C/text%3E%3C/svg%3E" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#0b0a10" />
+    <title>sutegi — a zero-dependency, agent-native web framework for Rust</title>
+    <meta name="description" content="sutegi is 'Laravel for Rust': a batteries-included web framework built entirely on std (no tokio, no serde). Tiny binaries, built-in introspection and LLM tool-calling, streaming, an ORM, validation, jobs, and a hexagonal-architecture toolkit." />
+    <meta name="keywords" content="rust web framework, zero dependency, agent native, llm tool calling, sse streaming, hexagonal architecture, sqlite orm, tiny binary, laravel for rust" />
+    <meta name="author" content="enekos" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="sutegi — a zero-dependency, agent-native web framework for Rust" />
+    <meta property="og:description" content="Laravel's ergonomics in Rust, built from std up. Tiny binaries, built-in /__introspect + /__tools for agents, streaming, ORM, validation, jobs, hexagonal toolkit." />
+    <meta property="og:url" content="https://enekos.github.io/sutegi/" />
+    <meta property="og:site_name" content="sutegi" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="sutegi — a zero-dependency, agent-native web framework for Rust" />
+    <meta name="twitter:description" content="Laravel's ergonomics in Rust, built from std up. Tiny binaries, agent-native introspection + tool-calling, streaming, ORM, validation, jobs." />
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+
+    <style>
+      :root {
+        --bg: #0b0a10;
+        --panel: #0f0e14;
+        --card: #13121a;
+        --border: #2a2833;
+        --text: #e6e6eb;
+        --muted: #9090a0;
+        --muted2: #7a7a8a;
+        --accent: #ff6a3d;   /* forge ember */
+        --accent2: #ffb454;  /* amber glow  */
+        --mono: "JetBrains Mono", monospace;
+        --sans: "Space Grotesk", sans-serif;
+      }
+
+      * { box-sizing: border-box; }
+      html, body { max-width: 100%; overflow-x: hidden; }
+      body {
+        margin: 0; padding: 0;
+        background-color: var(--bg);
+        color: var(--text);
+        font-family: var(--sans);
+        line-height: 1.6;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+      }
+      a { color: inherit; text-decoration: none; }
+      ::selection { background: var(--accent); color: #1a0d06; }
+
+      ::-webkit-scrollbar { width: 8px; height: 8px; }
+      ::-webkit-scrollbar-track { background: var(--bg); }
+      ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+      ::-webkit-scrollbar-thumb:hover { background: var(--accent); }
+
+      @keyframes float { 0% { transform: translateY(0); } 50% { transform: translateY(-18px); } 100% { transform: translateY(0); } }
+      @keyframes pulse { 0%,100% { opacity: .5; } 50% { opacity: 1; } }
+
+      .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+
+      /* floating background glyphs */
+      .glyphs { position: fixed; inset: 0; pointer-events: none; z-index: 0; overflow: hidden; }
+      .glyph { position: absolute; color: rgba(255,106,61,0.08); font-family: var(--mono); user-select: none; animation: float 8s ease-in-out infinite; }
+
+      /* nav */
+      nav {
+        position: sticky; top: 0; z-index: 50;
+        backdrop-filter: blur(10px);
+        background: rgba(11,10,16,0.72);
+        border-bottom: 1px solid var(--border);
+      }
+      nav .wrap { display: flex; align-items: center; justify-content: space-between; height: 60px; }
+      .brand { font-family: var(--mono); font-weight: 700; font-size: 18px; letter-spacing: .5px; }
+      .brand .dot { color: var(--accent); }
+      .navlinks { display: flex; gap: 22px; align-items: center; font-size: 14px; color: var(--muted); }
+      .navlinks a:hover { color: var(--text); }
+      .navlinks .gh { border: 1px solid var(--border); padding: 6px 12px; border-radius: 8px; color: var(--text); }
+      .navlinks .gh:hover { border-color: var(--accent); }
+      @media (max-width: 720px) { .navlinks a:not(.gh) { display: none; } }
+
+      /* hero */
+      header.hero { position: relative; z-index: 1; padding: 96px 0 72px; }
+      .eyebrow { font-family: var(--mono); font-size: 13px; color: var(--accent); letter-spacing: 2px; text-transform: uppercase; }
+      h1.title { font-size: clamp(40px, 8vw, 84px); line-height: 1.02; margin: 18px 0 8px; font-weight: 700; letter-spacing: -1px; }
+      h1.title .sub { display: block; background: linear-gradient(90deg, var(--accent), var(--accent2)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+      .lede { font-size: clamp(17px, 2.4vw, 21px); color: var(--muted); max-width: 640px; margin: 18px 0 0; }
+      .lede strong { color: var(--text); font-weight: 600; }
+      .cta { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 34px; }
+      .btn { font-family: var(--mono); font-size: 14px; padding: 12px 20px; border-radius: 10px; border: 1px solid var(--border); display: inline-flex; align-items: center; gap: 8px; transition: .15s; }
+      .btn.primary { background: var(--accent); color: #1a0d06; border-color: var(--accent); font-weight: 700; }
+      .btn.primary:hover { background: var(--accent2); border-color: var(--accent2); }
+      .btn.ghost:hover { border-color: var(--accent); color: var(--text); }
+      .stats { display: flex; gap: 28px; flex-wrap: wrap; margin-top: 44px; font-family: var(--mono); }
+      .stat .n { font-size: 26px; font-weight: 700; color: var(--text); }
+      .stat .l { font-size: 12px; color: var(--muted2); text-transform: uppercase; letter-spacing: 1px; }
+
+      /* sections */
+      section { position: relative; z-index: 1; padding: 64px 0; border-top: 1px solid var(--border); }
+      .label { font-family: var(--mono); font-size: 13px; color: var(--accent); letter-spacing: 1px; margin-bottom: 14px; }
+      h2 { font-size: clamp(26px, 4vw, 38px); margin: 0 0 14px; font-weight: 600; letter-spacing: -.5px; }
+      .section-lede { color: var(--muted); max-width: 680px; font-size: 17px; }
+
+      /* feature grid */
+      .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 36px; }
+      @media (max-width: 860px) { .grid { grid-template-columns: repeat(2, 1fr); } }
+      @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
+      .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 22px; transition: .15s; }
+      .card:hover { border-color: var(--accent); transform: translateY(-2px); }
+      .card .ico { font-size: 22px; }
+      .card h3 { font-family: var(--mono); font-size: 15px; margin: 12px 0 6px; color: var(--text); }
+      .card p { margin: 0; font-size: 14px; color: var(--muted); }
+
+      /* code */
+      .code { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; margin: 18px 0; overflow: hidden; }
+      .code .bar { display: flex; align-items: center; justify-content: space-between; padding: 8px 14px; border-bottom: 1px solid var(--border); }
+      .code .bar .name { font-family: var(--mono); font-size: 12px; color: var(--muted2); }
+      .code .bar .copy { font-family: var(--mono); font-size: 12px; color: var(--muted); cursor: pointer; border: 1px solid var(--border); border-radius: 6px; padding: 3px 9px; }
+      .code .bar .copy:hover { color: var(--accent); border-color: var(--accent); }
+      .code pre { margin: 0; padding: 16px; overflow-x: auto; font-family: var(--mono); font-size: 13.5px; line-height: 1.7; color: #d0d0e0; }
+      .code .k { color: var(--accent); }
+      .code .c { color: var(--muted2); }
+      .code .s { color: var(--accent2); }
+
+      table.endpoints { width: 100%; border-collapse: collapse; margin-top: 28px; font-size: 14px; }
+      table.endpoints td { padding: 12px 14px; border-bottom: 1px solid var(--border); vertical-align: top; }
+      table.endpoints td.ep { font-family: var(--mono); color: var(--accent); white-space: nowrap; }
+      table.endpoints td.de { color: var(--muted); }
+
+      .diagram { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-top: 26px; overflow-x: auto; }
+      .diagram pre { margin: 0; font-family: var(--mono); font-size: 12.5px; line-height: 1.5; color: var(--muted); }
+      .diagram pre b { color: var(--accent); }
+
+      .twocol { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 30px; }
+      @media (max-width: 720px) { .twocol { grid-template-columns: 1fr; } }
+      .linkcard { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; transition: .15s; }
+      .linkcard:hover { border-color: var(--accent); }
+      .linkcard .t { font-family: var(--mono); font-size: 14px; color: var(--text); }
+      .linkcard .d { font-size: 13px; color: var(--muted); margin-top: 4px; }
+      .linkcard .t .arrow { color: var(--accent); }
+
+      footer { position: relative; z-index: 1; border-top: 1px solid var(--border); padding: 40px 0 60px; color: var(--muted2); font-size: 13px; }
+      footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+      footer .mono { font-family: var(--mono); }
+    </style>
+  </head>
+  <body>
+    <div class="glyphs" id="glyphs" aria-hidden="true"></div>
+
+    <nav>
+      <div class="wrap">
+        <div class="brand">sutegi<span class="dot">.</span></div>
+        <div class="navlinks">
+          <a href="#features">Features</a>
+          <a href="#quickstart">Quickstart</a>
+          <a href="#agents">Agents</a>
+          <a href="#architecture">Architecture</a>
+          <a href="#docs">Docs</a>
+          <a class="gh" href="https://github.com/enekos/sutegi">GitHub ↗</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="wrap">
+        <div class="eyebrow">⚒️ the forge · zero-dependency · agent-native</div>
+        <h1 class="title"><span id="heroTop">Laravel for Rust</span><span class="sub" id="heroSub">built from std up.</span></h1>
+        <p class="lede">
+          <strong>sutegi</strong> (Basque: <em>forge</em>) is a batteries-included web framework with
+          <strong>zero third-party dependencies</strong>. The HTTP/1.1 server, JSON, router, ORM, and
+          LLM tool layer are all hand-built on <code>std</code>. No tokio, no serde — a tiny binary, and
+          an AI agent as a first-class user.
+        </p>
+        <div class="cta">
+          <a class="btn primary" href="#quickstart">Get started →</a>
+          <a class="btn ghost" href="https://github.com/enekos/sutegi">View on GitHub</a>
+          <a class="btn ghost" href="#agents">The agent contract</a>
+        </div>
+        <div class="stats">
+          <div class="stat"><div class="n">0</div><div class="l">runtime deps</div></div>
+          <div class="stat"><div class="n">362 KB</div><div class="l">core binary</div></div>
+          <div class="stat"><div class="n">11</div><div class="l">composable crates</div></div>
+          <div class="stat"><div class="n">std</div><div class="l">only</div></div>
+        </div>
+      </div>
+    </header>
+
+    <section id="what">
+      <div class="wrap">
+        <div class="label" data-scramble>// what is sutegi</div>
+        <h2>Three goals usually in tension, held at once.</h2>
+        <p class="section-lede">
+          Batteries-included ergonomics, a minimal binary, and an interface built for autonomous agents —
+          reconciled by one decision: build every component from the standard library, with no async runtime.
+        </p>
+        <div class="grid">
+          <div class="card"><div class="ico">📦</div><h3 data-hover>From the ground up</h3><p>Original std-only code you can read in an afternoon. Hand-written HTTP/1.1 parser, JSON codec, router, query builder.</p></div>
+          <div class="card"><div class="ico">🪶</div><h3 data-hover>Minimum binary</h3><p>No async runtime, size-optimized release profile. The core "hello" service is ~362 KB; full SQLite build ~1.3 MB.</p></div>
+          <div class="card"><div class="ico">🤖</div><h3 data-hover>Agent-native</h3><p>Routes, models, and tools are introspectable as JSON at runtime; tool-calling is a first-class concept, not a bolt-on.</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="features">
+      <div class="wrap">
+        <div class="label" data-scramble>// features</div>
+        <h2>A real framework, not a toy.</h2>
+        <p class="section-lede">Each pillar is an opt-in compile-time feature, so you ship only what you use.</p>
+        <div class="grid">
+          <div class="card"><div class="ico">🧭</div><h3 data-hover>Routing &amp; middleware</h3><p>Path params, route groups, before/after middleware, typed extractors — the request→handler→response spine.</p></div>
+          <div class="card"><div class="ico">🗄️</div><h3 data-hover>ORM &amp; query builder</h3><p>Typed schema, parameterized SELECT/UPDATE/DELETE builders, migrations, transactions. Optional bundled SQLite.</p></div>
+          <div class="card"><div class="ico">🧬</div><h3 data-hover>#[derive(Model)]</h3><p>Typed models hydrate from rows and serialize to JSON. Build-time-only macro deps never reach your binary.</p></div>
+          <div class="card"><div class="ico">✅</div><h3 data-hover>Validation</h3><p>Laravel-style rule sets and a JSON Schema validator, with structured per-field errors. Reused for AI tool args.</p></div>
+          <div class="card"><div class="ico">📡</div><h3 data-hover>Streaming &amp; SSE</h3><p>Stream bytes or Server-Sent Events with natural backpressure — the transport for live LLM tokens.</p></div>
+          <div class="card"><div class="ico">⚙️</div><h3 data-hover>Background jobs</h3><p>An in-process queue with workers, retries, delayed dispatch, and introspectable stats.</p></div>
+          <div class="card"><div class="ico">🔭</div><h3 data-hover>Introspection</h3><p>GET /__introspect returns the whole app surface as JSON — routes, models, tools — for humans and agents.</p></div>
+          <div class="card"><div class="ico">🧱</div><h3 data-hover>Hexagonal toolkit</h3><p>AppError, UseCase ports, and adapter glue for clean, testable ports-and-adapters apps.</p></div>
+          <div class="card"><div class="ico">☸️</div><h3 data-hover>Pod-ready</h3><p>Health/readiness/metrics endpoints, graceful SIGTERM draining, and a Sail-style Docker/k8s harness.</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="quickstart">
+      <div class="wrap">
+        <div class="label" data-scramble>// quickstart</div>
+        <h2>From zero to a running, introspectable app.</h2>
+
+        <div class="code">
+          <div class="bar"><span class="name">scaffold</span><span class="copy" data-copy>copy</span></div>
+<pre><span class="c"># scaffold a new app and run it</span>
+sutegi new blog
+<span class="k">cd</span> blog &amp;&amp; cargo run</pre>
+        </div>
+
+        <div class="code">
+          <div class="bar"><span class="name">src/main.rs</span><span class="copy" data-copy>copy</span></div>
+<pre><span class="k">use</span> sutegi::prelude::*;
+
+<span class="k">fn</span> main() -&gt; std::io::Result&lt;()&gt; {
+    App::new(<span class="s">"hello"</span>)
+        .get(<span class="s">"/"</span>, <span class="s">"Health check"</span>, |_req, _p| text(<span class="s">200</span>, <span class="s">"sutegi up"</span>))
+        .run_graceful(<span class="s">"0.0.0.0:8080"</span>)
+}</pre>
+        </div>
+
+        <div class="code">
+          <div class="bar"><span class="name">talk to it</span><span class="copy" data-copy>copy</span></div>
+<pre>curl localhost:8080/__introspect   <span class="c"># full app surface as JSON</span>
+curl localhost:8080/__tools        <span class="c"># LLM tool-calling manifest</span>
+curl -X POST localhost:8080/__tools/create_todo -d <span class="s">'{"title":"ship sutegi"}'</span></pre>
+        </div>
+      </div>
+    </section>
+
+    <section id="agents">
+      <div class="wrap">
+        <div class="label" data-scramble>// the agent contract</div>
+        <h2>An app an LLM can drive — no SDK, no source access.</h2>
+        <p class="section-lede">Every sutegi app is self-describing over plain JSON/HTTP. The loop is discover → manifest → invoke.</p>
+        <table class="endpoints">
+          <tr><td class="ep">GET /__introspect</td><td class="de">Full surface: routes (with docs), data models, and tools — deterministic JSON.</td></tr>
+          <tr><td class="ep">GET /__tools</td><td class="de">Anthropic-style <code>{name, description, input_schema, streaming}</code> tool manifest.</td></tr>
+          <tr><td class="ep">POST /__tools/:name</td><td class="de">Invoke a tool with a JSON body; arguments validated against its schema (precise 422 on failure).</td></tr>
+          <tr><td class="ep">POST /__tools/:name/stream</td><td class="de">Invoke a streaming tool; response is Server-Sent Events (live tokens).</td></tr>
+        </table>
+      </div>
+    </section>
+
+    <section id="architecture">
+      <div class="wrap">
+        <div class="label" data-scramble>// architecture</div>
+        <h2>Opinionated hexagonal, when you need structure.</h2>
+        <p class="section-lede">
+          The <code>hex</code> toolkit nudges you toward ports &amp; adapters: the dependency rule keeps your
+          domain free of HTTP/SQL and your business logic testable without a server. One use case, many transports.
+        </p>
+        <div class="diagram">
+<pre>   inbound adapters                       outbound adapters
+ (HTTP handlers, AI tools)              (SQLite repo, HTTP client)
+          │  call                            ▲  implement
+          ▼                                  │
+  <b>┌───────────────┐</b>     depends on    <b>┌──────────────┐</b>
+  <b>│  application  │</b> ─────────────────▶<b>│    ports     │</b>
+  <b>│  (use cases)  │</b>                   <b>│   (traits)   │</b>
+  <b>└───────┬───────┘</b>                   <b>└──────────────┘</b>
+          │ uses
+          ▼
+  <b>┌───────────────┐</b>
+  <b>│    domain     │</b>   pure: entities + rules, no framework
+  <b>└───────────────┘</b></pre>
+        </div>
+      </div>
+    </section>
+
+    <section id="docs">
+      <div class="wrap">
+        <div class="label" data-scramble>// docs &amp; examples</div>
+        <h2>Read more.</h2>
+        <div class="twocol">
+          <a class="linkcard" href="https://github.com/enekos/sutegi#readme"><div class="t">README <span class="arrow">→</span></div><div class="d">Overview, features, feature-flag guide, and the full API tour.</div></a>
+          <a class="linkcard" href="https://github.com/enekos/sutegi/blob/master/AGENTS.md"><div class="t">AGENTS.md <span class="arrow">→</span></div><div class="d">The complete agent-facing contract: discover, manifest, invoke, stream.</div></a>
+          <a class="linkcard" href="https://github.com/enekos/sutegi/blob/master/docs/HEXAGONAL.md"><div class="t">Hexagonal guide <span class="arrow">→</span></div><div class="d">The dependency rule, layer responsibilities, layout, and testing strategy.</div></a>
+          <a class="linkcard" href="https://github.com/enekos/sutegi/tree/master/examples"><div class="t">Examples <span class="arrow">→</span></div><div class="d">hello (minimal), todo (every pillar), hexagonal (clean architecture).</div></a>
+        </div>
+      </div>
+    </section>
+
+    <footer>
+      <div class="wrap">
+        <div><span class="mono">sutegi</span> — the forge. Built from std up.</div>
+        <div class="mono">MIT © 2026 Eneko Sarasola · <a href="https://github.com/enekos/sutegi" style="color:var(--accent)">github.com/enekos/sutegi</a></div>
+      </div>
+    </footer>
+
+    <script>
+      // --- floating glyphs ---
+      (function () {
+        const set = ['{', '}', '<>', '/', '⚒', 'fn', '::', '?', '#[', ']', 'std', '→'];
+        const host = document.getElementById('glyphs');
+        const n = window.innerWidth < 640 ? 0 : 14;
+        for (let i = 0; i < n; i++) {
+          const g = document.createElement('div');
+          g.className = 'glyph';
+          g.textContent = set[i % set.length];
+          g.style.left = Math.random() * 100 + '%';
+          g.style.top = Math.random() * 100 + '%';
+          g.style.fontSize = (16 + Math.random() * 40) + 'px';
+          g.style.animationDelay = (Math.random() * 8) + 's';
+          g.style.animationDuration = (7 + Math.random() * 6) + 's';
+          host.appendChild(g);
+        }
+      })();
+
+      // --- scramble text ---
+      const CH = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#$%&*+<>{}[]_-/';
+      function scrambleTo(target, progress) {
+        return target.split('').map((ch, i) => {
+          if (ch === ' ') return ' ';
+          if (progress > i) return ch;
+          return CH[Math.floor(Math.random() * CH.length)];
+        }).join('');
+      }
+      function runScramble(el, finalText, speed) {
+        let t = 0;
+        const iv = setInterval(() => {
+          el.textContent = scrambleTo(finalText, t);
+          t += (speed || 0.5);
+          if (t >= finalText.length + 2) { clearInterval(iv); el.textContent = finalText; }
+        }, 35);
+      }
+
+      // hero intro
+      runScramble(document.getElementById('heroTop'), 'Laravel for Rust', 0.6);
+      setTimeout(() => runScramble(document.getElementById('heroSub'), 'built from std up.', 0.6), 250);
+
+      // section labels scramble on first view
+      const io = new IntersectionObserver((entries) => {
+        entries.forEach((e) => {
+          if (e.isIntersecting) { runScramble(e.target, e.target.textContent, 0.6); io.unobserve(e.target); }
+        });
+      }, { threshold: 0.4 });
+      document.querySelectorAll('[data-scramble]').forEach((el) => io.observe(el));
+
+      // hover scramble on card titles
+      document.querySelectorAll('[data-hover]').forEach((el) => {
+        const final = el.textContent;
+        let iv = null;
+        el.addEventListener('mouseenter', () => {
+          let t = 0;
+          clearInterval(iv);
+          iv = setInterval(() => {
+            el.textContent = scrambleTo(final, t);
+            t += 0.7;
+            if (t >= final.length + 2) { clearInterval(iv); el.textContent = final; }
+          }, 28);
+        });
+        el.addEventListener('mouseleave', () => { clearInterval(iv); el.textContent = final; });
+      });
+
+      // copy buttons
+      document.querySelectorAll('[data-copy]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const pre = btn.closest('.code').querySelector('pre');
+          navigator.clipboard.writeText(pre.innerText).then(() => {
+            const old = btn.textContent;
+            btn.textContent = 'copied ✓';
+            setTimeout(() => (btn.textContent = old), 1400);
+          });
+        });
+      });
+    </script>
+  </body>
+</html>
