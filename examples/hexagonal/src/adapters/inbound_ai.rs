@@ -21,10 +21,17 @@ impl Tool for CreateTodoTool {
         "Create a todo item (drives the same use case as the HTTP API)."
     }
     fn parameters(&self) -> Json {
-        schema::object(vec![("title", schema::string("the todo's title"))], &["title"])
+        schema::object(
+            vec![("title", schema::string("the todo's title"))],
+            &["title"],
+        )
     }
     fn call(&self, args: Json) -> Result<Json, String> {
-        let title = args.get("title").and_then(|j| j.as_str()).unwrap_or("").to_string();
+        let title = args
+            .get("title")
+            .and_then(|j| j.as_str())
+            .unwrap_or("")
+            .to_string();
         // Run the use case; map the domain error onto the tool's String error.
         self.use_case
             .execute(title)

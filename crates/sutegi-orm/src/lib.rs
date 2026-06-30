@@ -143,7 +143,8 @@ pub trait Model {
     where
         Self: Sized + FromRow,
     {
-        let rows = conn.fetch::<Self>(&Self::query().filter(Self::primary_key(), "=", id).limit(1))?;
+        let rows =
+            conn.fetch::<Self>(&Self::query().filter(Self::primary_key(), "=", id).limit(1))?;
         Ok(rows.into_iter().next())
     }
 
@@ -271,12 +272,22 @@ pub mod db {
 
         /// Run a paginated query: returns the page's rows (as JSON) plus the
         /// total count. `page` is 1-based.
-        pub fn paginate(&self, qb: &QueryBuilder, page: i64, per_page: i64) -> Result<crate::Page<Json>, String> {
+        pub fn paginate(
+            &self,
+            qb: &QueryBuilder,
+            page: i64,
+            per_page: i64,
+        ) -> Result<crate::Page<Json>, String> {
             let total = self.count(qb)?;
             let page = page.max(1);
             let per_page = per_page.max(1);
             let items = self.select(&qb.clone().limit(per_page).offset((page - 1) * per_page))?;
-            Ok(crate::Page { items, total, page, per_page })
+            Ok(crate::Page {
+                items,
+                total,
+                page,
+                per_page,
+            })
         }
 
         /// Typed variant of [`paginate`](Db::paginate).
@@ -289,13 +300,24 @@ pub mod db {
             let total = self.count(qb)?;
             let page = page.max(1);
             let per_page = per_page.max(1);
-            let items = self.fetch::<T>(&qb.clone().limit(per_page).offset((page - 1) * per_page))?;
-            Ok(crate::Page { items, total, page, per_page })
+            let items =
+                self.fetch::<T>(&qb.clone().limit(per_page).offset((page - 1) * per_page))?;
+            Ok(crate::Page {
+                items,
+                total,
+                page,
+                per_page,
+            })
         }
 
         /// Insert, or update on primary/unique-key conflict (SQLite UPSERT).
         /// Non-conflict columns are overwritten with the new values.
-        pub fn upsert(&self, table: &str, cols: &[(&str, Value)], conflict: &str) -> Result<i64, String> {
+        pub fn upsert(
+            &self,
+            table: &str,
+            cols: &[(&str, Value)],
+            conflict: &str,
+        ) -> Result<i64, String> {
             let names: Vec<&str> = cols.iter().map(|(n, _)| *n).collect();
             let placeholders = vec!["?"; cols.len()].join(", ");
             let updates: Vec<String> = names
@@ -312,7 +334,9 @@ pub mod db {
                 updates.join(", ")
             );
             let bound: Vec<SqlValue> = cols.iter().map(|(_, v)| to_sql(v)).collect();
-            self.conn.execute(&sql, params_from_iter(bound)).map_err(|e| e.to_string())?;
+            self.conn
+                .execute(&sql, params_from_iter(bound))
+                .map_err(|e| e.to_string())?;
             Ok(self.conn.last_insert_rowid())
         }
 
@@ -327,10 +351,14 @@ pub mod db {
             &self,
             f: impl FnOnce(&Db) -> Result<T, String>,
         ) -> Result<T, String> {
-            self.conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+            self.conn
+                .execute_batch("BEGIN")
+                .map_err(|e| e.to_string())?;
             match f(self) {
                 Ok(value) => {
-                    self.conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+                    self.conn
+                        .execute_batch("COMMIT")
+                        .map_err(|e| e.to_string())?;
                     Ok(value)
                 }
                 Err(e) => {
@@ -356,7 +384,8 @@ pub mod db {
                     Ok(Json::Obj(obj))
                 })
                 .map_err(|e| e.to_string())?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())
         }
     }
 
@@ -389,9 +418,24 @@ pub mod db {
             TableSchema {
                 table: "todos",
                 columns: vec![
-                    Column { name: "id", ty: ColType::Integer, nullable: false, primary: true },
-                    Column { name: "title", ty: ColType::Text, nullable: false, primary: false },
-                    Column { name: "done", ty: ColType::Boolean, nullable: false, primary: false },
+                    Column {
+                        name: "id",
+                        ty: ColType::Integer,
+                        nullable: false,
+                        primary: true,
+                    },
+                    Column {
+                        name: "title",
+                        ty: ColType::Text,
+                        nullable: false,
+                        primary: false,
+                    },
+                    Column {
+                        name: "done",
+                        ty: ColType::Boolean,
+                        nullable: false,
+                        primary: false,
+                    },
                 ],
             }
         }
@@ -403,7 +447,10 @@ pub mod db {
             let id = db
                 .insert(
                     "todos",
-                    &[("title", Value::Text("ship sutegi".into())), ("done", Value::Bool(false))],
+                    &[
+                        ("title", Value::Text("ship sutegi".into())),
+                        ("done", Value::Bool(false)),
+                    ],
                 )
                 .unwrap();
             assert_eq!(id, 1);
@@ -420,7 +467,14 @@ pub mod db {
         fn update_delete_and_transaction() {
             let db = Db::memory().unwrap();
             db.migrate(&todos_schema()).unwrap();
-            db.insert("todos", &[("title", Value::Text("a".into())), ("done", Value::Bool(false))]).unwrap();
+            db.insert(
+                "todos",
+                &[
+                    ("title", Value::Text("a".into())),
+                    ("done", Value::Bool(false)),
+                ],
+            )
+            .unwrap();
 
             // UPDATE via builder.
             let (sql, params) = crate::UpdateBuilder::table("todos")
@@ -431,21 +485,35 @@ pub mod db {
 
             // Rollback leaves state untouched.
             let _ = db.transaction(|tx| {
-                tx.insert("todos", &[("title", Value::Text("b".into())), ("done", Value::Bool(false))])?;
+                tx.insert(
+                    "todos",
+                    &[
+                        ("title", Value::Text("b".into())),
+                        ("done", Value::Bool(false)),
+                    ],
+                )?;
                 Err::<(), String>("boom".into())
             });
             assert_eq!(db.select(&QueryBuilder::table("todos")).unwrap().len(), 1);
 
             // Commit persists.
             db.transaction(|tx| {
-                tx.insert("todos", &[("title", Value::Text("c".into())), ("done", Value::Bool(false))])?;
+                tx.insert(
+                    "todos",
+                    &[
+                        ("title", Value::Text("c".into())),
+                        ("done", Value::Bool(false)),
+                    ],
+                )?;
                 Ok(())
             })
             .unwrap();
             assert_eq!(db.select(&QueryBuilder::table("todos")).unwrap().len(), 2);
 
             // DELETE via builder.
-            let (dsql, dparams) = crate::DeleteBuilder::table("todos").filter("id", "=", Value::Int(1)).build();
+            let (dsql, dparams) = crate::DeleteBuilder::table("todos")
+                .filter("id", "=", Value::Int(1))
+                .build();
             assert_eq!(db.execute(&dsql, &dparams).unwrap(), 1);
         }
 
@@ -454,22 +522,47 @@ pub mod db {
             let db = Db::memory().unwrap();
             db.migrate(&todos_schema()).unwrap();
             for i in 0..7 {
-                db.insert("todos", &[("title", Value::Text(format!("t{i}"))), ("done", Value::Bool(false))]).unwrap();
+                db.insert(
+                    "todos",
+                    &[
+                        ("title", Value::Text(format!("t{i}"))),
+                        ("done", Value::Bool(false)),
+                    ],
+                )
+                .unwrap();
             }
             assert_eq!(db.count(&QueryBuilder::table("todos")).unwrap(), 7);
-            assert!(db.exists(&QueryBuilder::table("todos").filter("id", "=", Value::Int(3))).unwrap());
-            assert!(!db.exists(&QueryBuilder::table("todos").filter("id", "=", Value::Int(99))).unwrap());
+            assert!(db
+                .exists(&QueryBuilder::table("todos").filter("id", "=", Value::Int(3)))
+                .unwrap());
+            assert!(!db
+                .exists(&QueryBuilder::table("todos").filter("id", "=", Value::Int(99)))
+                .unwrap());
 
-            let page = db.paginate(&QueryBuilder::table("todos").order_by("id", false), 2, 3).unwrap();
+            let page = db
+                .paginate(&QueryBuilder::table("todos").order_by("id", false), 2, 3)
+                .unwrap();
             assert_eq!(page.total, 7);
             assert_eq!(page.items.len(), 3);
             assert_eq!(page.total_pages(), 3);
             assert!(page.has_next() && page.has_prev());
 
             // UPSERT on the primary key: second call updates, doesn't duplicate.
-            db.upsert("todos", &[("id", Value::Int(1)), ("title", Value::Text("upserted".into())), ("done", Value::Bool(true))], "id").unwrap();
+            db.upsert(
+                "todos",
+                &[
+                    ("id", Value::Int(1)),
+                    ("title", Value::Text("upserted".into())),
+                    ("done", Value::Bool(true)),
+                ],
+                "id",
+            )
+            .unwrap();
             assert_eq!(db.count(&QueryBuilder::table("todos")).unwrap(), 7);
-            let row = db.query_one("SELECT title FROM todos WHERE id = 1", &[]).unwrap().unwrap();
+            let row = db
+                .query_one("SELECT title FROM todos WHERE id = 1", &[])
+                .unwrap()
+                .unwrap();
             assert_eq!(row.get("title").unwrap(), &Json::str("upserted"));
         }
     }
@@ -489,7 +582,8 @@ pub mod row {
     use sutegi_json::Json;
 
     fn col<'a>(row: &'a Json, name: &str) -> Result<&'a Json, String> {
-        row.get(name).ok_or_else(|| format!("missing column '{}'", name))
+        row.get(name)
+            .ok_or_else(|| format!("missing column '{}'", name))
     }
 
     fn is_absent(row: &Json, name: &str) -> bool {
@@ -500,7 +594,10 @@ pub mod row {
         match col(row, name)? {
             Json::Num(n) => Ok(*n as i64),
             Json::Bool(b) => Ok(*b as i64),
-            Json::Str(s) => s.trim().parse().map_err(|_| format!("column '{}' is not an integer", name)),
+            Json::Str(s) => s
+                .trim()
+                .parse()
+                .map_err(|_| format!("column '{}' is not an integer", name)),
             _ => Err(format!("column '{}' is not an integer", name)),
         }
     }
@@ -508,7 +605,10 @@ pub mod row {
     pub fn get_f64(row: &Json, name: &str) -> Result<f64, String> {
         match col(row, name)? {
             Json::Num(n) => Ok(*n),
-            Json::Str(s) => s.trim().parse().map_err(|_| format!("column '{}' is not a number", name)),
+            Json::Str(s) => s
+                .trim()
+                .parse()
+                .map_err(|_| format!("column '{}' is not a number", name)),
             _ => Err(format!("column '{}' is not a number", name)),
         }
     }
@@ -532,16 +632,32 @@ pub mod row {
     }
 
     pub fn opt_i64(row: &Json, name: &str) -> Result<Option<i64>, String> {
-        if is_absent(row, name) { Ok(None) } else { get_i64(row, name).map(Some) }
+        if is_absent(row, name) {
+            Ok(None)
+        } else {
+            get_i64(row, name).map(Some)
+        }
     }
     pub fn opt_f64(row: &Json, name: &str) -> Result<Option<f64>, String> {
-        if is_absent(row, name) { Ok(None) } else { get_f64(row, name).map(Some) }
+        if is_absent(row, name) {
+            Ok(None)
+        } else {
+            get_f64(row, name).map(Some)
+        }
     }
     pub fn opt_string(row: &Json, name: &str) -> Result<Option<String>, String> {
-        if is_absent(row, name) { Ok(None) } else { get_string(row, name).map(Some) }
+        if is_absent(row, name) {
+            Ok(None)
+        } else {
+            get_string(row, name).map(Some)
+        }
     }
     pub fn opt_bool(row: &Json, name: &str) -> Result<Option<bool>, String> {
-        if is_absent(row, name) { Ok(None) } else { get_bool(row, name).map(Some) }
+        if is_absent(row, name) {
+            Ok(None)
+        } else {
+            get_bool(row, name).map(Some)
+        }
     }
 }
 
@@ -621,7 +737,11 @@ fn render_predicates(preds: &[Predicate]) -> (String, Vec<Value>) {
                 }
             }
             Predicate::IsNull(c, is_null) => {
-                clauses.push(format!("{} IS {}NULL", c, if *is_null { "" } else { "NOT " }));
+                clauses.push(format!(
+                    "{} IS {}NULL",
+                    c,
+                    if *is_null { "" } else { "NOT " }
+                ));
             }
             Predicate::Or(group) => {
                 if group.is_empty() {
@@ -690,7 +810,8 @@ impl QueryBuilder {
 
     /// Add a `WHERE col <op> ?` clause (AND-joined). `op` is e.g. `=`, `>`, `LIKE`.
     pub fn filter(mut self, col: &str, op: &str, value: Value) -> QueryBuilder {
-        self.preds.push(Predicate::Cmp(col.to_string(), op.to_string(), value));
+        self.preds
+            .push(Predicate::Cmp(col.to_string(), op.to_string(), value));
         self
     }
 
@@ -715,7 +836,10 @@ impl QueryBuilder {
     /// An OR group, AND-joined with the rest: `AND (a op ? OR b op ? …)`.
     pub fn or_group(mut self, group: &[(&str, &str, Value)]) -> QueryBuilder {
         self.preds.push(Predicate::Or(
-            group.iter().map(|(c, op, v)| (c.to_string(), op.to_string(), v.clone())).collect(),
+            group
+                .iter()
+                .map(|(c, op, v)| (c.to_string(), op.to_string(), v.clone()))
+                .collect(),
         ));
         self
     }
@@ -728,19 +852,22 @@ impl QueryBuilder {
     /// An arbitrary parenthesized WHERE fragment with its own bound params —
     /// an escape hatch for SQL the builder doesn't model.
     pub fn where_raw(mut self, fragment: &str, params: Vec<Value>) -> QueryBuilder {
-        self.preds.push(Predicate::Raw(fragment.to_string(), params));
+        self.preds
+            .push(Predicate::Raw(fragment.to_string(), params));
         self
     }
 
     /// `INNER JOIN other ON left = right`.
     pub fn join(mut self, other: &str, left: &str, right: &str) -> QueryBuilder {
-        self.joins.push(format!("JOIN {} ON {} = {}", other, left, right));
+        self.joins
+            .push(format!("JOIN {} ON {} = {}", other, left, right));
         self
     }
 
     /// `LEFT JOIN other ON left = right`.
     pub fn left_join(mut self, other: &str, left: &str, right: &str) -> QueryBuilder {
-        self.joins.push(format!("LEFT JOIN {} ON {} = {}", other, left, right));
+        self.joins
+            .push(format!("LEFT JOIN {} ON {} = {}", other, left, right));
         self
     }
 
@@ -766,7 +893,7 @@ impl QueryBuilder {
         self
     }
 
-    fn from_and_joins(&self) -> String {
+    fn build_from_and_joins(&self) -> String {
         let mut s = self.table.clone();
         for j in &self.joins {
             s.push(' ');
@@ -777,10 +904,20 @@ impl QueryBuilder {
 
     /// Build the SELECT SQL and ordered bound parameters.
     pub fn build(&self) -> (String, Vec<Value>) {
-        let cols = if self.columns.is_empty() { "*".to_string() } else { self.columns.join(", ") };
+        let cols = if self.columns.is_empty() {
+            "*".to_string()
+        } else {
+            self.columns.join(", ")
+        };
         let distinct = if self.distinct { "DISTINCT " } else { "" };
         let (where_sql, params) = render_predicates(&self.preds);
-        let mut sql = format!("SELECT {}{} FROM {}{}", distinct, cols, self.from_and_joins(), where_sql);
+        let mut sql = format!(
+            "SELECT {}{} FROM {}{}",
+            distinct,
+            cols,
+            self.build_from_and_joins(),
+            where_sql
+        );
 
         if !self.group_by.is_empty() {
             sql.push_str(&format!(" GROUP BY {}", self.group_by.join(", ")));
@@ -806,7 +943,14 @@ impl QueryBuilder {
     /// columns/order/limit/group), for pagination totals.
     pub fn build_count(&self) -> (String, Vec<Value>) {
         let (where_sql, params) = render_predicates(&self.preds);
-        (format!("SELECT COUNT(*) AS count FROM {}{}", self.from_and_joins(), where_sql), params)
+        (
+            format!(
+                "SELECT COUNT(*) AS count FROM {}{}",
+                self.build_from_and_joins(),
+                where_sql
+            ),
+            params,
+        )
     }
 }
 
@@ -820,14 +964,19 @@ pub struct UpdateBuilder {
 
 impl UpdateBuilder {
     pub fn table(table: &str) -> UpdateBuilder {
-        UpdateBuilder { table: table.to_string(), sets: Vec::new(), preds: Vec::new() }
+        UpdateBuilder {
+            table: table.to_string(),
+            sets: Vec::new(),
+            preds: Vec::new(),
+        }
     }
     pub fn set(mut self, col: &str, value: Value) -> UpdateBuilder {
         self.sets.push((col.to_string(), value));
         self
     }
     pub fn filter(mut self, col: &str, op: &str, value: Value) -> UpdateBuilder {
-        self.preds.push(Predicate::Cmp(col.to_string(), op.to_string(), value));
+        self.preds
+            .push(Predicate::Cmp(col.to_string(), op.to_string(), value));
         self
     }
     pub fn where_null(mut self, col: &str) -> UpdateBuilder {
@@ -835,7 +984,8 @@ impl UpdateBuilder {
         self
     }
     pub fn where_raw(mut self, fragment: &str, params: Vec<Value>) -> UpdateBuilder {
-        self.preds.push(Predicate::Raw(fragment.to_string(), params));
+        self.preds
+            .push(Predicate::Raw(fragment.to_string(), params));
         self
     }
     /// Returns `(sql, params)`. Params are SET values first, then WHERE values.
@@ -851,7 +1001,15 @@ impl UpdateBuilder {
             .collect();
         let (where_sql, where_params) = render_predicates(&self.preds);
         params.extend(where_params);
-        (format!("UPDATE {} SET {}{}", self.table, assignments.join(", "), where_sql), params)
+        (
+            format!(
+                "UPDATE {} SET {}{}",
+                self.table,
+                assignments.join(", "),
+                where_sql
+            ),
+            params,
+        )
     }
 }
 
@@ -864,10 +1022,14 @@ pub struct DeleteBuilder {
 
 impl DeleteBuilder {
     pub fn table(table: &str) -> DeleteBuilder {
-        DeleteBuilder { table: table.to_string(), preds: Vec::new() }
+        DeleteBuilder {
+            table: table.to_string(),
+            preds: Vec::new(),
+        }
     }
     pub fn filter(mut self, col: &str, op: &str, value: Value) -> DeleteBuilder {
-        self.preds.push(Predicate::Cmp(col.to_string(), op.to_string(), value));
+        self.preds
+            .push(Predicate::Cmp(col.to_string(), op.to_string(), value));
         self
     }
     pub fn where_null(mut self, col: &str) -> DeleteBuilder {
@@ -875,7 +1037,8 @@ impl DeleteBuilder {
         self
     }
     pub fn where_raw(mut self, fragment: &str, params: Vec<Value>) -> DeleteBuilder {
-        self.preds.push(Predicate::Raw(fragment.to_string(), params));
+        self.preds
+            .push(Predicate::Raw(fragment.to_string(), params));
         self
     }
     pub fn build(&self) -> (String, Vec<Value>) {
@@ -930,9 +1093,24 @@ mod tests {
         TableSchema {
             table: "todos",
             columns: vec![
-                Column { name: "id", ty: ColType::Integer, nullable: false, primary: true },
-                Column { name: "title", ty: ColType::Text, nullable: false, primary: false },
-                Column { name: "done", ty: ColType::Boolean, nullable: false, primary: false },
+                Column {
+                    name: "id",
+                    ty: ColType::Integer,
+                    nullable: false,
+                    primary: true,
+                },
+                Column {
+                    name: "title",
+                    ty: ColType::Text,
+                    nullable: false,
+                    primary: false,
+                },
+                Column {
+                    name: "done",
+                    ty: ColType::Boolean,
+                    nullable: false,
+                    primary: false,
+                },
             ],
         }
     }
@@ -995,7 +1173,10 @@ mod tests {
     fn or_group_null_like_and_joins() {
         let (sql, params) = QueryBuilder::table("todos")
             .filter("done", "=", Value::Bool(false))
-            .or_group(&[("priority", "=", Value::Text("high".into())), ("pinned", "=", Value::Bool(true))])
+            .or_group(&[
+                ("priority", "=", Value::Text("high".into())),
+                ("pinned", "=", Value::Bool(true)),
+            ])
             .where_not_null("title")
             .like("title", "%sutegi%")
             .build();
@@ -1022,9 +1203,15 @@ mod tests {
     #[test]
     fn where_raw_fragment() {
         let (sql, params) = QueryBuilder::table("t")
-            .where_raw("created_at > ? AND created_at < ?", vec![Value::Int(1), Value::Int(9)])
+            .where_raw(
+                "created_at > ? AND created_at < ?",
+                vec![Value::Int(1), Value::Int(9)],
+            )
             .build();
-        assert_eq!(sql, "SELECT * FROM t WHERE (created_at > ? AND created_at < ?)");
+        assert_eq!(
+            sql,
+            "SELECT * FROM t WHERE (created_at > ? AND created_at < ?)"
+        );
         assert_eq!(params.len(), 2);
     }
 
@@ -1038,8 +1225,138 @@ mod tests {
         assert_eq!(sql, "UPDATE todos SET title = ?, done = ? WHERE id = ?");
         assert_eq!(params.len(), 3);
 
-        let (dsql, dparams) = DeleteBuilder::table("todos").filter("id", "=", Value::Int(5)).build();
+        let (dsql, dparams) = DeleteBuilder::table("todos")
+            .filter("id", "=", Value::Int(5))
+            .build();
         assert_eq!(dsql, "DELETE FROM todos WHERE id = ?");
         assert_eq!(dparams, vec![Value::Int(5)]);
+    }
+
+    #[test]
+    fn update_delete_support_null_and_raw() {
+        let (usql, _) = UpdateBuilder::table("t")
+            .set("done", Value::Bool(true))
+            .where_null("deleted_at")
+            .build();
+        assert_eq!(usql, "UPDATE t SET done = ? WHERE deleted_at IS NULL");
+
+        let (dsql, dparams) = DeleteBuilder::table("t")
+            .where_raw("age > ?", vec![Value::Int(65)])
+            .build();
+        assert_eq!(dsql, "DELETE FROM t WHERE (age > ?)");
+        assert_eq!(dparams, vec![Value::Int(65)]);
+    }
+
+    #[test]
+    fn build_count_keeps_joins_and_filters() {
+        let (sql, params) = QueryBuilder::table("todos")
+            .join("users", "users.id", "todos.user_id")
+            .filter("users.active", "=", Value::Bool(true))
+            .build_count();
+        assert_eq!(
+            sql,
+            "SELECT COUNT(*) AS count FROM todos JOIN users ON users.id = todos.user_id WHERE users.active = ?"
+        );
+        assert_eq!(params.len(), 1);
+    }
+
+    #[test]
+    fn coltype_and_value_mappings() {
+        assert_eq!(ColType::Integer.sql(), "INTEGER");
+        assert_eq!(ColType::Boolean.sql(), "BOOLEAN");
+        assert_eq!(ColType::Real.name(), "real");
+        assert_eq!(Value::Bool(true).to_json(), Json::Bool(true));
+        assert_eq!(Value::Int(5).to_json(), Json::Num(5.0));
+        assert_eq!(Value::Null.to_json(), Json::Null);
+        assert_eq!(Value::Text("x".into()).to_json(), Json::str("x"));
+    }
+
+    #[test]
+    fn schema_json_describes_columns() {
+        let j = schema_json(&todos());
+        assert_eq!(j.get("table").and_then(Json::as_str), Some("todos"));
+        let cols = j.get("columns").and_then(Json::as_array).unwrap();
+        assert_eq!(cols.len(), 3);
+        // The id column is primary and not nullable.
+        let id = &cols[0];
+        assert_eq!(id.get("name").and_then(Json::as_str), Some("id"));
+        assert_eq!(id.get("primary").and_then(Json::as_bool), Some(true));
+    }
+
+    #[test]
+    fn model_default_primary_key_and_query() {
+        // primary_key() finds the primary column; query() scopes to the table.
+        struct T;
+        impl Model for T {
+            fn schema() -> TableSchema {
+                todos()
+            }
+        }
+        assert_eq!(T::primary_key(), "id");
+        assert_eq!(T::table(), "todos");
+        let (sql, _) = T::query().build();
+        assert_eq!(sql, "SELECT * FROM todos");
+    }
+
+    #[test]
+    fn row_extractors_tolerate_sqlite_quirks() {
+        // SQLite hands booleans back as 0/1 and ints can arrive as floats/strings.
+        let row = Json::obj(vec![
+            ("n", Json::Num(7.0)),
+            ("done", Json::int(1)),
+            ("name", Json::str("x")),
+            ("ratio", Json::str("2.5")),
+            ("flag", Json::str("true")),
+        ]);
+        assert_eq!(row::get_i64(&row, "n").unwrap(), 7);
+        assert!(row::get_bool(&row, "done").unwrap());
+        assert_eq!(row::get_string(&row, "name").unwrap(), "x");
+        assert_eq!(row::get_f64(&row, "ratio").unwrap(), 2.5);
+        assert!(row::get_bool(&row, "flag").unwrap());
+        // Missing column → error; absent optional → None.
+        assert!(row::get_i64(&row, "missing").is_err());
+        assert_eq!(
+            row::opt_i64(&Json::obj(vec![("x", Json::Null)]), "x").unwrap(),
+            None
+        );
+        assert_eq!(row::opt_string(&row, "name").unwrap().as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn page_pagination_math() {
+        let page = Page {
+            items: vec![1, 2, 3],
+            total: 10,
+            page: 2,
+            per_page: 3,
+        };
+        assert_eq!(page.total_pages(), 4); // ceil(10/3)
+        assert!(page.has_next());
+        assert!(page.has_prev());
+        // First page has no previous; a zero per_page degrades to 0 pages.
+        let first = Page {
+            items: vec![1],
+            total: 2,
+            page: 1,
+            per_page: 3,
+        };
+        assert!(!first.has_prev());
+        let degenerate = Page {
+            items: Vec::<i32>::new(),
+            total: 5,
+            page: 1,
+            per_page: 0,
+        };
+        assert_eq!(degenerate.total_pages(), 0);
+        // JSON shape carries the computed page count.
+        let j = Page {
+            items: vec![Json::int(1)],
+            total: 5,
+            page: 1,
+            per_page: 2,
+        }
+        .to_json();
+        assert_eq!(j.get("pages").and_then(Json::as_i64), Some(3));
+        assert_eq!(j.get("total").and_then(Json::as_i64), Some(5));
     }
 }

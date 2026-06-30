@@ -57,7 +57,9 @@ pub mod binding {
     /// hydrated model, or `Err(Response)` (404 if missing, 500 on db error)
     /// ready to return from the handler.
     pub fn model<T: Model + FromRow>(db: &Db, params: &Params, key: &str) -> Result<T, Response> {
-        let raw = params.get(key).ok_or_else(|| json(404, &not_found_json()))?;
+        let raw = params
+            .get(key)
+            .ok_or_else(|| json(404, &not_found_json()))?;
         let id = match raw.parse::<i64>() {
             Ok(n) => Value::Int(n),
             Err(_) => Value::Text(raw.clone()),
@@ -65,7 +67,10 @@ pub mod binding {
         match T::find_typed(db, id) {
             Ok(Some(m)) => Ok(m),
             Ok(None) => Err(json(404, &not_found_json())),
-            Err(e) => Err(json(500, &sutegi_json::Json::obj(vec![("error", sutegi_json::Json::str(e))]))),
+            Err(e) => Err(json(
+                500,
+                &sutegi_json::Json::obj(vec![("error", sutegi_json::Json::str(e))]),
+            )),
         }
     }
 
@@ -102,7 +107,8 @@ pub mod prelude {
     pub use sutegi_orm::row::FromRow;
     #[cfg(feature = "orm")]
     pub use sutegi_orm::{
-        ColType, Column, DeleteBuilder, Model, Page, QueryBuilder, TableSchema, UpdateBuilder, Value,
+        ColType, Column, DeleteBuilder, Model, Page, QueryBuilder, TableSchema, UpdateBuilder,
+        Value,
     };
     #[cfg(feature = "queue")]
     pub use sutegi_queue::{Job, Queue};

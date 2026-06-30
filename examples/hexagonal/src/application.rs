@@ -73,11 +73,15 @@ mod tests {
     #[test]
     fn create_then_complete() {
         let repo: Repo = Arc::new(InMemoryTodoRepo::new());
-        let created = CreateTodo { repo: repo.clone() }.execute("ship it".into()).unwrap();
+        let created = CreateTodo { repo: repo.clone() }
+            .execute("ship it".into())
+            .unwrap();
         assert_eq!(created.id, 1);
         assert!(!created.done);
 
-        let done = CompleteTodo { repo: repo.clone() }.execute(created.id).unwrap();
+        let done = CompleteTodo { repo: repo.clone() }
+            .execute(created.id)
+            .unwrap();
         assert!(done.done);
 
         let all = ListTodos { repo }.execute(()).unwrap();

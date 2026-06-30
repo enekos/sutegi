@@ -144,7 +144,12 @@ fn run_job(job: BoxedJob, counters: &Counters) {
             Err(err) => {
                 if attempt >= tries {
                     counters.failed.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("[queue] job '{}' failed after {} attempt(s): {}", job.name(), attempt, err);
+                    eprintln!(
+                        "[queue] job '{}' failed after {} attempt(s): {}",
+                        job.name(),
+                        attempt,
+                        err
+                    );
                     return;
                 }
                 counters.retried.fetch_add(1, Ordering::Relaxed);
@@ -206,12 +211,54 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 20);
     }
 
+    /// Poll `cond` until true or ~1s elapses; returns whether it became true.
+    fn wait_until(cond: impl Fn() -> bool) -> bool {
+        for _ in 0..200 {
+            if cond() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        cond()
+    }
+
     #[test]
-    fn retries_then_fails() {
+    fn retries_then_marks_failed() {
         let queue = Queue::new(1);
-        queue.dispatch(AlwaysFails);
-        // Give the worker a beat, then inspect via drop-join.
-        let q = Arc::try_unwrap(queue).ok();
-        drop(q);
+        queue.dispatch(AlwaysFails); // tries() == 3
+        assert!(
+            wait_until(|| queue.stats().failed == 1),
+            "job should fail terminally"
+        );
+        let s = queue.stats();
+        assert_eq!(s.failed, 1);
+        assert_eq!(s.retried, 2); // 3 attempts → 2 retries before the final failure
+        assert_eq!(s.processed, 0);
+        assert_eq!(s.dispatched, 1);
+    }
+
+    #[test]
+    fn delayed_dispatch_runs_after_delay() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let queue = Queue::new(2);
+        queue.dispatch_after(Duration::from_millis(10), Counting(Arc::clone(&counter)));
+        // Counted as dispatched immediately, but only processed after the delay.
+        assert_eq!(queue.stats().dispatched, 1);
+        assert!(wait_until(|| counter.load(Ordering::Relaxed) == 1));
+        assert!(wait_until(|| queue.stats().processed == 1));
+    }
+
+    #[test]
+    fn stats_serialize_to_json() {
+        let s = Stats {
+            dispatched: 5,
+            processed: 3,
+            failed: 1,
+            retried: 4,
+        };
+        let j = s.to_json();
+        assert_eq!(j.get("dispatched").and_then(Json::as_i64), Some(5));
+        assert_eq!(j.get("failed").and_then(Json::as_i64), Some(1));
+        assert_eq!(j.get("retried").and_then(Json::as_i64), Some(4));
     }
 }

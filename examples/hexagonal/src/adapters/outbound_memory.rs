@@ -26,7 +26,13 @@ impl TodoRepository for InMemoryTodoRepo {
     }
 
     fn find(&self, id: i64) -> AppResult<Option<Todo>> {
-        Ok(self.inner.lock().unwrap().iter().find(|t| t.id == id).cloned())
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.id == id)
+            .cloned())
     }
 
     fn insert(&self, todo: &Todo) -> AppResult<i64> {

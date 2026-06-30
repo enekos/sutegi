@@ -59,7 +59,8 @@ impl Sessions {
     }
 
     fn sign(&self, msg: &[u8]) -> String {
-        let mut mac = HmacSha256::new_from_slice(&self.secret).expect("HMAC accepts any key length");
+        let mut mac =
+            HmacSha256::new_from_slice(&self.secret).expect("HMAC accepts any key length");
         mac.update(msg);
         to_hex(&mac.finalize().into_bytes())
     }
@@ -91,14 +92,20 @@ impl Sessions {
                     if constant_time_eq(self.sign(&bytes).as_bytes(), sig.as_bytes()) {
                         if let Ok(s) = std::str::from_utf8(&bytes) {
                             if let Ok(Json::Obj(map)) = Json::parse(s) {
-                                return Session { data: map, dirty: false };
+                                return Session {
+                                    data: map,
+                                    dirty: false,
+                                };
                             }
                         }
                     }
                 }
             }
         }
-        Session { data: BTreeMap::new(), dirty: false }
+        Session {
+            data: BTreeMap::new(),
+            dirty: false,
+        }
     }
 
     /// Attach the signed session as a `Set-Cookie` on the response.
@@ -121,7 +128,10 @@ impl Sessions {
 
     /// Expire the session cookie.
     pub fn clear(&self, resp: Response) -> Response {
-        resp.with_header("set-cookie", &format!("{}=; Path=/; Max-Age=0", self.cookie))
+        resp.with_header(
+            "set-cookie",
+            &format!("{}=; Path=/; Max-Age=0", self.cookie),
+        )
     }
 }
 
@@ -242,5 +252,97 @@ mod tests {
         let t = s.token("user:42");
         assert_eq!(s.verify_token(&t).as_deref(), Some("user:42"));
         assert!(s.verify_token("deadbeef.badsig").is_none());
+    }
+
+    #[test]
+    fn save_sets_cookie_attributes() {
+        let s = Sessions::new(b"secret"); // secure by default, 1-day max-age
+        let mut sess = s.load(&req_with_cookie("x", ""));
+        sess.set("k", Json::int(1));
+        let header = s
+            .save(&sess, Response::new(200))
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert!(header.contains("HttpOnly"));
+        assert!(header.contains("SameSite=Lax"));
+        assert!(header.contains("Secure"));
+        assert!(header.contains("Max-Age=86400"));
+        assert!(header.starts_with("sutegi_session="));
+    }
+
+    #[test]
+    fn insecure_and_no_max_age_omit_attributes() {
+        let s = Sessions::new(b"secret").insecure().max_age(None);
+        let header = s
+            .save(
+                &Session {
+                    data: BTreeMap::new(),
+                    dirty: false,
+                },
+                Response::new(200),
+            )
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert!(!header.contains("Secure"));
+        assert!(!header.contains("Max-Age"));
+    }
+
+    #[test]
+    fn custom_cookie_name_roundtrips() {
+        let s = Sessions::new(b"k").cookie_name("sid").insecure();
+        let mut sess = s.load(&req_with_cookie("sid", ""));
+        sess.set("user", Json::str("eneko"));
+        let cookie = cookie_value(&s.save(&sess, Response::new(200)), "sid");
+        let reloaded = s.load(&req_with_cookie("sid", &cookie));
+        assert_eq!(reloaded.get_str("user"), Some("eneko"));
+        // A session signed under "sid" is invisible under the default name.
+        assert!(s
+            .load(&req_with_cookie("sutegi_session", &cookie))
+            .is_empty());
+    }
+
+    #[test]
+    fn clear_expires_cookie() {
+        let s = Sessions::new(b"k");
+        let header = s
+            .clear(Response::new(200))
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert!(header.contains("Max-Age=0"));
+    }
+
+    #[test]
+    fn session_mutation_tracks_dirty() {
+        let mut sess = Session {
+            data: BTreeMap::new(),
+            dirty: false,
+        };
+        assert!(!sess.is_dirty());
+        sess.set("a", Json::int(1));
+        assert!(sess.is_dirty());
+        assert_eq!(sess.get("a").and_then(Json::as_i64), Some(1));
+        sess.remove("a");
+        assert!(sess.get("a").is_none());
+        sess.set("b", Json::int(2));
+        sess.clear();
+        assert!(sess.is_empty());
+    }
+
+    #[test]
+    fn empty_payload_token_verification_fails_cleanly() {
+        let s = Sessions::new(b"k");
+        // No dot separator → None, not a panic.
+        assert!(s.verify_token("nosig").is_none());
+        // Odd-length hex → None.
+        assert!(s.verify_token("abc.sig").is_none());
     }
 }

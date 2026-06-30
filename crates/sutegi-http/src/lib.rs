@@ -122,9 +122,14 @@ impl Request {
 /// we omit `Content-Length`, write the headers, then hand the raw socket to a
 /// producer closure that flushes bytes over time. The client reads until the
 /// connection closes (a valid HTTP/1.1 framing). No chunked encoding, no async.
+/// Producer closure for a streaming [`Body`]: hands the raw socket to the
+/// caller, which flushes bytes over time until it returns (and the connection
+/// closes).
+pub type StreamProducer = Box<dyn FnOnce(&mut dyn Write) -> io::Result<()> + Send + 'static>;
+
 pub enum Body {
     Full(Vec<u8>),
-    Stream(Box<dyn FnOnce(&mut dyn Write) -> io::Result<()> + Send + 'static>),
+    Stream(StreamProducer),
 }
 
 /// An HTTP response.
@@ -206,7 +211,7 @@ impl<'a> SseSink<'a> {
     /// Send a `data:` event (multi-line data is split across `data:` lines).
     pub fn data(&mut self, data: &str) -> io::Result<()> {
         for line in data.split('\n') {
-            write!(self.w, "data: {}\n", line)?;
+            writeln!(self.w, "data: {}", line)?;
         }
         self.w.write_all(b"\n")?;
         self.w.flush()
@@ -214,9 +219,9 @@ impl<'a> SseSink<'a> {
 
     /// Send a named event.
     pub fn event(&mut self, event: &str, data: &str) -> io::Result<()> {
-        write!(self.w, "event: {}\n", event)?;
+        writeln!(self.w, "event: {}", event)?;
         for line in data.split('\n') {
-            write!(self.w, "data: {}\n", line)?;
+            writeln!(self.w, "data: {}", line)?;
         }
         self.w.write_all(b"\n")?;
         self.w.flush()
@@ -271,7 +276,7 @@ pub fn parse_request<R: BufRead>(reader: &mut R, limits: &Limits) -> io::Result<
     if reader.read_line(&mut request_line)? == 0 {
         return Ok(None);
     }
-    let mut parts = request_line.trim_end().split_whitespace();
+    let mut parts = request_line.split_whitespace();
     let method = Method::parse(parts.next().unwrap_or(""));
     let target = parts.next().unwrap_or("/").to_string();
     let version = parts.next().unwrap_or("HTTP/1.1").to_string();
@@ -481,13 +486,18 @@ where
             // Panic isolation: a panicking handler returns 500 instead of
             // silently killing this worker thread.
             let resp = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(req)))
-                .unwrap_or_else(|_| Response::new(500).with_body(&b"500 Internal Server Error"[..]));
+                .unwrap_or_else(|_| {
+                    Response::new(500).with_body(&b"500 Internal Server Error"[..])
+                });
             let mut writer = stream;
             write_response(&mut writer, resp)?;
         }
         Some(Incoming::TooLarge) => {
             let mut writer = stream;
-            write_response(&mut writer, Response::new(413).with_body(&b"413 Payload Too Large"[..]))?;
+            write_response(
+                &mut writer,
+                Response::new(413).with_body(&b"413 Payload Too Large"[..]),
+            )?;
         }
         None => {}
     }
@@ -553,7 +563,10 @@ mod tests {
     fn parses_request_with_body() {
         let raw = "POST /todos?x=1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
         let mut reader = BufReader::new(raw.as_bytes());
-        let req = match parse_request(&mut reader, &Limits::default()).unwrap().unwrap() {
+        let req = match parse_request(&mut reader, &Limits::default())
+            .unwrap()
+            .unwrap()
+        {
             Incoming::Request(r) => r,
             Incoming::TooLarge => panic!("unexpected 413"),
         };
@@ -579,7 +592,10 @@ mod tests {
     fn rejects_oversized_body() {
         let raw = "POST / HTTP/1.1\r\nContent-Length: 5000\r\n\r\n";
         let mut reader = BufReader::new(raw.as_bytes());
-        let limits = Limits { max_body: 100, ..Limits::default() };
+        let limits = Limits {
+            max_body: 100,
+            ..Limits::default()
+        };
         assert!(matches!(
             parse_request(&mut reader, &limits).unwrap(),
             Some(Incoming::TooLarge)
@@ -590,7 +606,10 @@ mod tests {
     fn request_content_type_and_cookies() {
         let raw = "GET / HTTP/1.1\r\nContent-Type: application/json\r\nCookie: sid=abc; theme=dark\r\n\r\n";
         let mut reader = BufReader::new(raw.as_bytes());
-        let req = match parse_request(&mut reader, &Limits::default()).unwrap().unwrap() {
+        let req = match parse_request(&mut reader, &Limits::default())
+            .unwrap()
+            .unwrap()
+        {
             Incoming::Request(r) => r,
             Incoming::TooLarge => panic!("unexpected 413"),
         };
@@ -617,5 +636,133 @@ mod tests {
         assert!(!s.to_lowercase().contains("content-length"));
         assert!(s.contains("data: one\n\n"));
         assert!(s.contains("data: two\n\n"));
+    }
+
+    #[test]
+    fn method_parse_and_as_str_roundtrip() {
+        for (s, m) in [
+            ("GET", Method::Get),
+            ("POST", Method::Post),
+            ("PUT", Method::Put),
+            ("PATCH", Method::Patch),
+            ("DELETE", Method::Delete),
+            ("HEAD", Method::Head),
+            ("OPTIONS", Method::Options),
+        ] {
+            assert_eq!(Method::parse(s), m);
+            assert_eq!(m.as_str(), s);
+        }
+        assert_eq!(Method::parse("BREW"), Method::Other);
+    }
+
+    #[test]
+    fn status_reason_known_and_fallbacks() {
+        assert_eq!(status_reason(200), "OK");
+        assert_eq!(status_reason(404), "Not Found");
+        assert_eq!(status_reason(422), "Unprocessable Entity");
+        // Unknown codes fall back to a class-appropriate phrase, never a wrong "OK".
+        assert_eq!(status_reason(299), "OK");
+        assert_eq!(status_reason(399), "Redirect");
+        assert_eq!(status_reason(418), "Client Error");
+        assert_eq!(status_reason(599), "Server Error");
+    }
+
+    #[test]
+    fn peer_ip_handles_ipv4_and_ipv6() {
+        let mk = |peer: &str| Request {
+            method: Method::Get,
+            path: "/".into(),
+            query: String::new(),
+            version: "HTTP/1.1".into(),
+            headers: vec![],
+            body: vec![],
+            peer: Some(peer.into()),
+        };
+        assert_eq!(mk("1.2.3.4:55000").peer_ip().as_deref(), Some("1.2.3.4"));
+        assert_eq!(mk("[::1]:8080").peer_ip().as_deref(), Some("[::1]"));
+        // No peer at all → None.
+        let mut r = mk("x");
+        r.peer = None;
+        assert_eq!(r.peer_ip(), None);
+    }
+
+    #[test]
+    fn rejects_oversized_headers() {
+        let big = "X-Pad: ".to_string() + &"a".repeat(500) + "\r\n";
+        let raw = format!("GET / HTTP/1.1\r\n{}\r\n", big);
+        let mut reader = BufReader::new(raw.as_bytes());
+        let limits = Limits {
+            max_header_bytes: 100,
+            ..Limits::default()
+        };
+        assert!(matches!(
+            parse_request(&mut reader, &limits).unwrap(),
+            Some(Incoming::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn empty_stream_yields_none() {
+        let mut reader = BufReader::new(&b""[..]);
+        assert!(parse_request(&mut reader, &Limits::default())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn explicit_content_type_is_not_overridden() {
+        let resp = Response::new(200)
+            .with_header("content-type", "application/json")
+            .with_body("{}");
+        let mut buf = Vec::new();
+        write_response(&mut buf, resp).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("content-type: application/json\r\n"));
+        // The default text/plain header must not also be appended.
+        assert!(!s.contains("text/plain"));
+    }
+
+    #[test]
+    fn stream_sink_writes_and_flushes() {
+        let mut buf = Vec::new();
+        {
+            let mut sink = StreamSink::new(&mut buf);
+            sink.write_str("chunk-").unwrap();
+            sink.write(b"bytes").unwrap();
+        }
+        assert_eq!(buf, b"chunk-bytes");
+    }
+
+    #[test]
+    fn sse_named_event_and_comment() {
+        let mut buf = Vec::new();
+        {
+            let mut sink = SseSink::new(&mut buf);
+            sink.event("tick", "1\n2").unwrap(); // multi-line data splits across data: lines
+            sink.comment("keep-alive").unwrap();
+            sink.retry(3000).unwrap();
+        }
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("event: tick\n"));
+        assert!(s.contains("data: 1\ndata: 2\n\n"));
+        assert!(s.contains(": keep-alive\n\n"));
+        assert!(s.contains("retry: 3000\n\n"));
+    }
+
+    #[test]
+    fn thread_pool_runs_jobs() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let count = Arc::new(AtomicU32::new(0));
+        {
+            let pool = ThreadPool::new(3);
+            for _ in 0..30 {
+                let c = Arc::clone(&count);
+                pool.execute(move || {
+                    c.fetch_add(1, Ordering::Relaxed);
+                });
+            }
+            // Dropping the pool joins all workers, so every job has run.
+        }
+        assert_eq!(count.load(Ordering::Relaxed), 30);
     }
 }

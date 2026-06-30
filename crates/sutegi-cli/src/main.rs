@@ -226,12 +226,14 @@ fn http_get(url: &str) -> io::Result<String> {
 // ---- naming helpers (the convention engine) -------------------------------
 
 fn to_pascal(s: &str) -> String {
-    s.split(|c: char| c == '_' || c == '-' || c == ' ')
+    s.split(['_', '-', ' '])
         .filter(|w| !w.is_empty())
         .map(|w| {
             let mut chars = w.chars();
             match chars.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
+                Some(first) => {
+                    first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
+                }
                 None => String::new(),
             }
         })
@@ -257,8 +259,8 @@ fn to_snake(pascal: &str) -> String {
 fn pluralize(word: &str) -> String {
     if word.ends_with('s') {
         word.to_string()
-    } else if word.ends_with('y') {
-        format!("{}ies", &word[..word.len() - 1])
+    } else if let Some(stem) = word.strip_suffix('y') {
+        format!("{}ies", stem)
     } else {
         format!("{}s", word)
     }
@@ -269,4 +271,68 @@ fn write_file(path: &Path, contents: &str) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {}", parent.display(), e))?;
     }
     std::fs::write(path, contents).map_err(|e| format!("{}: {}", path.display(), e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pascal_case_from_varied_separators() {
+        assert_eq!(to_pascal("blog_post"), "BlogPost");
+        assert_eq!(to_pascal("blog-post"), "BlogPost");
+        assert_eq!(to_pascal("blog post"), "BlogPost");
+        assert_eq!(to_pascal("USER"), "User"); // mixed case is normalized
+        assert_eq!(to_pascal("user"), "User");
+    }
+
+    #[test]
+    fn snake_case_from_pascal() {
+        assert_eq!(to_snake("BlogPost"), "blog_post");
+        assert_eq!(to_snake("User"), "user");
+        assert_eq!(to_snake("HTTPServer"), "h_t_t_p_server"); // naive, but predictable
+    }
+
+    #[test]
+    fn pluralize_follows_simple_english_rules() {
+        assert_eq!(pluralize("user"), "users");
+        assert_eq!(pluralize("category"), "categories"); // y → ies
+        assert_eq!(pluralize("posts"), "posts"); // already plural, unchanged
+    }
+
+    #[test]
+    fn make_model_name_pipeline_is_consistent() {
+        // The convention chain a user relies on: Name → Pascal → snake → table.
+        let pascal = to_pascal("blog_post");
+        let snake = to_snake(&pascal);
+        let table = pluralize(&snake);
+        assert_eq!(
+            (pascal.as_str(), snake.as_str(), table.as_str()),
+            ("BlogPost", "blog_post", "blog_posts")
+        );
+    }
+
+    #[test]
+    fn model_template_wires_struct_and_table() {
+        let tpl = model_template("Category", "categories");
+        assert!(tpl.contains("pub struct Category;"));
+        assert!(tpl.contains("impl Model for Category"));
+        assert!(tpl.contains(r#"table: "categories""#));
+        assert!(tpl.contains("use sutegi::prelude::*;"));
+    }
+
+    #[test]
+    fn route_template_exposes_register_with_snake_path() {
+        let tpl = route_template("health_check");
+        assert!(tpl.contains("pub fn register(app: App) -> App"));
+        assert!(tpl.contains("/health_check"));
+    }
+
+    #[test]
+    fn new_cargo_toml_names_package_and_depends_on_sutegi() {
+        let toml = new_cargo_toml("my_app");
+        assert!(toml.contains(r#"name = "my_app""#));
+        assert!(toml.contains("sutegi = {"));
+        assert!(toml.contains(r#"edition = "2021""#));
+    }
 }

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import {
-    Flame, Zap, ArrowRight, Copy, Check, GitBranch, ChevronDown, Terminal, TerminalSquare,
+    Flame, Zap, ArrowRight, Copy, Check, GitBranch, Terminal,
     Code, Database, Layers, Boxes, ShieldCheck, Radio, Cpu, Workflow, Rocket, Server, Plug,
     FileCode, Feather, Search,
   } from 'lucide-svelte';
@@ -63,7 +63,7 @@
   const featuresText = useScramble('Batteries included, std only', () => !!visibleSections['features']);
   const useCasesText = useScramble('Who it’s for', () => !!visibleSections['use-cases']);
   const quickstartText = useScramble('Quick start', () => !!visibleSections['quickstart']);
-  const docsText = useScramble('Documentation', () => !!visibleSections['docs']);
+  const docsText = useScramble('Build your first app', () => !!visibleSections['docs']);
   const liveText = useScramble('Introspect a live app', () => !!visibleSections['live']);
 
   // --- hover scramble action for card titles ---
@@ -117,10 +117,6 @@
     setTimeout(() => copied = false, 1500);
   }
 
-  // --- docs accordion ---
-  let openSection = $state<string | null>('architecture');
-  function toggle(id: string) { openSection = openSection === id ? null : id; }
-
   // --- code snippets (kept as strings so braces are literal text) ---
   const codeCargo = `[dependencies]
 # default = ["derive", "orm", "validate", "ai", "queue"]
@@ -140,36 +136,59 @@ fn main() -> std::io::Result<()> {
 curl localhost:8080/__tools        # LLM tool-calling manifest
 curl -X POST localhost:8080/__tools/create_todo -d '{"title":"ship sutegi"}'`;
 
-  const docSections = [
+  // --- tutorial (Laravel-style guided walkthrough: build a Todo API) ---
+  // Each chapter builds on the last. `lead`, `tip` and `note` are rendered as
+  // HTML (they carry inline <code> spans); `code` is verbatim text.
+  const tutorial = [
     {
-      id: 'architecture', icon: Boxes, title: 'Crate architecture',
-      intro: 'Only json + http + web are always compiled. Every other pillar is an opt-in cargo feature, so the binary carries exactly what you use — core "hello" is ~362 KB, a full SQLite build ~1.3 MB.',
-      code: `orm       schema + query builder + migrations
-derive    #[derive(Model)]  (build-time syn/quote only)
-validate  request / tool validation
-ai        Tool / StreamTool + /__tools
-queue     background jobs
-sqlite    bundled, runnable SQLite execution
-graceful  SIGTERM/SIGINT draining (libc)
-hex       hexagonal-architecture primitives`,
+      group: 'Getting started',
+      chapters: [
+        {
+          id: 'install', icon: Plug, kicker: 'Step 1', title: 'Install & scaffold',
+          lead: 'Every sutegi app is an ordinary Rust binary. Add the crate, switch on the feature pillars you want, and you’re ready — there are no runtime dependencies trailing behind it. Only <code>json</code>, <code>http</code> and <code>web</code> are always compiled; everything else is opt-in, so the binary carries exactly what you use.',
+          code: codeCargo,
+          tip: 'In a hurry? <code>sutegi new todo-api</code> scaffolds the whole app with the conventional layout. Add pieces later with <code>sutegi make:model Todo</code> and <code>sutegi make:route todos</code>.',
+        },
+        {
+          id: 'route', icon: Workflow, kicker: 'Step 2', title: 'Your first route',
+          lead: 'A handler is just a closure that receives the request and its path params and returns a response. Let’s boot a server with a health check, then add a route that reads an <code>:id</code> from the path. Run it with <code>cargo run</code> and you have a live HTTP/1.1 server.',
+          code: `use sutegi::prelude::*;
+
+fn main() -> std::io::Result<()> {
+    App::new("todo-api")
+        .get("/", "Health check", |_req, _p| text(200, "sutegi up"))
+        .get("/todos/:id", "Show one todo", |_req, p| {
+            text(200, p.get("id").unwrap())
+        })
+        .run_graceful("0.0.0.0:8080")
+}`,
+          note: 'Every route you register also shows up in <code>/__introspect</code>. You never write that endpoint — sutegi assembles your app’s whole surface for you. We’ll lean on it in Step&nbsp;6.',
+        },
+      ],
     },
     {
-      id: 'routing', icon: Workflow, title: 'Routing & middleware',
-      intro: 'The request → handler → response spine: path params, route groups with shared middleware, and before/after middleware. Handlers are plain closures.',
-      code: `App::new("api")
-    .get("/todos/:id", "Show one", |_req, p| {
-        text(200, p.get("id").unwrap())
-    })
-    .group("/admin", vec![mw(auth)], |g| {
-        g.get("/stats", "Admin stats", stats_handler)
-    })
-    .after(cors("*"))                 // transform every response
-    .run("0.0.0.0:8080")?;`,
-    },
-    {
-      id: 'orm', icon: Database, title: 'ORM & query builder',
-      intro: 'A driver-agnostic, parameterized builder (SELECT/UPDATE/DELETE) with OR groups, IS NULL, LIKE, joins, GROUP BY, DISTINCT, and a raw escape hatch. Plus migrations, transactions, counts, upsert, and pagination. Enable the sqlite feature for a runnable bundled engine; rows come back typed or as JSON.',
-      code: `Todo::migrate(&db)?;
+      group: 'The basics',
+      chapters: [
+        {
+          id: 'model', icon: FileCode, kicker: 'Step 3', title: 'Model your data',
+          lead: 'Echoing a path param is fun for about ten seconds. Let’s give the app something real to store. Derive <code>Model</code> on a plain struct and sutegi handles hydration from rows and JSON serialization — bools round-trip cleanly and <code>Option&lt;T&gt;</code> becomes a nullable column. The macro runs at build time, so none of its machinery reaches your binary.',
+          code: `#[derive(Model)]
+#[model(table = "todos")]
+struct Todo {
+    #[model(primary)]
+    id: i64,
+    title: String,
+    done: bool,            // round-trips as a real bool
+    note: Option<String>,  // Option<T> => nullable column
+    #[model(skip)]
+    cached: bool,          // not persisted; default-initialized
+}`,
+          tip: 'Drop the <code>#[model(table = "…")]</code> line and the name is inferred as snake_case + plural — <code>Todo</code> becomes <code>todos</code> automatically.',
+        },
+        {
+          id: 'orm', icon: Database, kicker: 'Step 4', title: 'Talk to the database',
+          lead: 'With a model in hand, the query builder gives you a parameterized, driver-agnostic way to read and write — OR groups, <code>IS NULL</code>, <code>LIKE</code>, joins and pagination all included, plus a raw escape hatch. Migrate the table, insert a row, compose a query. Enable the <code>sqlite</code> feature and it all runs against a bundled engine with no external database to install.',
+          code: `Todo::migrate(&db)?;
 let id = Todo::create(&db, &[("title", Value::Text("x".into()))])?;
 
 QueryBuilder::table("todos")
@@ -183,26 +202,11 @@ QueryBuilder::table("todos")
 db.transaction(|tx| { tx.insert("todos", &[/* … */])?; Ok(()) })?;
 Todo::update(&db, Value::Int(id), &[("done", Value::Bool(true))])?;
 let page = db.paginate(&Todo::query().order_by("id", true), 2, 20)?;`,
-    },
-    {
-      id: 'derive', icon: FileCode, title: '#[derive(Model)]',
-      intro: 'Typed models that hydrate from rows and serialize to JSON, with clean bool round-tripping. Table name is inferred (snake_case + plural) unless you set it. The macro is build-time only — its deps never reach your binary.',
-      code: `#[derive(Model)]
-#[model(table = "todos")]
-struct Todo {
-    #[model(primary)]
-    id: i64,
-    title: String,
-    done: bool,            // round-trips as a real bool
-    note: Option<String>,  // Option<T> => nullable column
-    #[model(skip)]
-    cached: bool,          // not persisted; default-initialized
-}`,
-    },
-    {
-      id: 'validation', icon: ShieldCheck, title: 'Validation',
-      intro: 'A Laravel-Validator-style rule set and a JSON Schema validator, both emitting structured per-field errors. AI tool arguments are validated automatically against each tool’s schema.',
-      code: `let rules = Ruleset::new()
+        },
+        {
+          id: 'validate', icon: ShieldCheck, kicker: 'Step 5', title: 'Validate the input',
+          lead: 'Never trust the request body. sutegi ships a Laravel-Validator-style rule set (plus a JSON Schema validator) that returns structured, per-field errors — hand them straight back to the client as a <code>422</code>. Define the rules, call <code>validate</code>, and you’re done.',
+          code: `let rules = Ruleset::new()
     .field("email", &[Rule::Required, Rule::Email])
     .field("age",   &[Rule::Integer, Rule::Between(18.0, 120.0)])
     .field("site",  &[Rule::Url])
@@ -210,35 +214,17 @@ struct Todo {
 
 rules.validate(&body)?;   // Err(ValidationErrors) -> errs.to_json()
 // { "email": ["The email must be a valid email address."] }`,
+          note: 'You get this on the agent surface for free too: AI tool arguments are validated against each tool’s schema automatically — more on that next.',
+        },
+      ],
     },
     {
-      id: 'streaming', icon: Radio, title: 'Streaming & SSE',
-      intro: 'Because the server is blocking thread-per-connection, streaming is trivial and naturally backpressured. Stream raw bytes or Server-Sent Events — the transport for live LLM tokens.',
-      code: `.get("/stream", "SSE demo", |_req, _p| sse(|sink| {
-    for token in answer().split(' ') {
-        sink.data(token)?;        // each frame flushed immediately
-    }
-    sink.event("done", "{}")
-}))`,
-    },
-    {
-      id: 'jobs', icon: Cpu, title: 'Background jobs',
-      intro: 'A zero-dependency in-process queue with worker threads, retries, delayed dispatch, and introspectable stats — for the work you do after the response.',
-      code: `struct Notify { to: String }
-impl Job for Notify {
-    fn name(&self) -> &str { "notify" }
-    fn handle(&self) -> Result<(), String> { /* send … */ Ok(()) }
-    fn tries(&self) -> u32 { 3 }   // retried on Err
-}
-
-let queue = Queue::new(4);
-queue.dispatch(Notify { to: "a@b.com".into() });
-let stats = queue.stats();         // dispatched / processed / failed / retried`,
-    },
-    {
-      id: 'ai', icon: Zap, title: 'AI tools & the agent contract',
-      intro: 'Tool-calling is a first-class concept. Implement Tool (or StreamTool), and sutegi exposes an LLM manifest plus an invocation endpoint. An agent discovers the whole app and acts — over plain JSON, no SDK.',
-      code: `struct CreateTodo;
+      group: 'Agents & realtime',
+      chapters: [
+        {
+          id: 'agent', icon: Zap, kicker: 'Step 6', title: 'Make it agent-native',
+          lead: 'Here’s where sutegi differs from every other framework. Implement <code>Tool</code> for a capability and it’s instantly exposed to an LLM: a manifest at <code>/__tools</code>, a validated invocation endpoint, and an SSE variant for streaming tools. An agent can discover your whole app via <code>/__introspect</code> and act on it over plain JSON — no SDK, no glue layer.',
+          code: `struct CreateTodo;
 impl Tool for CreateTodo {
     fn name(&self) -> &str { "create_todo" }
     fn description(&self) -> &str { "Create a todo." }
@@ -250,11 +236,41 @@ impl Tool for CreateTodo {
 // GET  /__tools             -> manifest  { name, description, input_schema }
 // POST /__tools/create_todo -> invoke (args validated -> 422 on failure)
 // POST /__tools/:name/stream -> SSE for streaming tools`,
+          tip: 'That’s the entire integration. Point any agent at <code>/__introspect</code> for the surface and <code>/__tools</code> for the call manifest — the same app you built for humans is now drivable by a model.',
+        },
+        {
+          id: 'stream', icon: Radio, kicker: 'Step 7', title: 'Stream responses',
+          lead: 'Because the server is blocking and thread-per-connection, streaming is trivial and naturally backpressured — there’s no executor to fight. Send raw bytes or Server-Sent Events; each frame flushes immediately. It’s the same transport that carries live LLM tokens back to a UI.',
+          code: `.get("/stream", "SSE demo", |_req, _p| sse(|sink| {
+    for token in answer().split(' ') {
+        sink.data(token)?;        // each frame flushed immediately
+    }
+    sink.event("done", "{}")
+}))`,
+        },
+        {
+          id: 'jobs', icon: Cpu, kicker: 'Step 8', title: 'Defer the slow work',
+          lead: 'Some work shouldn’t block the response — sending mail, calling a webhook. The in-process queue gives you worker threads, retries, delayed dispatch and introspectable stats, with zero dependencies like everything else. Return <code>Err</code> from <code>handle</code> and the job is retried up to <code>tries()</code> times.',
+          code: `struct Notify { to: String }
+impl Job for Notify {
+    fn name(&self) -> &str { "notify" }
+    fn handle(&self) -> Result<(), String> { /* send … */ Ok(()) }
+    fn tries(&self) -> u32 { 3 }   // retried on Err
+}
+
+let queue = Queue::new(4);
+queue.dispatch(Notify { to: "a@b.com".into() });
+let stats = queue.stats();         // dispatched / processed / failed / retried`,
+        },
+      ],
     },
     {
-      id: 'hex', icon: Layers, title: 'Hexagonal architecture',
-      intro: 'The hex toolkit nudges you toward ports & adapters: domain stays pure, the application depends on port traits, and adapters (HTTP, AI, SQLite) plug in at the edges. One use case, many transports; testable without a server.',
-      code: `impl UseCase for CreateTodo {
+      group: 'Going to production',
+      chapters: [
+        {
+          id: 'hex', icon: Layers, kicker: 'Step 9', title: 'Structure for growth',
+          lead: 'As the app grows, the hexagonal toolkit keeps it honest: your domain stays pure, the application layer depends on port traits, and adapters (HTTP, AI, SQLite) plug in at the edges. One use case, many transports — and fully testable without ever starting a server.',
+          code: `impl UseCase for CreateTodo {
     type Input = String;          // title
     type Output = Todo;
     fn execute(&self, title: String) -> AppResult<Todo> {
@@ -265,35 +281,44 @@ impl Tool for CreateTodo {
 }
 // inbound HTTP adapter:
 .post("/todos", "Create", move |req, _p| respond_created(uc.execute(title)))`,
-    },
-    {
-      id: 'scaling', icon: Server, title: 'Scaling & pods',
-      intro: 'Built-in operational endpoints (always on) and graceful shutdown make a sutegi process safe to run as a fleet. SIGTERM stops accepting, drains in-flight requests, then exits — exactly what a Kubernetes rolling update needs.',
-      code: `App::new("api")
+          note: 'The very same <code>CreateTodo</code> use case can back both an HTTP route and the AI tool from Step&nbsp;6. Write the logic once; expose it everywhere.',
+        },
+        {
+          id: 'ops', icon: Server, kicker: 'Step 10', title: 'Ship to production',
+          lead: 'You’re ready to deploy. The operational endpoints are always on, and <code>run_graceful</code> drains in-flight requests on SIGTERM before exiting — exactly what a Kubernetes rolling update needs. Wire a readiness probe to whatever “healthy” means for your app.',
+          code: `App::new("api")
     .workers(env_or("WORKERS", "8").parse().unwrap_or(8))
     .readiness(move || db.lock().unwrap().query("SELECT 1", &[]).is_ok())
     .run_graceful("0.0.0.0:8080")?;
 
 // GET /__health   liveness        GET /__ready    readiness (200/503)
 // GET /__metrics  Prometheus      GET /__introspect  full surface`,
-    },
-    {
-      id: 'sail', icon: Rocket, title: 'Sail & deployment',
-      intro: 'A Laravel-Sail-style harness wraps Docker Compose: N app replicas behind an nginx load balancer (proxy_buffering off, so SSE passes straight through). Kubernetes manifests ship with probes, graceful drain, and Prometheus annotations.',
-      code: `./sail up 3            # 3 replicas + LB on http://localhost:8080
+        },
+        {
+          id: 'deploy', icon: Rocket, kicker: 'Step 11', title: 'Deploy with Sail',
+          lead: 'Finally, a Laravel-Sail-style harness wraps Docker Compose: spin up N replicas behind an nginx load balancer (with <code>proxy_buffering off</code>, so the SSE streams from Step&nbsp;7 pass straight through), then promote the same shape to Kubernetes — the manifests ship with probes, graceful drain and Prometheus annotations already wired.',
+          code: `./sail up 3            # 3 replicas + LB on http://localhost:8080
 ./sail curl /api/todos
 ./sail logs
 ./sail k8s apply      # apply deploy/k8s/ (probes, drain, metrics)`,
-    },
-    {
-      id: 'cli', icon: Terminal, title: 'CLI',
-      intro: 'The sutegi command scaffolds apps with rigid, predictable conventions — one right shape per artifact — so the codebase stays legible (and an LLM can extend it with minimal context). It can also introspect a running app.',
-      code: `sutegi new blog            # scaffold an app
-sutegi make:model Post     # src/models/post.rs (table: posts)
-sutegi make:route health   # src/routes/health.rs
-sutegi introspect          # pretty-print a live app's /__introspect`,
+          tip: 'That’s the whole journey: a route, a database, validation, an agent interface, streaming, jobs and a production deploy — and your binary still has zero runtime dependencies.',
+        },
+      ],
     },
   ];
+
+  // flat list for the scrollspy + sidebar active state
+  const chapters = tutorial.flatMap((g) => g.chapters);
+  let activeChapter = $state(chapters[0].id);
+  onMount(() => {
+    const io = new IntersectionObserver((entries) => {
+      entries.forEach((e) => {
+        if (e.isIntersecting) activeChapter = e.target.id.replace('ch-', '');
+      });
+    }, { rootMargin: '-12% 0px -75% 0px', threshold: 0 });
+    document.querySelectorAll('[data-chapter]').forEach((el) => io.observe(el));
+    return () => io.disconnect();
+  });
 
   // --- live introspect demo ---
   let baseUrl = $state('http://localhost:8080');
@@ -544,47 +569,92 @@ sutegi introspect          # pretty-print a live app's /__introspect`,
         {/each}
       </div>
       <div class="mt-6 text-center text-sm text-[#7a7a8a]">
-        Or scaffold one: <code class="text-[#ff6a3d]">sutegi new blog</code>. Read the full <a href="#docs" class="text-[#ff6a3d] hover:underline">documentation</a> below.
+        That’s the TL;DR. Want the full walkthrough? The <a href="#docs" class="text-[#ff6a3d] hover:underline">step-by-step tutorial</a> below builds a complete Todo API.
       </div>
     </div>
   </section>
 
-  <!-- Docs -->
+  <!-- Docs / Tutorial -->
   <section id="docs" class="relative z-10 py-16 sm:py-24">
-    <div class="max-w-4xl mx-auto px-4 sm:px-6">
-      <div class="text-center mb-10 sm:mb-12">
-        <h2 class="text-2xl sm:text-3xl md:text-4xl font-bold text-white mb-3 min-h-[1.2em]">{docsText()}</h2>
-        <p class="text-[#a0a0b0] text-sm sm:text-base">Every pillar, with code. Click to expand.</p>
-      </div>
-      {#each docSections as s}
-        {@const Icon = s.icon}
-        <div class="border border-white/5 rounded-xl overflow-hidden mb-3 sm:mb-4 bg-[#13121a]">
-          <button onclick={() => toggle(s.id)} class="w-full flex items-center justify-between px-5 sm:px-6 py-4 sm:py-5 hover:bg-white/5 transition-colors text-left">
-            <div class="flex items-center gap-3 text-white font-semibold text-sm sm:text-base">
-              <Icon size={18} class="text-[#ff6a3d] shrink-0" /> {s.title}
-            </div>
-            <ChevronDown size={18} class="text-[#7a7a8a] transition-transform shrink-0 {openSection === s.id ? 'rotate-180' : ''}" />
-          </button>
-          {#if openSection === s.id}
-            <div class="px-5 sm:px-6 pb-5 sm:pb-6 text-[#b0b0c0] text-sm leading-relaxed space-y-4">
-              <p>{s.intro}</p>
-              <div class="relative">
-                <button onclick={() => copyCmd(s.code)} class="absolute top-2 right-2 text-[11px] font-mono text-[#7a7a8a] hover:text-[#ff6a3d] border border-white/10 rounded px-2 py-1 transition-colors">copy</button>
-                <pre class="bg-black/40 border border-white/5 rounded-lg p-3 sm:p-4 font-mono text-[11px] sm:text-[13px] text-[#d0d0e0] overflow-x-auto custom-scrollbar leading-relaxed">{s.code}</pre>
-              </div>
-            </div>
-          {/if}
+    <div class="max-w-6xl mx-auto px-4 sm:px-6">
+      <div class="text-center mb-10 sm:mb-14">
+        <div class="inline-flex items-center gap-2 px-3 py-1 mb-4 border border-[#ff6a3d]/30 rounded-full bg-[#ff6a3d]/10 text-[#ff6a3d] text-xs font-semibold tracking-wide uppercase">
+          <Terminal size={12} /> Tutorial
         </div>
-      {/each}
-      <div class="mt-8 grid sm:grid-cols-2 gap-3 sm:gap-4">
-        <a href="https://github.com/enekos/sutegi/blob/master/AGENTS.md" target="_blank" rel="noopener" class="bg-[#13121a] border border-white/5 rounded-xl p-4 sm:p-5 hover:border-[#ff6a3d]/40 transition-colors">
-          <div class="text-white font-mono text-sm">AGENTS.md <span class="text-[#ff6a3d]">→</span></div>
-          <div class="text-[#9090a0] text-xs mt-1">The complete agent-facing contract: discover, manifest, invoke, stream.</div>
-        </a>
-        <a href="https://github.com/enekos/sutegi/blob/master/docs/HEXAGONAL.md" target="_blank" rel="noopener" class="bg-[#13121a] border border-white/5 rounded-xl p-4 sm:p-5 hover:border-[#ff6a3d]/40 transition-colors">
-          <div class="text-white font-mono text-sm">Hexagonal guide <span class="text-[#ff6a3d]">→</span></div>
-          <div class="text-[#9090a0] text-xs mt-1">The dependency rule, layer responsibilities, layout, and testing strategy.</div>
-        </a>
+        <h2 class="text-2xl sm:text-3xl md:text-4xl font-bold text-white mb-3 min-h-[1.2em]">{docsText()}</h2>
+        <p class="text-[#a0a0b0] max-w-2xl mx-auto text-sm sm:text-base">
+          Follow along and build a complete <strong class="text-white">Todo API</strong> — routes, a database, validation, an agent interface, streaming and a production deploy — one step at a time.
+        </p>
+      </div>
+
+      <div class="flex flex-col lg:flex-row gap-8 lg:gap-12">
+        <!-- Sidebar TOC -->
+        <aside class="hidden lg:block w-56 shrink-0">
+          <nav class="sticky top-8 space-y-6">
+            {#each tutorial as grp}
+              <div>
+                <div class="text-[11px] uppercase tracking-wider text-[#7a7a8a] font-semibold mb-2.5">{grp.group}</div>
+                <ul class="border-l border-white/10">
+                  {#each grp.chapters as ch}
+                    <li>
+                      <a href="#ch-{ch.id}"
+                        class="block pl-4 -ml-px border-l py-1.5 text-sm transition-colors {activeChapter === ch.id ? 'border-[#ff6a3d] text-white font-medium' : 'border-transparent text-[#9090a0] hover:text-white hover:border-white/30'}">
+                        {ch.title}
+                      </a>
+                    </li>
+                  {/each}
+                </ul>
+              </div>
+            {/each}
+          </nav>
+        </aside>
+
+        <!-- Lessons -->
+        <div class="flex-1 min-w-0 space-y-12 sm:space-y-16">
+          {#each tutorial as grp}
+            {#each grp.chapters as ch}
+              {@const Icon = ch.icon}
+              <article id="ch-{ch.id}" data-chapter class="scroll-mt-24">
+                <div class="flex items-center gap-2 text-[#ff6a3d] text-[11px] font-mono font-semibold uppercase tracking-wider mb-2">
+                  <Icon size={14} /> {ch.kicker}
+                </div>
+                <h3 class="text-xl sm:text-2xl font-bold text-white mb-3" use:hoverScramble={ch.title}>{ch.title}</h3>
+                <p class="lesson text-[#b0b0c0] text-sm sm:text-[15px] leading-relaxed mb-4">{@html ch.lead}</p>
+                <div class="relative">
+                  <button onclick={() => copyCmd(ch.code)} class="absolute top-2 right-2 text-[11px] font-mono text-[#7a7a8a] hover:text-[#ff6a3d] border border-white/10 rounded px-2 py-1 transition-colors">copy</button>
+                  <pre class="bg-black/40 border border-white/5 rounded-lg p-3 sm:p-4 font-mono text-[11px] sm:text-[13px] text-[#d0d0e0] overflow-x-auto custom-scrollbar leading-relaxed">{ch.code}</pre>
+                </div>
+                {#if ch.tip}
+                  <div class="mt-4 flex gap-3 rounded-lg border border-[#ff6a3d]/20 bg-[#ff6a3d]/[0.06] p-3 sm:p-4">
+                    <Flame size={16} class="text-[#ff6a3d] shrink-0 mt-0.5" />
+                    <p class="lesson text-[#c8c8d4] text-sm leading-relaxed"><strong class="text-[#ff6a3d] not-italic">Tip&nbsp;·&nbsp;</strong>{@html ch.tip}</p>
+                  </div>
+                {/if}
+                {#if ch.note}
+                  <div class="mt-4 flex gap-3 rounded-lg border border-white/10 bg-white/[0.03] p-3 sm:p-4">
+                    <Feather size={16} class="text-[#9090a0] shrink-0 mt-0.5" />
+                    <p class="lesson text-[#b0b0c0] text-sm leading-relaxed"><strong class="text-white not-italic">Note&nbsp;·&nbsp;</strong>{@html ch.note}</p>
+                  </div>
+                {/if}
+              </article>
+            {/each}
+          {/each}
+
+          <!-- Keep reading -->
+          <div class="pt-2">
+            <div class="text-[11px] uppercase tracking-wider text-[#7a7a8a] font-semibold mb-3">Keep reading</div>
+            <div class="grid sm:grid-cols-2 gap-3 sm:gap-4">
+              <a href="https://github.com/enekos/sutegi/blob/master/AGENTS.md" target="_blank" rel="noopener" class="bg-[#13121a] border border-white/5 rounded-xl p-4 sm:p-5 hover:border-[#ff6a3d]/40 transition-colors">
+                <div class="text-white font-mono text-sm">AGENTS.md <span class="text-[#ff6a3d]">→</span></div>
+                <div class="text-[#9090a0] text-xs mt-1">The complete agent-facing contract: discover, manifest, invoke, stream.</div>
+              </a>
+              <a href="https://github.com/enekos/sutegi/blob/master/docs/HEXAGONAL.md" target="_blank" rel="noopener" class="bg-[#13121a] border border-white/5 rounded-xl p-4 sm:p-5 hover:border-[#ff6a3d]/40 transition-colors">
+                <div class="text-white font-mono text-sm">Hexagonal guide <span class="text-[#ff6a3d]">→</span></div>
+                <div class="text-[#9090a0] text-xs mt-1">The dependency rule, layer responsibilities, layout, and testing strategy.</div>
+              </a>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   </section>

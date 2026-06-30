@@ -121,7 +121,14 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 
         if skip {
             // Type is irrelevant for skipped fields; they're default-initialized.
-            infos.push(FieldInfo { ident, column, scalar: Scalar::Text, optional: false, primary: false, skip: true });
+            infos.push(FieldInfo {
+                ident,
+                column,
+                scalar: Scalar::Text,
+                optional: false,
+                primary: false,
+                skip: true,
+            });
             continue;
         }
 
@@ -132,7 +139,14 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             )
         })?;
 
-        infos.push(FieldInfo { ident, column, scalar, optional, primary, skip: false });
+        infos.push(FieldInfo {
+            ident,
+            column,
+            scalar,
+            optional,
+            primary,
+            skip: false,
+        });
     }
 
     // ---- schema() columns ---- (skipped fields are not columns)
@@ -314,8 +328,8 @@ fn to_snake(name: &str) -> String {
 fn pluralize(word: &str) -> String {
     if word.ends_with('s') {
         word.to_string()
-    } else if word.ends_with('y') {
-        format!("{}ies", &word[..word.len() - 1])
+    } else if let Some(stem) = word.strip_suffix('y') {
+        format!("{}ies", stem)
     } else {
         format!("{}s", word)
     }

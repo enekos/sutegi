@@ -21,7 +21,10 @@ impl ValidationErrors {
     }
 
     pub fn add(&mut self, field: &str, message: impl Into<String>) {
-        self.0.entry(field.to_string()).or_default().push(message.into());
+        self.0
+            .entry(field.to_string())
+            .or_default()
+            .push(message.into());
     }
 
     pub fn is_empty(&self) -> bool {
@@ -159,7 +162,10 @@ fn check_rule(field: &str, rule: &Rule, value: &Json, errors: &mut ValidationErr
         Rule::Email => {
             let ok = value.as_str().map(is_email).unwrap_or(false);
             if !ok {
-                errors.add(field, format!("The {} must be a valid email address.", field));
+                errors.add(
+                    field,
+                    format!("The {} must be a valid email address.", field),
+                );
             }
         }
         Rule::Alpha => {
@@ -177,7 +183,10 @@ fn check_rule(field: &str, rule: &Rule, value: &Json, errors: &mut ValidationErr
                 .map(|s| !s.is_empty() && s.chars().all(|c| c.is_alphanumeric()))
                 .unwrap_or(false);
             if !ok {
-                errors.add(field, format!("The {} may only contain letters and numbers.", field));
+                errors.add(
+                    field,
+                    format!("The {} may only contain letters and numbers.", field),
+                );
             }
         }
         Rule::Url => {
@@ -189,7 +198,10 @@ fn check_rule(field: &str, rule: &Rule, value: &Json, errors: &mut ValidationErr
         Rule::Between(min, max) => {
             if let Some(n) = value.as_f64() {
                 if n < *min || n > *max {
-                    errors.add(field, format!("The {} must be between {} and {}.", field, min, max));
+                    errors.add(
+                        field,
+                        format!("The {} must be between {} and {}.", field, min, max),
+                    );
                 }
             }
         }
@@ -205,21 +217,30 @@ fn check_rule(field: &str, rule: &Rule, value: &Json, errors: &mut ValidationErr
         Rule::Max(max) => {
             if let Some(n) = value.as_f64() {
                 if n > *max {
-                    errors.add(field, format!("The {} must not be greater than {}.", field, max));
+                    errors.add(
+                        field,
+                        format!("The {} must not be greater than {}.", field, max),
+                    );
                 }
             }
         }
         Rule::MinLen(min) => {
             if let Some(len) = length_of(value) {
                 if len < *min {
-                    errors.add(field, format!("The {} must be at least {} long.", field, min));
+                    errors.add(
+                        field,
+                        format!("The {} must be at least {} long.", field, min),
+                    );
                 }
             }
         }
         Rule::MaxLen(max) => {
             if let Some(len) = length_of(value) {
                 if len > *max {
-                    errors.add(field, format!("The {} must not be longer than {}.", field, max));
+                    errors.add(
+                        field,
+                        format!("The {} must not be longer than {}.", field, max),
+                    );
                 }
             }
         }
@@ -229,7 +250,9 @@ fn check_rule(field: &str, rule: &Rule, value: &Json, errors: &mut ValidationErr
                 Json::Num(_) | Json::Bool(_) => Some(value.to_string()),
                 _ => None,
             };
-            let ok = as_str.map(|s| allowed.iter().any(|a| a == &s)).unwrap_or(false);
+            let ok = as_str
+                .map(|s| allowed.iter().any(|a| a == &s))
+                .unwrap_or(false);
             if !ok {
                 errors.add(field, format!("The selected {} is invalid.", field));
             }
@@ -262,7 +285,10 @@ fn is_email(s: &str) -> bool {
 
 /// A minimal URL check: `http(s)://` followed by a non-empty, space-free host.
 fn is_url(s: &str) -> bool {
-    let rest = match s.strip_prefix("https://").or_else(|| s.strip_prefix("http://")) {
+    let rest = match s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+    {
         Some(r) => r,
         None => return false,
     };
@@ -459,8 +485,20 @@ mod tests {
             (
                 "properties",
                 Json::obj(vec![
-                    ("title", Json::obj(vec![("type", Json::str("string")), ("minLength", Json::num(1))])),
-                    ("count", Json::obj(vec![("type", Json::str("integer")), ("minimum", Json::num(0))])),
+                    (
+                        "title",
+                        Json::obj(vec![
+                            ("type", Json::str("string")),
+                            ("minLength", Json::num(1)),
+                        ]),
+                    ),
+                    (
+                        "count",
+                        Json::obj(vec![
+                            ("type", Json::str("integer")),
+                            ("minimum", Json::num(0)),
+                        ]),
+                    ),
                 ]),
             ),
             ("required", Json::arr(vec![Json::str("title")])),
@@ -474,5 +512,164 @@ mod tests {
 
         let good = Json::obj(vec![("title", Json::str("ok")), ("count", Json::num(3))]);
         assert!(validate_schema(&schema, &good).is_ok());
+    }
+
+    #[test]
+    fn scalar_type_rules() {
+        let rules = Ruleset::new()
+            .field("n", &[Rule::Number])
+            .field("i", &[Rule::Integer])
+            .field("b", &[Rule::Bool])
+            .field("s", &[Rule::Str])
+            .field("a", &[Rule::Alpha]);
+        // All wrong types.
+        let bad = Json::obj(vec![
+            ("n", Json::str("x")),
+            ("i", Json::num(1.5)),
+            ("b", Json::str("x")),
+            ("s", Json::num(1)),
+            ("a", Json::str("a1")),
+        ]);
+        let j = bad.clone();
+        let errs = rules.validate(&j).unwrap_err().to_json();
+        for f in ["n", "i", "b", "s", "a"] {
+            assert!(errs.get(f).is_some(), "{f} should fail");
+        }
+        // All correct types.
+        let good = Json::obj(vec![
+            ("n", Json::num(1.5)),
+            ("i", Json::num(7)),
+            ("b", Json::Bool(true)),
+            ("s", Json::str("hi")),
+            ("a", Json::str("abc")),
+        ]);
+        assert!(rules.validate(&good).is_ok());
+    }
+
+    #[test]
+    fn numeric_and_length_bounds() {
+        let rules = Ruleset::new()
+            .field("score", &[Rule::Min(0.0), Rule::Max(100.0)])
+            .field("tags", &[Rule::MinLen(1), Rule::MaxLen(2)]);
+        let bad = Json::obj(vec![
+            ("score", Json::num(150)),
+            (
+                "tags",
+                Json::arr(vec![Json::str("a"), Json::str("b"), Json::str("c")]),
+            ),
+        ]);
+        let errs = rules.validate(&bad).unwrap_err().to_json();
+        assert!(errs.get("score").is_some());
+        assert!(errs.get("tags").is_some()); // MaxLen counts array items
+                                             // In-bounds passes; MinLen also counts array length.
+        let good = Json::obj(vec![
+            ("score", Json::num(50)),
+            ("tags", Json::arr(vec![Json::str("a")])),
+        ]);
+        assert!(rules.validate(&good).is_ok());
+    }
+
+    #[test]
+    fn absent_optional_field_passes_but_required_fails() {
+        let rules = Ruleset::new()
+            .field("opt", &[Rule::Str, Rule::MaxLen(3)])
+            .field("req", &[Rule::Required]);
+        // `opt` absent + optional → fine; `req` absent → error.
+        let errs = rules.validate(&Json::obj(vec![])).unwrap_err().to_json();
+        assert!(errs.get("opt").is_none());
+        assert!(errs.get("req").is_some());
+        // Explicit null is treated as absent.
+        let null_req = Json::obj(vec![("req", Json::Null)]);
+        assert!(rules.validate(&null_req).is_err());
+    }
+
+    #[test]
+    fn in_rule_accepts_numbers_and_strings() {
+        let rules = Ruleset::new().field(
+            "level",
+            &[Rule::In(vec!["1".into(), "2".into(), "3".into()])],
+        );
+        // A numeric value stringifies and matches.
+        assert!(rules
+            .validate(&Json::obj(vec![("level", Json::num(2))]))
+            .is_ok());
+        assert!(rules
+            .validate(&Json::obj(vec![("level", Json::num(9))]))
+            .is_err());
+    }
+
+    #[test]
+    fn email_and_url_edge_cases() {
+        assert!(is_email("a@b.co"));
+        assert!(!is_email("a@b")); // no dotted domain
+        assert!(!is_email("@b.co")); // empty local
+        assert!(!is_email("a b@c.co")); // whitespace
+        assert!(!is_email("a@@b.co")); // two @
+        assert!(is_url("https://join.com/x?y#z"));
+        assert!(is_url("http://localhost"));
+        assert!(!is_url("ftp://x")); // wrong scheme
+        assert!(!is_url("http:// host")); // space in host
+    }
+
+    #[test]
+    fn schema_enum_nested_arrays_and_string_length() {
+        let schema = Json::obj(vec![
+            ("type", Json::str("object")),
+            (
+                "properties",
+                Json::obj(vec![
+                    (
+                        "role",
+                        Json::obj(vec![(
+                            "enum",
+                            Json::arr(vec![Json::str("admin"), Json::str("user")]),
+                        )]),
+                    ),
+                    (
+                        "name",
+                        Json::obj(vec![
+                            ("type", Json::str("string")),
+                            ("maxLength", Json::num(3)),
+                        ]),
+                    ),
+                    (
+                        "tags",
+                        Json::obj(vec![
+                            ("type", Json::str("array")),
+                            ("items", Json::obj(vec![("type", Json::str("integer"))])),
+                        ]),
+                    ),
+                ]),
+            ),
+        ]);
+        let bad = Json::obj(vec![
+            ("role", Json::str("root")),                             // not in enum
+            ("name", Json::str("toolong")),                          // > maxLength
+            ("tags", Json::arr(vec![Json::num(1), Json::str("x")])), // items[1] wrong type
+        ]);
+        let errs = validate_schema(&schema, &bad).unwrap_err().to_json();
+        assert!(errs.get("role").is_some());
+        assert!(errs.get("name").is_some());
+        assert!(errs.get("tags[1]").is_some(), "nested item path expected");
+
+        let good = Json::obj(vec![
+            ("role", Json::str("user")),
+            ("name", Json::str("ok")),
+            ("tags", Json::arr(vec![Json::num(1), Json::num(2)])),
+        ]);
+        assert!(validate_schema(&schema, &good).is_ok());
+    }
+
+    #[test]
+    fn validation_errors_helpers() {
+        let mut e = ValidationErrors::new();
+        assert!(e.is_empty());
+        e.add("x", "bad");
+        e.add("x", "also bad");
+        assert!(!e.is_empty());
+        // Two messages collected under the same field.
+        let arr = e.to_json();
+        assert_eq!(arr.get("x").and_then(Json::as_array).map(Vec::len), Some(2));
+        assert!(e.into_result().is_err());
     }
 }

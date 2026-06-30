@@ -40,23 +40,37 @@ fn main() -> std::io::Result<()> {
     };
 
     // 2. Wire the use cases (inbound ports) over the chosen repo.
-    let create = Arc::new(CreateTodo { repo: Arc::clone(&repo) });
-    let list = Arc::new(ListTodos { repo: Arc::clone(&repo) });
-    let complete = Arc::new(CompleteTodo { repo: Arc::clone(&repo) });
+    let create = Arc::new(CreateTodo {
+        repo: Arc::clone(&repo),
+    });
+    let list = Arc::new(ListTodos {
+        repo: Arc::clone(&repo),
+    });
+    let complete = Arc::new(CompleteTodo {
+        repo: Arc::clone(&repo),
+    });
 
     // 3. Mount the inbound adapters — HTTP and AI both over the same use cases.
-    let app = App::new("hexagonal-todo")
-        .readiness(|| true)
-        .get("/", "Health check.", |_req, _p| text(200, "sutegi up"));
+    let app =
+        App::new("hexagonal-todo")
+            .readiness(|| true)
+            .get("/", "Health check.", |_req, _p| text(200, "sutegi up"));
     let app = inbound_http::register(app, Arc::clone(&create), list, complete);
     let app = sutegi::ai::mount(
         app,
         ToolRegistry::new().add(CreateTodoTool { use_case: create }),
     );
 
-    let addr = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| format!("{}:{}", sutegi::env_or("HOST", "0.0.0.0"), sutegi::env_or("PORT", "8080")));
-    println!("hexagonal-todo on http://{addr}  (REPO={})", sutegi::env_or("REPO", "sqlite"));
+    let addr = std::env::args().nth(1).unwrap_or_else(|| {
+        format!(
+            "{}:{}",
+            sutegi::env_or("HOST", "0.0.0.0"),
+            sutegi::env_or("PORT", "8080")
+        )
+    });
+    println!(
+        "hexagonal-todo on http://{addr}  (REPO={})",
+        sutegi::env_or("REPO", "sqlite")
+    );
     app.run_graceful(&addr)
 }

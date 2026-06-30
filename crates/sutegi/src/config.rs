@@ -28,7 +28,11 @@ pub struct ConfigError {
 
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "missing required configuration: {}", self.missing.join(", "))
+        write!(
+            f,
+            "missing required configuration: {}",
+            self.missing.join(", ")
+        )
     }
 }
 
@@ -85,12 +89,16 @@ impl Config {
 
     /// Integer value, or `default` if unset/unparseable.
     pub fn int(&self, key: &str, default: i64) -> i64 {
-        self.get(key).and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+        self.get(key)
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(default)
     }
 
     /// Float value, or `default` if unset/unparseable.
     pub fn float(&self, key: &str, default: f64) -> f64 {
-        self.get(key).and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+        self.get(key)
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(default)
     }
 
     /// Boolean value (`1/true/yes/on` ⇒ true, `0/false/no/off` ⇒ false,
@@ -106,15 +114,20 @@ impl Config {
     /// Comma-separated list (trimmed, empties dropped). Empty if unset.
     pub fn list(&self, key: &str) -> Vec<String> {
         self.get(key)
-            .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
     /// Require a value; `Err` (listing the key) if it's unset.
     pub fn require(&self, key: &str) -> Result<String, ConfigError> {
-        self.get(key)
-            .map(String::from)
-            .ok_or_else(|| ConfigError { missing: vec![key.to_string()] })
+        self.get(key).map(String::from).ok_or_else(|| ConfigError {
+            missing: vec![key.to_string()],
+        })
     }
 
     /// Require several values at once; the error lists **all** missing keys, so
@@ -138,7 +151,10 @@ impl Config {
         let vars = self
             .vars
             .iter()
-            .filter_map(|(k, v)| k.strip_prefix(prefix).map(|stripped| (stripped.to_string(), v.clone())))
+            .filter_map(|(k, v)| {
+                k.strip_prefix(prefix)
+                    .map(|stripped| (stripped.to_string(), v.clone()))
+            })
             .collect();
         Config { vars }
     }
@@ -217,7 +233,8 @@ mod tests {
 
     #[test]
     fn dotenv_parsing() {
-        let content = "# comment\n\nexport NAME=\"sutegi\"\nPORT=8080\nQUOTED='a b'\nbad line\nEMPTY=\n";
+        let content =
+            "# comment\n\nexport NAME=\"sutegi\"\nPORT=8080\nQUOTED='a b'\nbad line\nEMPTY=\n";
         let parsed: BTreeMap<_, _> = parse_dotenv(content).into_iter().collect();
         assert_eq!(parsed.get("NAME").map(String::as_str), Some("sutegi"));
         assert_eq!(parsed.get("PORT").map(String::as_str), Some("8080"));

@@ -11,9 +11,9 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use std::time::Duration;
 pub use sutegi_http::{Body, Limits, Method, Request, Response, SseSink, StreamSink};
 use sutegi_json::Json;
-use std::time::Duration;
 
 /// Path parameters captured from a route pattern (`:name` segments).
 pub type Params = BTreeMap<String, String>;
@@ -190,7 +190,12 @@ impl App {
 
     /// Register a group of routes sharing a path `prefix` and group-scoped
     /// `middleware`. Laravel-style: `app.group("/api", vec![mw(auth)], |g| g.get(...))`.
-    pub fn group(mut self, prefix: &str, middleware: Vec<Mw>, build: impl FnOnce(Group) -> Group) -> App {
+    pub fn group(
+        mut self,
+        prefix: &str,
+        middleware: Vec<Mw>,
+        build: impl FnOnce(Group) -> Group,
+    ) -> App {
         let group = build(Group {
             prefix: prefix.to_string(),
             middleware,
@@ -290,7 +295,13 @@ impl App {
     }
 
     /// Build the request service closure (shared by every `run*` variant).
-    fn into_service(self) -> (usize, Limits, impl Fn(Request) -> Response + Send + Sync + 'static) {
+    fn into_service(
+        self,
+    ) -> (
+        usize,
+        Limits,
+        impl Fn(Request) -> Response + Send + Sync + 'static,
+    ) {
         let limits = self.limits;
         let introspect = self.introspection();
         let routes = Arc::new(self.routes);
@@ -310,7 +321,10 @@ impl App {
                     "/__health" => return json(200, &Json::obj(vec![("status", Json::str("ok"))])),
                     "/__ready" => {
                         let ready = readiness.as_ref().as_ref().map(|f| f()).unwrap_or(true);
-                        let body = Json::obj(vec![("status", Json::str(if ready { "ready" } else { "not ready" }))]);
+                        let body = Json::obj(vec![(
+                            "status",
+                            Json::str(if ready { "ready" } else { "not ready" }),
+                        )]);
                         return json(if ready { 200 } else { 503 }, &body);
                     }
                     "/__metrics" => {
@@ -340,7 +354,10 @@ impl App {
                 }
 
                 // Distinguish "no such path" from "wrong method".
-                if routes.iter().any(|r| match_pattern(&r.pattern, &req.path).is_some()) {
+                if routes
+                    .iter()
+                    .any(|r| match_pattern(&r.pattern, &req.path).is_some())
+                {
                     return text(405, "405 Method Not Allowed");
                 }
                 not_found()
@@ -434,16 +451,36 @@ impl Group {
         self
     }
 
-    pub fn get(self, p: &str, doc: &str, h: impl Fn(&Request, &Params) -> Response + Send + Sync + 'static) -> Group {
+    pub fn get(
+        self,
+        p: &str,
+        doc: &str,
+        h: impl Fn(&Request, &Params) -> Response + Send + Sync + 'static,
+    ) -> Group {
         self.route(Method::Get, p, doc, h)
     }
-    pub fn post(self, p: &str, doc: &str, h: impl Fn(&Request, &Params) -> Response + Send + Sync + 'static) -> Group {
+    pub fn post(
+        self,
+        p: &str,
+        doc: &str,
+        h: impl Fn(&Request, &Params) -> Response + Send + Sync + 'static,
+    ) -> Group {
         self.route(Method::Post, p, doc, h)
     }
-    pub fn put(self, p: &str, doc: &str, h: impl Fn(&Request, &Params) -> Response + Send + Sync + 'static) -> Group {
+    pub fn put(
+        self,
+        p: &str,
+        doc: &str,
+        h: impl Fn(&Request, &Params) -> Response + Send + Sync + 'static,
+    ) -> Group {
         self.route(Method::Put, p, doc, h)
     }
-    pub fn delete(self, p: &str, doc: &str, h: impl Fn(&Request, &Params) -> Response + Send + Sync + 'static) -> Group {
+    pub fn delete(
+        self,
+        p: &str,
+        doc: &str,
+        h: impl Fn(&Request, &Params) -> Response + Send + Sync + 'static,
+    ) -> Group {
         self.route(Method::Delete, p, doc, h)
     }
 }
@@ -542,14 +579,19 @@ pub fn logger() -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static
 
 /// A pre-middleware that answers CORS preflight (`OPTIONS`) with `204` and the
 /// permitted origin. Pair with [`cors`] (an after-middleware) for full CORS.
-pub fn cors_preflight(origin: &str) -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static {
+pub fn cors_preflight(
+    origin: &str,
+) -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static {
     let origin = origin.to_string();
     move |req: &Request| {
         if req.method == Method::Options {
             Some(
                 Response::new(204)
                     .with_header("access-control-allow-origin", &origin)
-                    .with_header("access-control-allow-methods", "GET,POST,PUT,DELETE,OPTIONS")
+                    .with_header(
+                        "access-control-allow-methods",
+                        "GET,POST,PUT,DELETE,OPTIONS",
+                    )
                     .with_header("access-control-allow-headers", "*"),
             )
         } else {
@@ -575,11 +617,19 @@ pub fn bearer(token: &str) -> impl Fn(&Request) -> Option<Response> + Send + Syn
 }
 
 /// A pre-middleware requiring HTTP Basic auth for `user`/`pass`; else `401`.
-pub fn basic(user: &str, pass: &str) -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static {
-    let expected = format!("Basic {}", base64_encode(format!("{}:{}", user, pass).as_bytes()));
+pub fn basic(
+    user: &str,
+    pass: &str,
+) -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static {
+    let expected = format!(
+        "Basic {}",
+        base64_encode(format!("{}:{}", user, pass).as_bytes())
+    );
     move |req: &Request| match req.header("authorization") {
         Some(h) if h == expected => None,
-        _ => Some(text(401, "401 Unauthorized").with_header("www-authenticate", "Basic realm=\"sutegi\"")),
+        _ => Some(
+            text(401, "401 Unauthorized").with_header("www-authenticate", "Basic realm=\"sutegi\""),
+        ),
     }
 }
 
@@ -590,7 +640,10 @@ pub fn secure_headers() -> impl Fn(&Request, Response) -> Response + Send + Sync
         resp.with_header("x-content-type-options", "nosniff")
             .with_header("x-frame-options", "DENY")
             .with_header("referrer-policy", "no-referrer")
-            .with_header("strict-transport-security", "max-age=31536000; includeSubDomains")
+            .with_header(
+                "strict-transport-security",
+                "max-age=31536000; includeSubDomains",
+            )
     }
 }
 
@@ -600,10 +653,15 @@ pub fn rate_limit(
     max_requests: u32,
     per: Duration,
 ) -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static {
-    let buckets: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, (f64, std::time::Instant)>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let buckets: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, (f64, std::time::Instant)>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let capacity = max_requests as f64;
-    let refill_per_sec = if per.as_secs_f64() > 0.0 { capacity / per.as_secs_f64() } else { capacity };
+    let refill_per_sec = if per.as_secs_f64() > 0.0 {
+        capacity / per.as_secs_f64()
+    } else {
+        capacity
+    };
     move |req: &Request| {
         let key = req.peer_ip().unwrap_or_else(|| "unknown".to_string());
         let now = std::time::Instant::now();
@@ -624,15 +682,23 @@ pub fn rate_limit(
 /// Minimal standard base64 encoder (used by `basic`).
 fn base64_encode(input: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b0 = chunk[0];
         let b1 = *chunk.get(1).unwrap_or(&0);
         let b2 = *chunk.get(2).unwrap_or(&0);
         out.push(T[(b0 >> 2) as usize] as char);
         out.push(T[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
-        out.push(if chunk.len() > 1 { T[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[(b2 & 0x3f) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(b2 & 0x3f) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -799,7 +865,8 @@ mod tests {
         };
         let guard = bearer("s3cr3t");
         assert_eq!(guard(&req).map(|r| r.status), Some(401)); // no header
-        req.headers.push(("Authorization".into(), "Bearer s3cr3t".into()));
+        req.headers
+            .push(("Authorization".into(), "Bearer s3cr3t".into()));
         assert!(guard(&req).is_none()); // authorized
 
         // Rate limit: 2 requests allowed, 3rd blocked.
@@ -816,7 +883,10 @@ mod tests {
         assert_eq!(redirect("/login").status, 302);
         assert_eq!(no_content().status, 204);
         let h = html(200, "<p>hi</p>");
-        assert!(h.headers.iter().any(|(k, v)| k == "content-type" && v.contains("text/html")));
+        assert!(h
+            .headers
+            .iter()
+            .any(|(k, v)| k == "content-type" && v.contains("text/html")));
     }
 
     #[test]
@@ -833,5 +903,137 @@ mod tests {
         let q = query_params(&req);
         assert_eq!(q.get("q").map(String::as_str), Some("hello world"));
         assert_eq!(q.get("page").map(String::as_str), Some("2"));
+    }
+
+    fn req(method: Method, body: &[u8]) -> Request {
+        Request {
+            method,
+            path: "/".into(),
+            query: String::new(),
+            version: "HTTP/1.1".into(),
+            headers: vec![],
+            body: body.to_vec(),
+            peer: Some("9.9.9.9:1".into()),
+        }
+    }
+
+    #[test]
+    fn json_body_parses_and_defaults_empty() {
+        let r = req(Method::Post, br#"{"a":1}"#);
+        assert_eq!(
+            json_body(&r).unwrap().get("a").and_then(Json::as_i64),
+            Some(1)
+        );
+        // Empty body → empty object, not an error.
+        assert_eq!(
+            json_body(&req(Method::Post, b"")).unwrap(),
+            Json::Obj(BTreeMap::new())
+        );
+        // Malformed JSON is an error.
+        assert!(json_body(&req(Method::Post, b"{not json")).is_err());
+    }
+
+    #[test]
+    fn url_decode_percent_and_plus() {
+        let r = Request {
+            query: "name=a%20b%2Bc&plus=x+y".into(),
+            ..req(Method::Get, b"")
+        };
+        let q = query_params(&r);
+        assert_eq!(q.get("name").map(String::as_str), Some("a b+c"));
+        assert_eq!(q.get("plus").map(String::as_str), Some("x y"));
+    }
+
+    #[test]
+    fn json_and_text_helpers_set_content_type() {
+        let j = json(201, &Json::obj(vec![("ok", Json::Bool(true))]));
+        assert_eq!(j.status, 201);
+        assert!(j
+            .headers
+            .iter()
+            .any(|(k, v)| k == "content-type" && v.contains("application/json")));
+        assert_eq!(status(204).status, 204);
+        assert_eq!(not_found().status, 404);
+    }
+
+    #[test]
+    fn cors_preflight_and_after_middleware() {
+        let pre = cors_preflight("https://join.com");
+        // OPTIONS is answered with 204 + allow-origin.
+        let resp = pre(&req(Method::Options, b"")).unwrap();
+        assert_eq!(resp.status, 204);
+        assert!(resp
+            .headers
+            .iter()
+            .any(|(k, v)| k == "access-control-allow-origin" && v == "https://join.com"));
+        // Non-OPTIONS passes through.
+        assert!(pre(&req(Method::Get, b"")).is_none());
+        // The after-middleware stamps the header on any response.
+        let after = cors("*");
+        let stamped = after(&req(Method::Get, b""), Response::new(200));
+        assert!(stamped
+            .headers
+            .iter()
+            .any(|(k, v)| k == "access-control-allow-origin" && v == "*"));
+    }
+
+    #[test]
+    fn secure_headers_added() {
+        let resp = secure_headers()(&req(Method::Get, b""), Response::new(200));
+        for h in [
+            "x-content-type-options",
+            "x-frame-options",
+            "referrer-policy",
+            "strict-transport-security",
+        ] {
+            assert!(resp.headers.iter().any(|(k, _)| k == h), "missing {h}");
+        }
+    }
+
+    #[test]
+    fn basic_auth_checks_base64_credentials() {
+        let guard = basic("user", "pass");
+        // Wrong / missing creds → 401 with a Basic challenge.
+        let denied = guard(&req(Method::Get, b"")).unwrap();
+        assert_eq!(denied.status, 401);
+        assert!(denied
+            .headers
+            .iter()
+            .any(|(k, v)| k == "www-authenticate" && v.contains("Basic")));
+        // base64("user:pass") == "dXNlcjpwYXNz".
+        let mut r = req(Method::Get, b"");
+        r.headers
+            .push(("Authorization".into(), "Basic dXNlcjpwYXNz".into()));
+        assert!(guard(&r).is_none());
+    }
+
+    #[test]
+    fn rate_limit_refills_over_time() {
+        let rl = rate_limit(1, std::time::Duration::from_millis(20));
+        let r = req(Method::Get, b"");
+        assert!(rl(&r).is_none()); // first allowed
+        assert_eq!(rl(&r).map(|x| x.status), Some(429)); // bucket empty
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(rl(&r).is_none()); // refilled
+    }
+
+    #[test]
+    fn group_prefixes_routes_and_introspects() {
+        // Build an app with a prefixed group; introspection reflects the joined paths.
+        let app = App::new("t").group("/api", vec![], |g| {
+            g.get("/users", "list", |_r, _p| text(200, "ok")).post(
+                "/users/:id",
+                "update",
+                |_r, _p| text(200, "ok"),
+            )
+        });
+        let intro = app.introspection();
+        let routes = intro.get("routes").and_then(Json::as_array).unwrap();
+        let patterns: Vec<&str> = routes
+            .iter()
+            .filter_map(|r| r.get("pattern").and_then(Json::as_str))
+            .collect();
+        assert!(patterns.contains(&"/api/users"));
+        assert!(patterns.contains(&"/api/users/:id"));
     }
 }

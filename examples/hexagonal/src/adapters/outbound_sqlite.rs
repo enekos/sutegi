@@ -23,7 +23,11 @@ struct TodoRow {
 
 impl TodoRow {
     fn into_domain(self) -> Todo {
-        Todo { id: self.id, title: self.title, done: self.done }
+        Todo {
+            id: self.id,
+            title: self.title,
+            done: self.done,
+        }
     }
 }
 
@@ -36,7 +40,7 @@ impl SqliteTodoRepo {
     pub fn new(db: Arc<Mutex<Db>>) -> AppResult<SqliteTodoRepo> {
         {
             let guard = db.lock().unwrap();
-            TodoRow::migrate(&guard).map_err(|e| AppError::internal(e))?;
+            TodoRow::migrate(&guard).map_err(AppError::internal)?;
         }
         Ok(SqliteTodoRepo { db })
     }
@@ -45,13 +49,13 @@ impl SqliteTodoRepo {
 impl TodoRepository for SqliteTodoRepo {
     fn list(&self) -> AppResult<Vec<Todo>> {
         let db = self.db.lock().unwrap();
-        let rows = TodoRow::all_typed(&db).map_err(|e| AppError::internal(e))?;
+        let rows = TodoRow::all_typed(&db).map_err(AppError::internal)?;
         Ok(rows.into_iter().map(TodoRow::into_domain).collect())
     }
 
     fn find(&self, id: i64) -> AppResult<Option<Todo>> {
         let db = self.db.lock().unwrap();
-        let row = TodoRow::find_typed(&db, Value::Int(id)).map_err(|e| AppError::internal(e))?;
+        let row = TodoRow::find_typed(&db, Value::Int(id)).map_err(AppError::internal)?;
         Ok(row.map(TodoRow::into_domain))
     }
 
@@ -59,9 +63,12 @@ impl TodoRepository for SqliteTodoRepo {
         let db = self.db.lock().unwrap();
         TodoRow::create(
             &db,
-            &[("title", Value::Text(todo.title.clone())), ("done", Value::Bool(todo.done))],
+            &[
+                ("title", Value::Text(todo.title.clone())),
+                ("done", Value::Bool(todo.done)),
+            ],
         )
-        .map_err(|e| AppError::internal(e))
+        .map_err(AppError::internal)
     }
 
     fn update(&self, todo: &Todo) -> AppResult<()> {
@@ -75,6 +82,6 @@ impl TodoRepository for SqliteTodoRepo {
             ],
         )
         .map(|_| ())
-        .map_err(|e| AppError::internal(e))
+        .map_err(AppError::internal)
     }
 }

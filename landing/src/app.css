@@ -59,6 +59,17 @@ body {
 
 code { word-break: break-word; }
 
+/* Inline code inside tutorial prose / callouts */
+.lesson code {
+  color: #ff8a5d;
+  background: rgba(255, 106, 61, 0.1);
+  padding: 0.1em 0.4em;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  white-space: nowrap;
+}
+
 @keyframes typing {
   from { max-width: 0 }
   to { max-width: 100% }

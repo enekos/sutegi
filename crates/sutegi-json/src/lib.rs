@@ -513,11 +513,10 @@ mod tests {
     #[test]
     fn parses_nested_and_escapes() {
         let v = Json::parse(r#"{"a":{"b":[1,2,"he\"llo\n"]},"n":null}"#).unwrap();
-        assert_eq!(v.get("a").unwrap().get("b").unwrap(), &Json::arr(vec![
-            Json::num(1),
-            Json::num(2),
-            Json::str("he\"llo\n"),
-        ]));
+        assert_eq!(
+            v.get("a").unwrap().get("b").unwrap(),
+            &Json::arr(vec![Json::num(1), Json::num(2), Json::str("he\"llo\n"),])
+        );
     }
 
     #[test]
@@ -554,5 +553,75 @@ mod tests {
         assert_eq!(v["n"].as_i64(), Some(7));
         assert_eq!(v["arr"].as_array().map(Vec::len), Some(1));
         assert!(v["obj"].as_object().is_some());
+    }
+
+    #[test]
+    fn parse_errors_are_reported() {
+        // Trailing characters after a complete value.
+        assert!(Json::parse("123 garbage").unwrap_err().contains("trailing"));
+        // Unterminated string.
+        assert!(Json::parse("\"abc").unwrap_err().contains("unterminated"));
+        // Bad escape sequence.
+        assert!(Json::parse(r#""a\xb""#).unwrap_err().contains("escape"));
+        // Missing object value / malformed object.
+        assert!(Json::parse(r#"{"k"}"#).is_err());
+        assert!(Json::parse("[1,2").is_err()); // unterminated array
+        assert!(Json::parse("").is_err()); // empty input
+        assert!(Json::parse("nul").is_err()); // truncated literal
+    }
+
+    #[test]
+    fn parses_unicode_escape() {
+        let v = Json::parse(r#""éA""#).unwrap();
+        assert_eq!(v.as_str(), Some("éA"));
+    }
+
+    #[test]
+    fn pretty_prints_nested() {
+        let v = Json::obj(vec![
+            ("a", Json::int(1)),
+            ("b", Json::arr(vec![Json::int(2), Json::int(3)])),
+        ]);
+        let pretty = v.to_pretty();
+        // Indented, multi-line, and still re-parses to the same value.
+        assert!(pretty.contains("\n  \"a\": 1"));
+        assert!(pretty.contains('\n'));
+        assert_eq!(Json::parse(&pretty).unwrap(), v);
+        // Empty containers stay compact even in pretty mode.
+        assert_eq!(Json::arr(vec![]).to_pretty(), "[]");
+        assert_eq!(Json::obj(vec![]).to_pretty(), "{}");
+    }
+
+    #[test]
+    fn number_display_edge_cases() {
+        // Non-finite numbers are not valid JSON → rendered as null.
+        assert_eq!(Json::Num(f64::INFINITY).to_string(), "null");
+        assert_eq!(Json::Num(f64::NAN).to_string(), "null");
+        // Negative integral floats render without a decimal point.
+        assert_eq!(Json::Num(-7.0).to_string(), "-7");
+        // as_i64 rejects fractional numbers.
+        assert_eq!(Json::Num(2.5).as_i64(), None);
+        assert_eq!(Json::int(-42).as_i64(), Some(-42));
+    }
+
+    #[test]
+    fn accessors_return_none_on_type_mismatch() {
+        let v = Json::str("hi");
+        assert_eq!(v.as_f64(), None);
+        assert_eq!(v.as_bool(), None);
+        assert_eq!(v.as_array(), None);
+        assert_eq!(v.as_object(), None);
+        assert_eq!(v.get("x"), None);
+        // Index into a non-array / pointer past the end → Null / None.
+        assert!(Json::arr(vec![Json::int(1)])[9].is_null());
+        assert!(v.pointer("/0").is_none());
+    }
+
+    #[test]
+    fn string_escaping_roundtrips_control_chars() {
+        let s = "tab\tnewline\nquote\"slash\\bell\u{0008}";
+        let encoded = Json::str(s).to_string();
+        assert!(encoded.contains("\\t") && encoded.contains("\\n") && encoded.contains("\\b"));
+        assert_eq!(Json::parse(&encoded).unwrap().as_str(), Some(s));
     }
 }

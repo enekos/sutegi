@@ -36,7 +36,15 @@ type Database = Arc<Mutex<Db>>;
 /// Validation rules for creating a todo — Laravel `Validator` style.
 fn create_todo_rules() -> Ruleset {
     Ruleset::new()
-        .field("title", &[Rule::Required, Rule::Str, Rule::MinLen(1), Rule::MaxLen(200)])
+        .field(
+            "title",
+            &[
+                Rule::Required,
+                Rule::Str,
+                Rule::MinLen(1),
+                Rule::MaxLen(200),
+            ],
+        )
         .field("done", &[Rule::Bool])
 }
 
@@ -69,7 +77,10 @@ impl Tool for CreateTodo {
         "Create a new todo item with the given title."
     }
     fn parameters(&self) -> Json {
-        schema::object(vec![("title", schema::string("the todo's title"))], &["title"])
+        schema::object(
+            vec![("title", schema::string("the todo's title"))],
+            &["title"],
+        )
     }
     fn call(&self, args: Json) -> Result<Json, String> {
         let title = args
@@ -79,10 +90,23 @@ impl Tool for CreateTodo {
             .to_string();
         let id = {
             let db = self.db.lock().unwrap();
-            Todo::create(&db, &[("title", Value::Text(title.clone())), ("done", Value::Bool(false))])?
+            Todo::create(
+                &db,
+                &[
+                    ("title", Value::Text(title.clone())),
+                    ("done", Value::Bool(false)),
+                ],
+            )?
         };
-        self.queue.dispatch(NotifyJob { title: title.clone() });
-        Ok(Todo { id, title, done: false }.to_json())
+        self.queue.dispatch(NotifyJob {
+            title: title.clone(),
+        });
+        Ok(Todo {
+            id,
+            title,
+            done: false,
+        }
+        .to_json())
     }
 }
 
@@ -109,36 +133,6 @@ impl StreamTool for StreamAnswer {
         }
         sink.event("done", "{}")?;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod derive_tests {
-    use sutegi::prelude::*;
-
-    // No #[model(table)] → table inferred as snake_case + plural ("articles").
-    #[derive(Model)]
-    struct Article {
-        #[model(primary)]
-        id: i64,
-        title: String,
-        #[model(skip)]
-        cached: bool, // not a column; default-initialized on load
-    }
-
-    #[test]
-    fn auto_table_name_and_skip() {
-        let schema = Article::schema();
-        assert_eq!(schema.table, "articles");
-        assert_eq!(schema.columns.len(), 2); // `cached` is skipped
-
-        let a = Article { id: 1, title: "x".into(), cached: true };
-        assert_eq!(a.to_values().len(), 2); // skipped field not persisted
-
-        let row = sutegi::json::Json::parse(r#"{"id":5,"title":"y"}"#).unwrap();
-        let got = <Article as FromRow>::from_row(&row).unwrap();
-        assert_eq!(got.id, 5);
-        assert!(!got.cached); // default-initialized
     }
 }
 
@@ -176,15 +170,19 @@ fn main() -> std::io::Result<()> {
         .get("/__queue", "Background queue stats.", move |_req, _p| {
             json(200, &stats_queue.stats().to_json())
         })
-        .get("/stream", "SSE demo: stream three ticks then a done event.", |_req, _p| {
-            sse(|sink| {
-                for i in 1..=3 {
-                    sink.data(&format!("tick {}", i))?;
-                    std::thread::sleep(std::time::Duration::from_millis(80));
-                }
-                sink.event("done", "bye")
-            })
-        })
+        .get(
+            "/stream",
+            "SSE demo: stream three ticks then a done event.",
+            |_req, _p| {
+                sse(|sink| {
+                    for i in 1..=3 {
+                        sink.data(&format!("tick {}", i))?;
+                        std::thread::sleep(std::time::Duration::from_millis(80));
+                    }
+                    sink.event("done", "bye")
+                })
+            },
+        )
         .group("/api", vec![logger], move |g| {
             let list_db = Arc::clone(&list_db);
             let show_db = Arc::clone(&show_db);
@@ -197,13 +195,17 @@ fn main() -> std::io::Result<()> {
                     Err(e) => json(500, &Json::obj(vec![("error", Json::str(e))])),
                 }
             })
-            .get("/todos/:id", "Fetch one todo (route-model binding).", move |_req, p| {
-                let db = show_db.lock().unwrap();
-                match binding::model::<Todo>(&db, p, "id") {
-                    Ok(todo) => json(200, &todo.to_json()),
-                    Err(resp) => resp, // 404/500 already built
-                }
-            })
+            .get(
+                "/todos/:id",
+                "Fetch one todo (route-model binding).",
+                move |_req, p| {
+                    let db = show_db.lock().unwrap();
+                    match binding::model::<Todo>(&db, p, "id") {
+                        Ok(todo) => json(200, &todo.to_json()),
+                        Err(resp) => resp, // 404/500 already built
+                    }
+                },
+            )
             .post("/todos", "Create a todo (validated).", move |req, _p| {
                 let body = match json_body(req) {
                     Ok(b) => b,
@@ -218,16 +220,28 @@ fn main() -> std::io::Result<()> {
                         ]),
                     );
                 }
-                let title = body.get("title").and_then(|j| j.as_str()).unwrap_or("").to_string();
+                let title = body
+                    .get("title")
+                    .and_then(|j| j.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let done = body.get("done").and_then(|j| j.as_bool()).unwrap_or(false);
                 let id = {
                     let db = create_db.lock().unwrap();
-                    match Todo::create(&db, &[("title", Value::Text(title.clone())), ("done", Value::Bool(done))]) {
+                    match Todo::create(
+                        &db,
+                        &[
+                            ("title", Value::Text(title.clone())),
+                            ("done", Value::Bool(done)),
+                        ],
+                    ) {
                         Ok(id) => id,
                         Err(e) => return json(500, &Json::obj(vec![("error", Json::str(e))])),
                     }
                 };
-                create_queue.dispatch(NotifyJob { title: title.clone() });
+                create_queue.dispatch(NotifyJob {
+                    title: title.clone(),
+                });
                 json(201, &Todo { id, title, done }.to_json())
             })
         });
@@ -243,12 +257,50 @@ fn main() -> std::io::Result<()> {
     );
 
     // 12-factor config: bind 0.0.0.0 in a container; argv[1] still overrides.
-    let addr = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| format!("{}:{}", sutegi::env_or("HOST", "0.0.0.0"), sutegi::env_or("PORT", "8080")));
+    let addr = std::env::args().nth(1).unwrap_or_else(|| {
+        format!(
+            "{}:{}",
+            sutegi::env_or("HOST", "0.0.0.0"),
+            sutegi::env_or("PORT", "8080")
+        )
+    });
     println!("sutegi todo-demo on http://{addr}");
     println!("  ops:  /__health | /__ready | /__metrics | /__introspect");
     println!("  app:  /api/todos (GET, POST), /api/todos/:id, /stream, /__tools[/...]");
     // Graceful shutdown: SIGTERM (pod stop) drains in-flight requests.
     app.run_graceful(&addr)
+}
+
+#[cfg(test)]
+mod derive_tests {
+    use sutegi::prelude::*;
+
+    // No #[model(table)] → table inferred as snake_case + plural ("articles").
+    #[derive(Model)]
+    struct Article {
+        #[model(primary)]
+        id: i64,
+        title: String,
+        #[model(skip)]
+        cached: bool, // not a column; default-initialized on load
+    }
+
+    #[test]
+    fn auto_table_name_and_skip() {
+        let schema = Article::schema();
+        assert_eq!(schema.table, "articles");
+        assert_eq!(schema.columns.len(), 2); // `cached` is skipped
+
+        let a = Article {
+            id: 1,
+            title: "x".into(),
+            cached: true,
+        };
+        assert_eq!(a.to_values().len(), 2); // skipped field not persisted
+
+        let row = sutegi::json::Json::parse(r#"{"id":5,"title":"y"}"#).unwrap();
+        let got = <Article as FromRow>::from_row(&row).unwrap();
+        assert_eq!(got.id, 5);
+        assert!(!got.cached); // default-initialized
+    }
 }

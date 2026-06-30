@@ -21,9 +21,9 @@ use aatxe_bench::{bench, keep, Suite};
 use sutegi::http::{parse_request, Limits};
 use sutegi::json::Json;
 use sutegi::orm::db::Db;
-use sutegi::orm::{QueryBuilder, Value};
+use sutegi::orm::{QueryBuilder, UpdateBuilder, Value};
 use sutegi::prelude::*;
-use sutegi::validate::{Rule, Ruleset};
+use sutegi::validate::{validate_schema, Rule, Ruleset};
 
 const ADDR: &str = "127.0.0.1:18099";
 
@@ -42,6 +42,9 @@ fn main() {
     let value = Json::parse(doc).unwrap();
     bench(&mut suite, "json_serialize", || {
         keep(value.to_string());
+    });
+    bench(&mut suite, "json_pretty", || {
+        keep(value.to_pretty());
     });
 
     // --- HTTP/1.1 request parsing ---
@@ -65,13 +68,41 @@ fn main() {
         keep(built);
     });
 
-    // --- Validation ---
+    // --- ORM update-builder emission ---
+    bench(&mut suite, "update_builder", || {
+        let built = UpdateBuilder::table("todos")
+            .set("title", Value::Text("new".into()))
+            .set("done", Value::Bool(true))
+            .filter("id", "=", Value::Int(5))
+            .build();
+        keep(built);
+    });
+
+    // --- ORM count-query emission ---
+    let count_qb = QueryBuilder::table("todos")
+        .join("users", "users.id", "todos.user_id")
+        .filter("done", "=", Value::Bool(false));
+    bench(&mut suite, "count_builder", || {
+        keep(count_qb.build_count());
+    });
+
+    // --- Validation (Ruleset) ---
     let rules = Ruleset::new()
         .field("title", &[Rule::Required, Rule::Str, Rule::MinLen(1), Rule::MaxLen(200)])
         .field("email", &[Rule::Required, Rule::Email]);
     let body = Json::parse(r#"{"title":"ship sutegi","email":"a@b.com"}"#).unwrap();
     bench(&mut suite, "validate_ruleset", || {
         keep(rules.validate(&body).is_ok());
+    });
+
+    // --- Validation (JSON Schema subset — the AI tool-arg path) ---
+    let arg_schema = Json::parse(
+        r#"{"type":"object","required":["title"],"properties":{"title":{"type":"string","minLength":1},"count":{"type":"integer","minimum":0}}}"#,
+    )
+    .unwrap();
+    let args = Json::parse(r#"{"title":"ship sutegi","count":3}"#).unwrap();
+    bench(&mut suite, "validate_schema", || {
+        keep(validate_schema(&arg_schema, &args).is_ok());
     });
 
     // --- Real SQLite operations (in-memory) ---
@@ -92,21 +123,56 @@ fn main() {
         bench(&mut suite, "sqlite_select_20", || {
             keep(db.select(&select).unwrap());
         });
+        let count_q = QueryBuilder::table("todos").filter("done", "=", Value::Bool(false));
+        bench(&mut suite, "sqlite_count", || {
+            keep(db.count(&count_q).unwrap());
+        });
     }
 
-    // --- End-to-end: full request over a live TCP socket ---
+    // --- End-to-end over a live TCP socket (connection-per-request) ---
     bench(&mut suite, "e2e_request", || {
         keep(http_get("/bench"));
     });
+    bench(&mut suite, "e2e_introspect", || {
+        keep(http_get("/__introspect"));
+    });
+    bench(&mut suite, "e2e_post_echo", || {
+        keep(http_post("/echo", r#"{"x":1}"#));
+    });
+    bench(&mut suite, "e2e_tool_call", || {
+        keep(http_post("/__tools/echo", r#"{"msg":"hi"}"#));
+    });
 
     suite.emit_stdout();
+}
+
+/// An echo tool so the e2e bench can exercise the AI invoke + validate path.
+struct BenchEcho;
+impl Tool for BenchEcho {
+    fn name(&self) -> &str {
+        "echo"
+    }
+    fn description(&self) -> &str {
+        "Echo a message back."
+    }
+    fn parameters(&self) -> Json {
+        schema::object(vec![("msg", schema::string("text to echo"))], &["msg"])
+    }
+    fn call(&self, args: Json) -> Result<Json, String> {
+        Ok(Json::obj(vec![("echo", Json::str(args.get("msg").and_then(Json::as_str).unwrap_or("")))]))
+    }
 }
 
 /// Start a sutegi server on ADDR in a background thread.
 fn spawn_server() {
     thread::spawn(|| {
         let app = App::new("bench-server")
-            .get("/bench", "Bench endpoint", |_req, _p| text(200, "ok"));
+            .get("/bench", "Bench endpoint", |_req, _p| text(200, "ok"))
+            .post("/echo", "Echo a JSON body back", |req, _p| {
+                json(200, &json_body(req).unwrap_or(Json::Null))
+            });
+        // Mount the AI tool surface so e2e_tool_call has a real endpoint.
+        let app = sutegi::ai::mount(app, ToolRegistry::new().add(BenchEcho));
         let _ = app.run(ADDR);
     });
 }
@@ -126,6 +192,21 @@ fn wait_ready() {
 fn http_get(path: &str) -> usize {
     let mut stream = TcpStream::connect(ADDR).expect("connect");
     let req = format!("GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", path);
+    stream.write_all(req.as_bytes()).expect("write");
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).expect("read");
+    buf.len()
+}
+
+/// One full HTTP/1.1 POST round-trip with a JSON body.
+fn http_post(path: &str, body: &str) -> usize {
+    let mut stream = TcpStream::connect(ADDR).expect("connect");
+    let req = format!(
+        "POST {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        path,
+        body.len(),
+        body
+    );
     stream.write_all(req.as_bytes()).expect("write");
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).expect("read");

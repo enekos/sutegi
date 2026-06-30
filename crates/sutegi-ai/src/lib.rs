@@ -50,6 +50,8 @@ impl ToolRegistry {
         }
     }
 
+    // Builder-style `add`, not the arithmetic `Add` trait — keep the name (public API).
+    #[allow(clippy::should_implement_trait)]
     pub fn add(mut self, tool: impl Tool) -> ToolRegistry {
         self.tools.push(Box::new(tool));
         self
@@ -63,12 +65,18 @@ impl ToolRegistry {
 
     /// Look up a tool by name.
     pub fn tool(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools.iter().find(|t| t.name() == name).map(|b| b.as_ref())
+        self.tools
+            .iter()
+            .find(|t| t.name() == name)
+            .map(|b| b.as_ref())
     }
 
     /// Look up a streaming tool by name.
     pub fn stream_tool(&self, name: &str) -> Option<&dyn StreamTool> {
-        self.stream_tools.iter().find(|t| t.name() == name).map(|b| b.as_ref())
+        self.stream_tools
+            .iter()
+            .find(|t| t.name() == name)
+            .map(|b| b.as_ref())
     }
 
     /// One manifest entry per tool, in the `{name, description, input_schema,
@@ -82,7 +90,12 @@ impl ToolRegistry {
             .map(|t| manifest_entry(t.name(), t.description(), t.parameters(), false))
             .collect();
         for t in &self.stream_tools {
-            entries.push(manifest_entry(t.name(), t.description(), t.parameters(), true));
+            entries.push(manifest_entry(
+                t.name(),
+                t.description(),
+                t.parameters(),
+                true,
+            ));
         }
         entries
     }
@@ -139,7 +152,10 @@ pub fn mount(mut app: App, registry: ToolRegistry) -> App {
                 None => {
                     return json(
                         404,
-                        &Json::obj(vec![("error", Json::str(format!("unknown tool '{}'", name)))]),
+                        &Json::obj(vec![(
+                            "error",
+                            Json::str(format!("unknown tool '{}'", name)),
+                        )]),
                     );
                 }
             };
@@ -176,7 +192,10 @@ pub fn mount(mut app: App, registry: ToolRegistry) -> App {
                 None => {
                     return json(
                         404,
-                        &Json::obj(vec![("error", Json::str(format!("unknown streaming tool '{}'", name)))]),
+                        &Json::obj(vec![(
+                            "error",
+                            Json::str(format!("unknown streaming tool '{}'", name)),
+                        )]),
                     )
                 }
                 Some(tool) => {
@@ -301,5 +320,102 @@ mod tests {
             .call("echo", Json::obj(vec![("msg", Json::str("hi"))]))
             .unwrap();
         assert_eq!(out.get("echo").unwrap(), &Json::str("hi"));
+    }
+
+    #[test]
+    fn unknown_tool_is_reported() {
+        let reg = ToolRegistry::new().add(Echo);
+        let err = reg.call("nope", Json::obj(vec![])).unwrap_err();
+        assert!(err.contains("unknown tool"));
+        assert!(reg.tool("nope").is_none());
+        assert!(reg.tool("echo").is_some());
+    }
+
+    #[test]
+    fn schema_builders_emit_jsonschema() {
+        let s = schema::object(
+            vec![
+                ("name", schema::string("the name")),
+                ("age", schema::integer("the age")),
+                ("admin", schema::boolean("is admin")),
+            ],
+            &["name"],
+        );
+        assert_eq!(s.get("type").and_then(Json::as_str), Some("object"));
+        assert_eq!(
+            s.pointer("/properties/age/type").and_then(Json::as_str),
+            Some("integer")
+        );
+        let required = s.get("required").and_then(Json::as_array).unwrap();
+        assert_eq!(required.len(), 1);
+        assert_eq!(required[0], Json::str("name"));
+    }
+
+    #[test]
+    fn enum_constraint_is_enforced_on_call() {
+        struct SetLevel;
+        impl Tool for SetLevel {
+            fn name(&self) -> &str {
+                "set_level"
+            }
+            fn description(&self) -> &str {
+                "Set a level."
+            }
+            fn parameters(&self) -> Json {
+                schema::object(
+                    vec![(
+                        "level",
+                        Json::obj(vec![(
+                            "enum",
+                            Json::arr(vec![Json::str("low"), Json::str("high")]),
+                        )]),
+                    )],
+                    &["level"],
+                )
+            }
+            fn call(&self, _args: Json) -> Result<Json, String> {
+                Ok(Json::obj(vec![("ok", Json::Bool(true))]))
+            }
+        }
+        let reg = ToolRegistry::new().add(SetLevel);
+        assert!(reg
+            .call("set_level", Json::obj(vec![("level", Json::str("mid"))]))
+            .is_err());
+        assert!(reg
+            .call("set_level", Json::obj(vec![("level", Json::str("high"))]))
+            .is_ok());
+    }
+
+    #[test]
+    fn streaming_tools_carry_flag_in_manifest() {
+        struct Ticker;
+        impl StreamTool for Ticker {
+            fn name(&self) -> &str {
+                "ticker"
+            }
+            fn description(&self) -> &str {
+                "stream ticks"
+            }
+            fn parameters(&self) -> Json {
+                schema::object(vec![], &[])
+            }
+            fn run(&self, _args: Json, sink: &mut SseSink) -> std::io::Result<()> {
+                sink.data("tick")
+            }
+        }
+        let reg = ToolRegistry::new().add(Echo).add_stream(Ticker);
+        assert!(reg.stream_tool("ticker").is_some());
+        let entries = reg.schema_entries();
+        // The plain tool is non-streaming; the SSE tool is flagged streaming.
+        let echo = entries
+            .iter()
+            .find(|e| e.get("name") == Some(&Json::str("echo")))
+            .unwrap();
+        let ticker = entries
+            .iter()
+            .find(|e| e.get("name") == Some(&Json::str("ticker")))
+            .unwrap();
+        assert_eq!(echo.get("streaming").and_then(Json::as_bool), Some(false));
+        assert_eq!(ticker.get("streaming").and_then(Json::as_bool), Some(true));
     }
 }

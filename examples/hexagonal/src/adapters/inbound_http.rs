@@ -40,11 +40,13 @@ pub fn register(
                 .unwrap_or_default();
             respond_created(create.execute(title))
         })
-        .post("/todos/:id/complete", "Mark a todo complete.", move |_req, p| {
-            match p.get("id").and_then(|s| s.parse::<i64>().ok()) {
+        .post(
+            "/todos/:id/complete",
+            "Mark a todo complete.",
+            move |_req, p| match p.get("id").and_then(|s| s.parse::<i64>().ok()) {
                 Some(id) => respond(complete.execute(id)),
                 None => AppError::invalid("id must be an integer").to_response(),
-            }
-        })
+            },
+        )
     })
 }

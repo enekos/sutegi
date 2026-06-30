@@ -202,11 +202,14 @@ pub trait Query: Send + Sync {
 /// command that caused them.
 pub trait Event: std::any::Any + Send + Sync + 'static {}
 
+/// A single event handler: receives the type-erased event payload.
+type EventHandler = Box<dyn Fn(&dyn std::any::Any) + Send + Sync>;
+
 /// A type-keyed event bus. Register handlers with [`EventBus::on`] and fan an
 /// event out to all handlers for its type with [`EventBus::dispatch`].
 #[derive(Default)]
 pub struct EventBus {
-    handlers: std::collections::HashMap<std::any::TypeId, Vec<Box<dyn Fn(&dyn std::any::Any) + Send + Sync>>>,
+    handlers: std::collections::HashMap<std::any::TypeId, Vec<EventHandler>>,
 }
 
 impl EventBus {
@@ -216,7 +219,10 @@ impl EventBus {
 
     /// Register a handler for events of type `E`.
     pub fn on<E: Event, F: Fn(&E) + Send + Sync + 'static>(&mut self, handler: F) {
-        let entry = self.handlers.entry(std::any::TypeId::of::<E>()).or_default();
+        let entry = self
+            .handlers
+            .entry(std::any::TypeId::of::<E>())
+            .or_default();
         entry.push(Box::new(move |any| {
             if let Some(event) = any.downcast_ref::<E>() {
                 handler(event);
@@ -259,21 +265,34 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc;
 
-        struct CreateThing { name: String }
+        struct CreateThing {
+            name: String,
+        }
         impl Command for CreateThing {
             type Output = String;
             fn execute(self) -> AppResult<String> {
-                if self.name.is_empty() { return Err(AppError::invalid("empty")); }
+                if self.name.is_empty() {
+                    return Err(AppError::invalid("empty"));
+                }
                 Ok(format!("created:{}", self.name))
             }
         }
-        assert_eq!(CreateThing { name: "x".into() }.execute().unwrap(), "created:x");
-        assert!(CreateThing { name: String::new() }.execute().is_err());
+        assert_eq!(
+            CreateThing { name: "x".into() }.execute().unwrap(),
+            "created:x"
+        );
+        assert!(CreateThing {
+            name: String::new()
+        }
+        .execute()
+        .is_err());
 
         struct CountThings;
         impl Query for CountThings {
             type Output = i64;
-            fn execute(&self) -> AppResult<i64> { Ok(42) }
+            fn execute(&self) -> AppResult<i64> {
+                Ok(42)
+            }
         }
         assert_eq!(CountThings.execute().unwrap(), 42);
 
@@ -282,7 +301,9 @@ mod tests {
         let hits = Arc::new(AtomicU32::new(0));
         let h = Arc::clone(&hits);
         let mut bus = EventBus::new();
-        bus.on::<ThingCreated, _>(move |_e| { h.fetch_add(1, Ordering::Relaxed); });
+        bus.on::<ThingCreated, _>(move |_e| {
+            h.fetch_add(1, Ordering::Relaxed);
+        });
         bus.dispatch(&ThingCreated);
         bus.dispatch(&ThingCreated);
         assert_eq!(hits.load(Ordering::Relaxed), 2);
@@ -294,5 +315,84 @@ mod tests {
         assert_eq!(ok.status, 200);
         let err: Response = respond::<Json>(Err(AppError::conflict("dup")));
         assert_eq!(err.status, 409);
+    }
+
+    #[test]
+    fn all_error_variants_map_status_kind_message() {
+        let cases = [
+            (AppError::not_found("a"), 404u16, "not_found"),
+            (AppError::invalid("b"), 422, "invalid"),
+            (AppError::conflict("c"), 409, "conflict"),
+            (AppError::unauthorized("d"), 401, "unauthorized"),
+            (AppError::internal("e"), 500, "internal"),
+        ];
+        for (err, status, kind) in cases {
+            assert_eq!(err.status(), status);
+            assert_eq!(err.kind(), kind);
+            // Display is "<kind>: <message>".
+            assert_eq!(format!("{}", err), format!("{}: {}", kind, err.message()));
+            // The canonical response carries status + a {error,kind} body.
+            assert_eq!(err.to_response().status, status);
+        }
+    }
+
+    #[test]
+    fn respond_created_is_201() {
+        let r: Response = respond_created::<Json>(Ok(Json::str("x")));
+        assert_eq!(r.status, 201);
+        let e: Response = respond_created::<Json>(Err(AppError::invalid("bad")));
+        assert_eq!(e.status, 422);
+    }
+
+    #[test]
+    fn into_json_impls() {
+        // () presents as {ok:true}.
+        assert_eq!(().into_json(), Json::obj(vec![("ok", Json::Bool(true))]));
+        // Option maps None → Null, Some → inner.
+        assert_eq!(None::<Json>.into_json(), Json::Null);
+        assert_eq!(Some(Json::int(3)).into_json(), Json::int(3));
+        // Vec maps element-wise.
+        assert_eq!(
+            vec![Json::int(1), Json::int(2)].into_json(),
+            Json::arr(vec![Json::int(1), Json::int(2)])
+        );
+        // Json is identity.
+        assert_eq!(Json::str("x").into_json(), Json::str("x"));
+    }
+
+    #[test]
+    fn use_case_executes() {
+        struct Doubler;
+        impl UseCase for Doubler {
+            type Input = i64;
+            type Output = i64;
+            fn execute(&self, input: i64) -> AppResult<i64> {
+                if input < 0 {
+                    return Err(AppError::invalid("negative"));
+                }
+                Ok(input * 2)
+            }
+        }
+        assert_eq!(Doubler.execute(21).unwrap(), 42);
+        assert_eq!(Doubler.execute(-1).unwrap_err().status(), 422);
+    }
+
+    #[test]
+    fn event_bus_only_fires_matching_type() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        struct A;
+        impl Event for A {}
+        struct B;
+        impl Event for B {}
+        let hits = Arc::new(AtomicU32::new(0));
+        let h = Arc::clone(&hits);
+        let mut bus = EventBus::new();
+        bus.on::<A, _>(move |_| {
+            h.fetch_add(1, Ordering::Relaxed);
+        });
+        bus.dispatch(&A); // matches
+        bus.dispatch(&B); // no handler registered → ignored
+        assert_eq!(hits.load(Ordering::Relaxed), 1);
     }
 }
