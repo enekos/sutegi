@@ -168,18 +168,21 @@ hex       hexagonal-architecture primitives`,
     },
     {
       id: 'orm', icon: Database, title: 'ORM & query builder',
-      intro: 'A driver-agnostic, parameterized query builder (SELECT / UPDATE / DELETE), migrations, and transactions. Enable the sqlite feature for a runnable, bundled engine. Rows come back typed or as JSON.',
-      code: `let db = Db::memory()?;
-Todo::migrate(&db)?;
-
+      intro: 'A driver-agnostic, parameterized builder (SELECT/UPDATE/DELETE) with OR groups, IS NULL, LIKE, joins, GROUP BY, DISTINCT, and a raw escape hatch. Plus migrations, transactions, counts, upsert, and pagination. Enable the sqlite feature for a runnable bundled engine; rows come back typed or as JSON.',
+      code: `Todo::migrate(&db)?;
 let id = Todo::create(&db, &[("title", Value::Text("x".into()))])?;
-let one: Option<Todo> = db.fetch_one(&Todo::query().filter("id", "=", Value::Int(id)))?;
 
 QueryBuilder::table("todos")
-    .filter_in("id", vec![Value::Int(1), Value::Int(2)])
-    .order_by("done", false).limit(20).offset(40).build();
+    .filter("done", "=", Value::Bool(false))
+    .or_group(&[("priority", "=", Value::Text("high".into())),
+                ("pinned", "=", Value::Bool(true))])   // AND (a OR b)
+    .where_not_null("title").like("title", "%sutegi%")
+    .join("users", "users.id", "todos.user_id")
+    .order_by("id", true).build();
 
-db.transaction(|tx| { tx.insert("todos", &[/* … */])?; Ok(()) })?;`,
+db.transaction(|tx| { tx.insert("todos", &[/* … */])?; Ok(()) })?;
+Todo::update(&db, Value::Int(id), &[("done", Value::Bool(true))])?;
+let page = db.paginate(&Todo::query().order_by("id", true), 2, 20)?;`,
     },
     {
       id: 'derive', icon: FileCode, title: '#[derive(Model)]',

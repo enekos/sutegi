@@ -146,6 +146,32 @@ pub trait Model {
         let rows = conn.fetch::<Self>(&Self::query().filter(Self::primary_key(), "=", id).limit(1))?;
         Ok(rows.into_iter().next())
     }
+
+    /// Total row count for this model's table.
+    #[cfg(feature = "sqlite")]
+    fn count(conn: &db::Db) -> Result<i64, String> {
+        conn.count(&Self::query())
+    }
+
+    /// Update columns on the row matching the primary key. Returns rows affected.
+    #[cfg(feature = "sqlite")]
+    fn update(conn: &db::Db, id: Value, sets: &[(&str, Value)]) -> Result<usize, String> {
+        let mut builder = UpdateBuilder::table(Self::table());
+        for (col, value) in sets {
+            builder = builder.set(col, value.clone());
+        }
+        let (sql, params) = builder.filter(Self::primary_key(), "=", id).build();
+        conn.execute(&sql, &params)
+    }
+
+    /// Delete the row matching the primary key. Returns `true` if a row was removed.
+    #[cfg(feature = "sqlite")]
+    fn delete(conn: &db::Db, id: Value) -> Result<bool, String> {
+        let (sql, params) = DeleteBuilder::table(Self::table())
+            .filter(Self::primary_key(), "=", id)
+            .build();
+        Ok(conn.execute(&sql, &params)? > 0)
+    }
 }
 
 /// A thin, runnable SQLite execution layer over the query builder. Available
@@ -226,6 +252,68 @@ pub mod db {
         pub fn fetch_one<T: crate::FromRow>(&self, qb: &QueryBuilder) -> Result<Option<T>, String> {
             let rows = self.select(qb)?;
             rows.first().map(T::from_row).transpose()
+        }
+
+        /// Count rows matching a query builder (uses its `build_count`).
+        pub fn count(&self, qb: &QueryBuilder) -> Result<i64, String> {
+            let (sql, params) = qb.build_count();
+            let row = self.query_one(&sql, &params)?;
+            Ok(row
+                .and_then(|r| r.get("count").and_then(|j| j.as_f64()))
+                .map(|f| f as i64)
+                .unwrap_or(0))
+        }
+
+        /// Whether any row matches.
+        pub fn exists(&self, qb: &QueryBuilder) -> Result<bool, String> {
+            Ok(self.count(qb)? > 0)
+        }
+
+        /// Run a paginated query: returns the page's rows (as JSON) plus the
+        /// total count. `page` is 1-based.
+        pub fn paginate(&self, qb: &QueryBuilder, page: i64, per_page: i64) -> Result<crate::Page<Json>, String> {
+            let total = self.count(qb)?;
+            let page = page.max(1);
+            let per_page = per_page.max(1);
+            let items = self.select(&qb.clone().limit(per_page).offset((page - 1) * per_page))?;
+            Ok(crate::Page { items, total, page, per_page })
+        }
+
+        /// Typed variant of [`paginate`](Db::paginate).
+        pub fn paginate_typed<T: crate::FromRow>(
+            &self,
+            qb: &QueryBuilder,
+            page: i64,
+            per_page: i64,
+        ) -> Result<crate::Page<T>, String> {
+            let total = self.count(qb)?;
+            let page = page.max(1);
+            let per_page = per_page.max(1);
+            let items = self.fetch::<T>(&qb.clone().limit(per_page).offset((page - 1) * per_page))?;
+            Ok(crate::Page { items, total, page, per_page })
+        }
+
+        /// Insert, or update on primary/unique-key conflict (SQLite UPSERT).
+        /// Non-conflict columns are overwritten with the new values.
+        pub fn upsert(&self, table: &str, cols: &[(&str, Value)], conflict: &str) -> Result<i64, String> {
+            let names: Vec<&str> = cols.iter().map(|(n, _)| *n).collect();
+            let placeholders = vec!["?"; cols.len()].join(", ");
+            let updates: Vec<String> = names
+                .iter()
+                .filter(|n| **n != conflict)
+                .map(|n| format!("{} = excluded.{}", n, n))
+                .collect();
+            let sql = format!(
+                "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT({}) DO UPDATE SET {}",
+                table,
+                names.join(", "),
+                placeholders,
+                conflict,
+                updates.join(", ")
+            );
+            let bound: Vec<SqlValue> = cols.iter().map(|(_, v)| to_sql(v)).collect();
+            self.conn.execute(&sql, params_from_iter(bound)).map_err(|e| e.to_string())?;
+            Ok(self.conn.last_insert_rowid())
         }
 
         /// Run a SELECT and return only the first row (as JSON), if any.
@@ -360,6 +448,30 @@ pub mod db {
             let (dsql, dparams) = crate::DeleteBuilder::table("todos").filter("id", "=", Value::Int(1)).build();
             assert_eq!(db.execute(&dsql, &dparams).unwrap(), 1);
         }
+
+        #[test]
+        fn count_exists_paginate_upsert() {
+            let db = Db::memory().unwrap();
+            db.migrate(&todos_schema()).unwrap();
+            for i in 0..7 {
+                db.insert("todos", &[("title", Value::Text(format!("t{i}"))), ("done", Value::Bool(false))]).unwrap();
+            }
+            assert_eq!(db.count(&QueryBuilder::table("todos")).unwrap(), 7);
+            assert!(db.exists(&QueryBuilder::table("todos").filter("id", "=", Value::Int(3))).unwrap());
+            assert!(!db.exists(&QueryBuilder::table("todos").filter("id", "=", Value::Int(99))).unwrap());
+
+            let page = db.paginate(&QueryBuilder::table("todos").order_by("id", false), 2, 3).unwrap();
+            assert_eq!(page.total, 7);
+            assert_eq!(page.items.len(), 3);
+            assert_eq!(page.total_pages(), 3);
+            assert!(page.has_next() && page.has_prev());
+
+            // UPSERT on the primary key: second call updates, doesn't duplicate.
+            db.upsert("todos", &[("id", Value::Int(1)), ("title", Value::Text("upserted".into())), ("done", Value::Bool(true))], "id").unwrap();
+            assert_eq!(db.count(&QueryBuilder::table("todos")).unwrap(), 7);
+            let row = db.query_one("SELECT title FROM todos WHERE id = 1", &[]).unwrap().unwrap();
+            assert_eq!(row.get("title").unwrap(), &Json::str("upserted"));
+        }
     }
 }
 
@@ -473,14 +585,78 @@ pub fn create_table_sql(schema: &TableSchema) -> String {
     )
 }
 
-/// A fluent, parameterized SELECT builder. Emits `?` placeholders and the
-/// matching ordered parameter list — driver-agnostic and injection-safe.
+/// A single `WHERE` predicate, shared by the SELECT/UPDATE/DELETE builders.
+/// Predicates are joined with `AND`; use [`Predicate::Or`] for an OR group.
+#[derive(Clone, Debug)]
+enum Predicate {
+    Cmp(String, String, Value),       // col op ?
+    In(String, Vec<Value>),           // col IN (?, …)  — empty => "0 = 1"
+    IsNull(String, bool),             // true => IS NULL, false => IS NOT NULL
+    Or(Vec<(String, String, Value)>), // (a op ? OR b op ? …)
+    Raw(String, Vec<Value>),          // an arbitrary parenthesized fragment
+}
+
+/// Render a predicate list to a `" WHERE …"` clause (empty string if none) plus
+/// the ordered bound parameters. Shared by every builder so AND/OR/NULL/raw
+/// behave identically across SELECT, UPDATE, and DELETE.
+fn render_predicates(preds: &[Predicate]) -> (String, Vec<Value>) {
+    if preds.is_empty() {
+        return (String::new(), Vec::new());
+    }
+    let mut clauses = Vec::new();
+    let mut params = Vec::new();
+    for p in preds {
+        match p {
+            Predicate::Cmp(c, op, v) => {
+                params.push(v.clone());
+                clauses.push(format!("{} {} ?", c, op));
+            }
+            Predicate::In(c, values) => {
+                if values.is_empty() {
+                    clauses.push("0 = 1".to_string());
+                } else {
+                    let marks = vec!["?"; values.len()].join(", ");
+                    clauses.push(format!("{} IN ({})", c, marks));
+                    params.extend(values.iter().cloned());
+                }
+            }
+            Predicate::IsNull(c, is_null) => {
+                clauses.push(format!("{} IS {}NULL", c, if *is_null { "" } else { "NOT " }));
+            }
+            Predicate::Or(group) => {
+                if group.is_empty() {
+                    clauses.push("0 = 1".to_string());
+                } else {
+                    let parts: Vec<String> = group
+                        .iter()
+                        .map(|(c, op, v)| {
+                            params.push(v.clone());
+                            format!("{} {} ?", c, op)
+                        })
+                        .collect();
+                    clauses.push(format!("({})", parts.join(" OR ")));
+                }
+            }
+            Predicate::Raw(frag, ps) => {
+                clauses.push(format!("({})", frag));
+                params.extend(ps.iter().cloned());
+            }
+        }
+    }
+    (format!(" WHERE {}", clauses.join(" AND ")), params)
+}
+
+/// A fluent, parameterized SELECT builder with filters, OR groups, joins,
+/// grouping, ordering, and paging. Emits `?` placeholders and the matching
+/// ordered parameter list — driver-agnostic and injection-safe.
 #[derive(Clone, Debug)]
 pub struct QueryBuilder {
     table: String,
+    distinct: bool,
     columns: Vec<String>,
-    wheres: Vec<(String, String, Value)>,
-    in_clauses: Vec<(String, Vec<Value>)>,
+    joins: Vec<String>,
+    preds: Vec<Predicate>,
+    group_by: Vec<String>,
     order: Vec<(String, bool)>,
     limit: Option<i64>,
     offset: Option<i64>,
@@ -490,9 +666,11 @@ impl QueryBuilder {
     pub fn table(table: &str) -> QueryBuilder {
         QueryBuilder {
             table: table.to_string(),
+            distinct: false,
             columns: Vec::new(),
-            wheres: Vec::new(),
-            in_clauses: Vec::new(),
+            joins: Vec::new(),
+            preds: Vec::new(),
+            group_by: Vec::new(),
             order: Vec::new(),
             limit: None,
             offset: None,
@@ -504,15 +682,71 @@ impl QueryBuilder {
         self
     }
 
-    /// Add a `WHERE col <op> ?` clause. `op` is e.g. `=`, `>`, `LIKE`.
+    /// `SELECT DISTINCT …`.
+    pub fn distinct(mut self) -> QueryBuilder {
+        self.distinct = true;
+        self
+    }
+
+    /// Add a `WHERE col <op> ?` clause (AND-joined). `op` is e.g. `=`, `>`, `LIKE`.
     pub fn filter(mut self, col: &str, op: &str, value: Value) -> QueryBuilder {
-        self.wheres.push((col.to_string(), op.to_string(), value));
+        self.preds.push(Predicate::Cmp(col.to_string(), op.to_string(), value));
         self
     }
 
     /// Add a `WHERE col IN (?, ?, …)` clause. An empty list matches nothing.
     pub fn filter_in(mut self, col: &str, values: Vec<Value>) -> QueryBuilder {
-        self.in_clauses.push((col.to_string(), values));
+        self.preds.push(Predicate::In(col.to_string(), values));
+        self
+    }
+
+    /// `WHERE col IS NULL`.
+    pub fn where_null(mut self, col: &str) -> QueryBuilder {
+        self.preds.push(Predicate::IsNull(col.to_string(), true));
+        self
+    }
+
+    /// `WHERE col IS NOT NULL`.
+    pub fn where_not_null(mut self, col: &str) -> QueryBuilder {
+        self.preds.push(Predicate::IsNull(col.to_string(), false));
+        self
+    }
+
+    /// An OR group, AND-joined with the rest: `AND (a op ? OR b op ? …)`.
+    pub fn or_group(mut self, group: &[(&str, &str, Value)]) -> QueryBuilder {
+        self.preds.push(Predicate::Or(
+            group.iter().map(|(c, op, v)| (c.to_string(), op.to_string(), v.clone())).collect(),
+        ));
+        self
+    }
+
+    /// A `col LIKE ?` convenience.
+    pub fn like(self, col: &str, pattern: &str) -> QueryBuilder {
+        self.filter(col, "LIKE", Value::Text(pattern.to_string()))
+    }
+
+    /// An arbitrary parenthesized WHERE fragment with its own bound params —
+    /// an escape hatch for SQL the builder doesn't model.
+    pub fn where_raw(mut self, fragment: &str, params: Vec<Value>) -> QueryBuilder {
+        self.preds.push(Predicate::Raw(fragment.to_string(), params));
+        self
+    }
+
+    /// `INNER JOIN other ON left = right`.
+    pub fn join(mut self, other: &str, left: &str, right: &str) -> QueryBuilder {
+        self.joins.push(format!("JOIN {} ON {} = {}", other, left, right));
+        self
+    }
+
+    /// `LEFT JOIN other ON left = right`.
+    pub fn left_join(mut self, other: &str, left: &str, right: &str) -> QueryBuilder {
+        self.joins.push(format!("LEFT JOIN {} ON {} = {}", other, left, right));
+        self
+    }
+
+    /// `GROUP BY …` (call with the grouping columns).
+    pub fn group_by(mut self, cols: &[&str]) -> QueryBuilder {
+        self.group_by = cols.iter().map(|c| c.to_string()).collect();
         self
     }
 
@@ -532,42 +766,25 @@ impl QueryBuilder {
         self
     }
 
-    /// The `WHERE` clause shared by `build` and `build_count`.
-    fn where_clause(&self) -> (String, Vec<Value>) {
-        let mut clauses = Vec::new();
-        let mut params = Vec::new();
-        for (c, op, v) in &self.wheres {
-            params.push(v.clone());
-            clauses.push(format!("{} {} ?", c, op));
+    fn from_and_joins(&self) -> String {
+        let mut s = self.table.clone();
+        for j in &self.joins {
+            s.push(' ');
+            s.push_str(j);
         }
-        for (c, values) in &self.in_clauses {
-            if values.is_empty() {
-                // IN () is invalid SQL; encode "matches nothing".
-                clauses.push("0 = 1".to_string());
-                continue;
-            }
-            let marks = vec!["?"; values.len()].join(", ");
-            clauses.push(format!("{} IN ({})", c, marks));
-            params.extend(values.iter().cloned());
-        }
-        let sql = if clauses.is_empty() {
-            String::new()
-        } else {
-            format!(" WHERE {}", clauses.join(" AND "))
-        };
-        (sql, params)
+        s
     }
 
     /// Build the SELECT SQL and ordered bound parameters.
     pub fn build(&self) -> (String, Vec<Value>) {
-        let cols = if self.columns.is_empty() {
-            "*".to_string()
-        } else {
-            self.columns.join(", ")
-        };
-        let (where_sql, params) = self.where_clause();
-        let mut sql = format!("SELECT {} FROM {}{}", cols, self.table, where_sql);
+        let cols = if self.columns.is_empty() { "*".to_string() } else { self.columns.join(", ") };
+        let distinct = if self.distinct { "DISTINCT " } else { "" };
+        let (where_sql, params) = render_predicates(&self.preds);
+        let mut sql = format!("SELECT {}{} FROM {}{}", distinct, cols, self.from_and_joins(), where_sql);
 
+        if !self.group_by.is_empty() {
+            sql.push_str(&format!(" GROUP BY {}", self.group_by.join(", ")));
+        }
         if !self.order.is_empty() {
             let terms: Vec<String> = self
                 .order
@@ -585,11 +802,11 @@ impl QueryBuilder {
         (sql, params)
     }
 
-    /// Build a `SELECT COUNT(*)` over the same table/filters (ignores
-    /// columns/order/limit), for pagination totals.
+    /// Build a `SELECT COUNT(*)` over the same table/joins/filters (ignores
+    /// columns/order/limit/group), for pagination totals.
     pub fn build_count(&self) -> (String, Vec<Value>) {
-        let (where_sql, params) = self.where_clause();
-        (format!("SELECT COUNT(*) AS count FROM {}{}", self.table, where_sql), params)
+        let (where_sql, params) = render_predicates(&self.preds);
+        (format!("SELECT COUNT(*) AS count FROM {}{}", self.from_and_joins(), where_sql), params)
     }
 }
 
@@ -598,19 +815,27 @@ impl QueryBuilder {
 pub struct UpdateBuilder {
     table: String,
     sets: Vec<(String, Value)>,
-    wheres: Vec<(String, String, Value)>,
+    preds: Vec<Predicate>,
 }
 
 impl UpdateBuilder {
     pub fn table(table: &str) -> UpdateBuilder {
-        UpdateBuilder { table: table.to_string(), sets: Vec::new(), wheres: Vec::new() }
+        UpdateBuilder { table: table.to_string(), sets: Vec::new(), preds: Vec::new() }
     }
     pub fn set(mut self, col: &str, value: Value) -> UpdateBuilder {
         self.sets.push((col.to_string(), value));
         self
     }
     pub fn filter(mut self, col: &str, op: &str, value: Value) -> UpdateBuilder {
-        self.wheres.push((col.to_string(), op.to_string(), value));
+        self.preds.push(Predicate::Cmp(col.to_string(), op.to_string(), value));
+        self
+    }
+    pub fn where_null(mut self, col: &str) -> UpdateBuilder {
+        self.preds.push(Predicate::IsNull(col.to_string(), true));
+        self
+    }
+    pub fn where_raw(mut self, fragment: &str, params: Vec<Value>) -> UpdateBuilder {
+        self.preds.push(Predicate::Raw(fragment.to_string(), params));
         self
     }
     /// Returns `(sql, params)`. Params are SET values first, then WHERE values.
@@ -624,19 +849,9 @@ impl UpdateBuilder {
                 format!("{} = ?", c)
             })
             .collect();
-        let mut sql = format!("UPDATE {} SET {}", self.table, assignments.join(", "));
-        if !self.wheres.is_empty() {
-            let clauses: Vec<String> = self
-                .wheres
-                .iter()
-                .map(|(c, op, v)| {
-                    params.push(v.clone());
-                    format!("{} {} ?", c, op)
-                })
-                .collect();
-            sql.push_str(&format!(" WHERE {}", clauses.join(" AND ")));
-        }
-        (sql, params)
+        let (where_sql, where_params) = render_predicates(&self.preds);
+        params.extend(where_params);
+        (format!("UPDATE {} SET {}{}", self.table, assignments.join(", "), where_sql), params)
     }
 }
 
@@ -644,32 +859,66 @@ impl UpdateBuilder {
 #[derive(Clone, Debug)]
 pub struct DeleteBuilder {
     table: String,
-    wheres: Vec<(String, String, Value)>,
+    preds: Vec<Predicate>,
 }
 
 impl DeleteBuilder {
     pub fn table(table: &str) -> DeleteBuilder {
-        DeleteBuilder { table: table.to_string(), wheres: Vec::new() }
+        DeleteBuilder { table: table.to_string(), preds: Vec::new() }
     }
     pub fn filter(mut self, col: &str, op: &str, value: Value) -> DeleteBuilder {
-        self.wheres.push((col.to_string(), op.to_string(), value));
+        self.preds.push(Predicate::Cmp(col.to_string(), op.to_string(), value));
+        self
+    }
+    pub fn where_null(mut self, col: &str) -> DeleteBuilder {
+        self.preds.push(Predicate::IsNull(col.to_string(), true));
+        self
+    }
+    pub fn where_raw(mut self, fragment: &str, params: Vec<Value>) -> DeleteBuilder {
+        self.preds.push(Predicate::Raw(fragment.to_string(), params));
         self
     }
     pub fn build(&self) -> (String, Vec<Value>) {
-        let mut params = Vec::new();
-        let mut sql = format!("DELETE FROM {}", self.table);
-        if !self.wheres.is_empty() {
-            let clauses: Vec<String> = self
-                .wheres
-                .iter()
-                .map(|(c, op, v)| {
-                    params.push(v.clone());
-                    format!("{} {} ?", c, op)
-                })
-                .collect();
-            sql.push_str(&format!(" WHERE {}", clauses.join(" AND ")));
+        let (where_sql, params) = render_predicates(&self.preds);
+        (format!("DELETE FROM {}{}", self.table, where_sql), params)
+    }
+}
+
+/// A page of results plus paging metadata — the return of `Db::paginate`.
+#[derive(Clone, Debug)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub total: i64,
+    pub page: i64,
+    pub per_page: i64,
+}
+
+impl<T> Page<T> {
+    pub fn total_pages(&self) -> i64 {
+        if self.per_page <= 0 {
+            0
+        } else {
+            (self.total + self.per_page - 1) / self.per_page
         }
-        (sql, params)
+    }
+    pub fn has_next(&self) -> bool {
+        self.page < self.total_pages()
+    }
+    pub fn has_prev(&self) -> bool {
+        self.page > 1
+    }
+}
+
+impl Page<sutegi_json::Json> {
+    /// `{ items, total, page, per_page, pages }` — ready to return from a handler.
+    pub fn to_json(&self) -> sutegi_json::Json {
+        sutegi_json::Json::obj(vec![
+            ("items", sutegi_json::Json::arr(self.items.clone())),
+            ("total", sutegi_json::Json::int(self.total)),
+            ("page", sutegi_json::Json::int(self.page)),
+            ("per_page", sutegi_json::Json::int(self.per_page)),
+            ("pages", sutegi_json::Json::int(self.total_pages())),
+        ])
     }
 }
 
@@ -740,6 +989,43 @@ mod tests {
             .filter("done", "=", Value::Bool(true))
             .build_count();
         assert_eq!(sql, "SELECT COUNT(*) AS count FROM t WHERE done = ?");
+    }
+
+    #[test]
+    fn or_group_null_like_and_joins() {
+        let (sql, params) = QueryBuilder::table("todos")
+            .filter("done", "=", Value::Bool(false))
+            .or_group(&[("priority", "=", Value::Text("high".into())), ("pinned", "=", Value::Bool(true))])
+            .where_not_null("title")
+            .like("title", "%sutegi%")
+            .build();
+        assert_eq!(
+            sql,
+            "SELECT * FROM todos WHERE done = ? AND (priority = ? OR pinned = ?) AND title IS NOT NULL AND title LIKE ?"
+        );
+        assert_eq!(params.len(), 4); // done, priority, pinned, like-pattern
+
+        let (jsql, _) = QueryBuilder::table("todos")
+            .select(&["todos.id", "users.name"])
+            .join("users", "users.id", "todos.user_id")
+            .group_by(&["users.name"])
+            .build();
+        assert_eq!(
+            jsql,
+            "SELECT todos.id, users.name FROM todos JOIN users ON users.id = todos.user_id GROUP BY users.name"
+        );
+
+        let (dsql, _) = QueryBuilder::table("t").distinct().select(&["a"]).build();
+        assert_eq!(dsql, "SELECT DISTINCT a FROM t");
+    }
+
+    #[test]
+    fn where_raw_fragment() {
+        let (sql, params) = QueryBuilder::table("t")
+            .where_raw("created_at > ? AND created_at < ?", vec![Value::Int(1), Value::Int(9)])
+            .build();
+        assert_eq!(sql, "SELECT * FROM t WHERE (created_at > ? AND created_at < ?)");
+        assert_eq!(params.len(), 2);
     }
 
     #[test]

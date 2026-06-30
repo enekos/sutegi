@@ -94,7 +94,7 @@ pub mod prelude {
     pub use sutegi_orm::row::FromRow;
     #[cfg(feature = "orm")]
     pub use sutegi_orm::{
-        ColType, Column, DeleteBuilder, Model, QueryBuilder, TableSchema, UpdateBuilder, Value,
+        ColType, Column, DeleteBuilder, Model, Page, QueryBuilder, TableSchema, UpdateBuilder, Value,
     };
     #[cfg(feature = "queue")]
     pub use sutegi_queue::{Job, Queue};

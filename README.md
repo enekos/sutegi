@@ -196,10 +196,27 @@ QueryBuilder::table("todos")
     .limit(20).offset(40).build();                    // paging
 QueryBuilder::table("todos").filter("done", "=", Value::Bool(true)).build_count();
 
+QueryBuilder::table("todos")
+    .filter("done", "=", Value::Bool(false))
+    .or_group(&[("priority", "=", Value::Text("high".into())),   // AND (a OR b)
+                ("pinned", "=", Value::Bool(true))])
+    .where_not_null("title")
+    .like("title", "%sutegi%")
+    .join("users", "users.id", "todos.user_id")                  // JOIN / LEFT JOIN
+    .group_by(&["users.name"]).distinct()
+    .where_raw("created_at > ?", vec![Value::Int(0)]);           // escape hatch
+
 UpdateBuilder::table("todos").set("done", Value::Bool(true)).filter("id", "=", Value::Int(5)).build();
 DeleteBuilder::table("todos").filter("id", "=", Value::Int(5)).build();
 
-db.transaction(|tx| { tx.insert("todos", &[/* … */])?; Ok(()) })?;   // COMMIT, or ROLLBACK on Err
+// Runnable (sqlite): transactions, counts, existence, upsert, pagination.
+db.transaction(|tx| { tx.insert("todos", &[/* … */])?; Ok(()) })?;     // COMMIT / ROLLBACK
+let n = Todo::count(&db)?;                                              // i64
+let ok = db.exists(&Todo::query().filter("id", "=", Value::Int(1)))?;  // bool
+db.upsert("todos", &[("id", Value::Int(1)), ("title", Value::Text("x".into()))], "id")?;
+Todo::update(&db, Value::Int(1), &[("done", Value::Bool(true))])?;     // by primary key
+Todo::delete(&db, Value::Int(1))?;
+let page = db.paginate(&Todo::query().order_by("id", true), 2, 20)?;   // Page { items, total, page, … }
 let one: Option<Todo> = db.fetch_one(&Todo::query().filter("id", "=", Value::Int(1)))?;
 ```
 
