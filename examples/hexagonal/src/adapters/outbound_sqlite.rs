@@ -40,7 +40,7 @@ impl SqliteTodoRepo {
     pub fn new(db: Arc<Mutex<Db>>) -> AppResult<SqliteTodoRepo> {
         {
             let guard = db.lock().unwrap();
-            TodoRow::migrate(&guard).map_err(AppError::internal)?;
+            TodoRow::migrate(&*guard).map_err(AppError::internal)?;
         }
         Ok(SqliteTodoRepo { db })
     }
@@ -49,20 +49,20 @@ impl SqliteTodoRepo {
 impl TodoRepository for SqliteTodoRepo {
     fn list(&self) -> AppResult<Vec<Todo>> {
         let db = self.db.lock().unwrap();
-        let rows = TodoRow::all_typed(&db).map_err(AppError::internal)?;
+        let rows = TodoRow::all_typed(&*db).map_err(AppError::internal)?;
         Ok(rows.into_iter().map(TodoRow::into_domain).collect())
     }
 
     fn find(&self, id: i64) -> AppResult<Option<Todo>> {
         let db = self.db.lock().unwrap();
-        let row = TodoRow::find_typed(&db, Value::Int(id)).map_err(AppError::internal)?;
+        let row = TodoRow::find_typed(&*db, Value::Int(id)).map_err(AppError::internal)?;
         Ok(row.map(TodoRow::into_domain))
     }
 
     fn insert(&self, todo: &Todo) -> AppResult<i64> {
         let db = self.db.lock().unwrap();
         TodoRow::create(
-            &db,
+            &*db,
             &[
                 ("title", Value::Text(todo.title.clone())),
                 ("done", Value::Bool(todo.done)),

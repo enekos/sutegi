@@ -4,15 +4,16 @@
 //! * SQLite ORM — `migrate` / `all_typed` / `find_typed` / `create`
 //! * route **groups** + group **middleware** (`/api`, request logger)
 //! * **route-model binding** — `GET /api/todos/:id` hydrates a `Todo` or 404s
-//! * a background **job queue** — creating a todo dispatches a notify job
 //! * Laravel-style **validation** + a first-class **AI tool** sharing the DB
+//!
+//! (The durable, cross-pod job queue lives in `sutegi-queue` and needs a
+//! PostgreSQL pool, so it isn't wired into this self-contained SQLite demo.)
 //!
 //! ```text
 //! curl localhost:8080/__introspect
 //! curl -X POST localhost:8080/api/todos -d '{"title":"ship sutegi"}'
 //! curl localhost:8080/api/todos
 //! curl localhost:8080/api/todos/1
-//! curl localhost:8080/__queue
 //! curl -X POST localhost:8080/__tools/create_todo -d '{"title":"via agent"}'
 //! ```
 
@@ -48,25 +49,9 @@ fn create_todo_rules() -> Ruleset {
         .field("done", &[Rule::Bool])
 }
 
-/// A background job dispatched after a todo is created.
-struct NotifyJob {
-    title: String,
-}
-
-impl Job for NotifyJob {
-    fn name(&self) -> &str {
-        "notify"
-    }
-    fn handle(&self) -> Result<(), String> {
-        println!("[job:notify] a todo was created: {:?}", self.title);
-        Ok(())
-    }
-}
-
-/// An AI tool that creates a todo (same DB + queue as the HTTP routes).
+/// An AI tool that creates a todo (same DB as the HTTP routes).
 struct CreateTodo {
     db: Database,
-    queue: Arc<Queue>,
 }
 
 impl Tool for CreateTodo {
@@ -91,16 +76,13 @@ impl Tool for CreateTodo {
         let id = {
             let db = self.db.lock().unwrap();
             Todo::create(
-                &db,
+                &*db,
                 &[
                     ("title", Value::Text(title.clone())),
                     ("done", Value::Bool(false)),
                 ],
             )?
         };
-        self.queue.dispatch(NotifyJob {
-            title: title.clone(),
-        });
         Ok(Todo {
             id,
             title,
@@ -140,15 +122,12 @@ fn main() -> std::io::Result<()> {
     let db = Db::memory().expect("open db");
     Todo::migrate(&db).expect("migrate");
     let db: Database = Arc::new(Mutex::new(db));
-    let queue = Queue::new(2);
 
     // Per-route clones for the handlers / group / tool.
     let list_db = Arc::clone(&db);
     let show_db = Arc::clone(&db);
     let create_db = Arc::clone(&db);
     let ready_db = Arc::clone(&db);
-    let create_queue = Arc::clone(&queue);
-    let stats_queue = Arc::clone(&queue);
 
     // A group middleware: log every request to the /api group.
     let logger = mw(|req: &Request| {
@@ -167,9 +146,6 @@ fn main() -> std::io::Result<()> {
         })
         .register_model(sutegi::orm::schema_json(&Todo::schema()))
         .get("/", "Health check.", |_req, _p| text(200, "sutegi up"))
-        .get("/__queue", "Background queue stats.", move |_req, _p| {
-            json(200, &stats_queue.stats().to_json())
-        })
         .get(
             "/stream",
             "SSE demo: stream three ticks then a done event.",
@@ -187,10 +163,9 @@ fn main() -> std::io::Result<()> {
             let list_db = Arc::clone(&list_db);
             let show_db = Arc::clone(&show_db);
             let create_db = Arc::clone(&create_db);
-            let create_queue = Arc::clone(&create_queue);
             g.get("/todos", "List all todos.", move |_req, _p| {
                 let db = list_db.lock().unwrap();
-                match Todo::all_typed(&db) {
+                match Todo::all_typed(&*db) {
                     Ok(todos) => json(200, &Json::arr(todos.iter().map(Todo::to_json).collect())),
                     Err(e) => json(500, &Json::obj(vec![("error", Json::str(e))])),
                 }
@@ -200,7 +175,7 @@ fn main() -> std::io::Result<()> {
                 "Fetch one todo (route-model binding).",
                 move |_req, p| {
                     let db = show_db.lock().unwrap();
-                    match binding::model::<Todo>(&db, p, "id") {
+                    match binding::model::<Todo, _>(&*db, p, "id") {
                         Ok(todo) => json(200, &todo.to_json()),
                         Err(resp) => resp, // 404/500 already built
                     }
@@ -229,7 +204,7 @@ fn main() -> std::io::Result<()> {
                 let id = {
                     let db = create_db.lock().unwrap();
                     match Todo::create(
-                        &db,
+                        &*db,
                         &[
                             ("title", Value::Text(title.clone())),
                             ("done", Value::Bool(done)),
@@ -239,9 +214,6 @@ fn main() -> std::io::Result<()> {
                         Err(e) => return json(500, &Json::obj(vec![("error", Json::str(e))])),
                     }
                 };
-                create_queue.dispatch(NotifyJob {
-                    title: title.clone(),
-                });
                 json(201, &Todo { id, title, done }.to_json())
             })
         });
@@ -251,7 +223,6 @@ fn main() -> std::io::Result<()> {
         ToolRegistry::new()
             .add(CreateTodo {
                 db: Arc::clone(&db),
-                queue: Arc::clone(&queue),
             })
             .add_stream(StreamAnswer),
     );

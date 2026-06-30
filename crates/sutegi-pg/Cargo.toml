@@ -1,0 +1,12 @@
+[package]
+name = "sutegi-pg"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Zero-dependency, pure-std PostgreSQL wire-protocol (v3) client for sutegi: blocking TCP, SCRAM-SHA-256/MD5/cleartext auth, a small connection pool. No async runtime, no C library."
+
+[dependencies]
+sutegi-json = { path = "../sutegi-json", version = "0.2.0" }

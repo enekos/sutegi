@@ -15,6 +15,26 @@ jobs:
   ci:
     name: fmt + clippy + test
     runs-on: ubuntu-latest
+
+    # A real PostgreSQL so the pure-std driver's live tests (SCRAM auth, the
+    # query builder over PG, the durable queue) actually run in CI. The tests
+    # skip themselves when SUTEGI_PG_TEST_URL is unset, so this is the only
+    # thing that exercises them.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: sutegi
+          POSTGRES_PASSWORD: secret
+          POSTGRES_DB: sutegi_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
 
@@ -33,6 +53,8 @@ jobs:
 
       - name: Test (all features)
         run: cargo test --all-features
+        env:
+          SUTEGI_PG_TEST_URL: postgres://sutegi:secret@localhost:5432/sutegi_test
 
       - name: Build (zero-dep core, no default features)
         run: cargo build --no-default-features

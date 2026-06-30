@@ -10,9 +10,13 @@ description = "Zero-dependency SQL query builder, model/schema layer, and migrat
 
 [dependencies]
 rusqlite = { version = "0.40.1", features = ["bundled"], optional = true }
+sutegi-pg = { path = "../sutegi-pg", version = "0.2.0", optional = true }
 sutegi-json = { path = "../sutegi-json", version = "0.2.0" }
 
-# `sqlite` is OFF by default: the zero-dependency core stays tiny. Enable it
-# (`--features sqlite`) to get a runnable, bundled SQLite execution layer.
+# Both execution backends are OFF by default so the zero-dependency core stays
+# tiny. Enable one to get a runnable layer over the same query builder:
+#   --features sqlite     bundled SQLite (one C library, single-process)
+#   --features postgres   pure-std Postgres driver (no deps, cross-pod)
 [features]
 sqlite = ["dep:rusqlite"]
+postgres = ["dep:sutegi-pg"]

@@ -7,14 +7,16 @@
 //! | Feature | Pulls in | Gives you |
 //! |---------|----------|-----------|
 //! | `orm`      | sutegi-orm      | schema + query builder + migrations |
-//! | `sqlite`   | + bundled rusqlite | a runnable SQLite execution layer |
+//! | `sqlite`   | + bundled rusqlite | a runnable SQLite execution layer (per-pod) |
+//! | `postgres` | sutegi-pg (pure std) | a cross-pod Postgres execution layer |
+//! | `durable-queue` | + sutegi-pg | a cross-pod, DB-backed job queue |
 //! | `derive`   | sutegi-macros (build-time only) | `#[derive(Model)]` |
 //! | `validate` | sutegi-validate | request / tool validation |
 //! | `ai`       | sutegi-ai       | `Tool`/`StreamTool` + `/__tools` |
-//! | `queue`    | sutegi-queue    | background jobs |
+//! | `queue`    | sutegi-queue (+ sutegi-pg) | durable, cross-pod job queue (Postgres) |
 //! | `graceful` | libc            | SIGTERM/SIGINT draining for pods |
 //!
-//! `default = ["derive", "orm", "validate", "ai", "queue"]`. For a minimal
+//! `default = ["derive", "orm", "validate", "ai"]`. For a minimal
 //! HTTP service: `sutegi = { version = "*", default-features = false }`.
 //!
 //! ## Built-in operational endpoints (always on)
@@ -45,18 +47,22 @@ pub use sutegi_validate as validate;
 pub use sutegi_macros::Model;
 
 /// Route-model binding: hydrate a typed model straight from a path parameter,
-/// or return a ready-made error response. Requires `sqlite` (needs a live DB).
-#[cfg(feature = "sqlite")]
+/// or return a ready-made error response. Works over any runnable backend
+/// (`sqlite` or `postgres`).
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub mod binding {
-    use sutegi_orm::db::Db;
     use sutegi_orm::row::FromRow;
-    use sutegi_orm::{Model, Value};
+    use sutegi_orm::{Backend, Model, Value};
     use sutegi_web::{json, Params, Response};
 
     /// Look up `params[key]` as the primary key of model `T`. Returns the
     /// hydrated model, or `Err(Response)` (404 if missing, 500 on db error)
     /// ready to return from the handler.
-    pub fn model<T: Model + FromRow>(db: &Db, params: &Params, key: &str) -> Result<T, Response> {
+    pub fn model<T: Model + FromRow, B: Backend>(
+        db: &B,
+        params: &Params,
+        key: &str,
+    ) -> Result<T, Response> {
         let raw = params
             .get(key)
             .ok_or_else(|| json(404, &not_found_json()))?;
@@ -107,11 +113,11 @@ pub mod prelude {
     pub use sutegi_orm::row::FromRow;
     #[cfg(feature = "orm")]
     pub use sutegi_orm::{
-        ColType, Column, DeleteBuilder, Model, Page, QueryBuilder, TableSchema, UpdateBuilder,
-        Value,
+        Backend, ColType, Column, DeleteBuilder, Model, Page, QueryBuilder, TableSchema,
+        UpdateBuilder, Value,
     };
     #[cfg(feature = "queue")]
-    pub use sutegi_queue::{Job, Queue};
+    pub use sutegi_queue::{Queue, Workers};
     #[cfg(feature = "validate")]
     pub use sutegi_validate::{validate_schema, Rule, Ruleset, ValidationErrors};
 
@@ -120,6 +126,9 @@ pub mod prelude {
 
     #[cfg(feature = "sqlite")]
     pub use sutegi_orm::db::Db;
+
+    #[cfg(feature = "postgres")]
+    pub use sutegi_orm::pg::Pg;
 
     #[cfg(feature = "hex")]
     pub use sutegi_hex::{

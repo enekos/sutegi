@@ -79,6 +79,43 @@ pub struct TableSchema {
     pub columns: Vec<Column>,
 }
 
+/// A runnable execution backend behind the query builder. Both the bundled
+/// SQLite layer ([`db::Db`], `sqlite` feature) and the pure-std Postgres layer
+/// ([`pg::Pg`], `postgres` feature) implement it, so the same [`Model`] code
+/// runs against either — swap the backend, not the call sites.
+///
+/// The query builder emits canonical `?`-placeholder SQL; each backend is
+/// responsible for translating to its own placeholder dialect.
+pub trait Backend {
+    /// Run a query builder and return rows as JSON objects.
+    fn select(&self, qb: &QueryBuilder) -> Result<Vec<sutegi_json::Json>, String>;
+
+    /// Execute a parameterized statement; returns rows affected.
+    fn execute(&self, sql: &str, params: &[Value]) -> Result<usize, String>;
+
+    /// Insert a row from `(column, value)` pairs; returns the new primary key.
+    /// `pk` names the auto-generated key column (e.g. `id`) for backends that
+    /// need an explicit `RETURNING`; backends with a native last-insert-id
+    /// may ignore it.
+    fn insert(&self, table: &str, cols: &[(&str, Value)], pk: &str) -> Result<i64, String>;
+
+    /// Count rows matching a query builder.
+    fn count(&self, qb: &QueryBuilder) -> Result<i64, String>;
+
+    /// Create a table from a schema if it does not already exist.
+    fn migrate(&self, schema: &TableSchema) -> Result<(), String>;
+
+    /// Run a query builder and hydrate each row into a typed `FromRow`.
+    fn fetch<T: FromRow>(&self, qb: &QueryBuilder) -> Result<Vec<T>, String> {
+        self.select(qb)?.iter().map(T::from_row).collect()
+    }
+
+    /// Fetch and hydrate the first matching row, if any.
+    fn fetch_one<T: FromRow>(&self, qb: &QueryBuilder) -> Result<Option<T>, String> {
+        Ok(self.fetch::<T>(qb)?.into_iter().next())
+    }
+}
+
 /// Anything that maps to a table. Implementors describe their schema; the
 /// framework derives migrations, query helpers, and introspection from it.
 pub trait Model {
@@ -104,33 +141,28 @@ pub trait Model {
     }
 
     /// Create this model's table if it does not exist.
-    #[cfg(feature = "sqlite")]
-    fn migrate(conn: &db::Db) -> Result<(), String> {
+    fn migrate<B: Backend>(conn: &B) -> Result<(), String> {
         conn.migrate(&Self::schema())
     }
 
     /// Eloquent-style: fetch every row as a JSON object.
-    #[cfg(feature = "sqlite")]
-    fn all(conn: &db::Db) -> Result<Vec<sutegi_json::Json>, String> {
+    fn all<B: Backend>(conn: &B) -> Result<Vec<sutegi_json::Json>, String> {
         conn.select(&Self::query())
     }
 
     /// Eloquent-style: find one row by primary key.
-    #[cfg(feature = "sqlite")]
-    fn find(conn: &db::Db, id: Value) -> Result<Option<sutegi_json::Json>, String> {
+    fn find<B: Backend>(conn: &B, id: Value) -> Result<Option<sutegi_json::Json>, String> {
         let rows = conn.select(&Self::query().filter(Self::primary_key(), "=", id).limit(1))?;
         Ok(rows.into_iter().next())
     }
 
-    /// Eloquent-style: insert a row, returning its new rowid.
-    #[cfg(feature = "sqlite")]
-    fn create(conn: &db::Db, values: &[(&str, Value)]) -> Result<i64, String> {
-        conn.insert(Self::table(), values)
+    /// Eloquent-style: insert a row, returning its new primary key.
+    fn create<B: Backend>(conn: &B, values: &[(&str, Value)]) -> Result<i64, String> {
+        conn.insert(Self::table(), values, Self::primary_key())
     }
 
     /// Typed variant of [`all`](Model::all): hydrate every row into `Self`.
-    #[cfg(feature = "sqlite")]
-    fn all_typed(conn: &db::Db) -> Result<Vec<Self>, String>
+    fn all_typed<B: Backend>(conn: &B) -> Result<Vec<Self>, String>
     where
         Self: Sized + FromRow,
     {
@@ -138,8 +170,7 @@ pub trait Model {
     }
 
     /// Typed variant of [`find`](Model::find): hydrate the matching row.
-    #[cfg(feature = "sqlite")]
-    fn find_typed(conn: &db::Db, id: Value) -> Result<Option<Self>, String>
+    fn find_typed<B: Backend>(conn: &B, id: Value) -> Result<Option<Self>, String>
     where
         Self: Sized + FromRow,
     {
@@ -149,14 +180,12 @@ pub trait Model {
     }
 
     /// Total row count for this model's table.
-    #[cfg(feature = "sqlite")]
-    fn count(conn: &db::Db) -> Result<i64, String> {
+    fn count<B: Backend>(conn: &B) -> Result<i64, String> {
         conn.count(&Self::query())
     }
 
     /// Update columns on the row matching the primary key. Returns rows affected.
-    #[cfg(feature = "sqlite")]
-    fn update(conn: &db::Db, id: Value, sets: &[(&str, Value)]) -> Result<usize, String> {
+    fn update<B: Backend>(conn: &B, id: Value, sets: &[(&str, Value)]) -> Result<usize, String> {
         let mut builder = UpdateBuilder::table(Self::table());
         for (col, value) in sets {
             builder = builder.set(col, value.clone());
@@ -166,8 +195,7 @@ pub trait Model {
     }
 
     /// Delete the row matching the primary key. Returns `true` if a row was removed.
-    #[cfg(feature = "sqlite")]
-    fn delete(conn: &db::Db, id: Value) -> Result<bool, String> {
+    fn delete<B: Backend>(conn: &B, id: Value) -> Result<bool, String> {
         let (sql, params) = DeleteBuilder::table(Self::table())
             .filter(Self::primary_key(), "=", id)
             .build();
@@ -389,6 +417,26 @@ pub mod db {
         }
     }
 
+    impl crate::Backend for Db {
+        fn select(&self, qb: &QueryBuilder) -> Result<Vec<Json>, String> {
+            Db::select(self, qb)
+        }
+        fn execute(&self, sql: &str, params: &[Value]) -> Result<usize, String> {
+            Db::execute(self, sql, params)
+        }
+        // SQLite uses the implicit rowid / `last_insert_rowid()`, so the named
+        // primary key is not needed here.
+        fn insert(&self, table: &str, cols: &[(&str, Value)], _pk: &str) -> Result<i64, String> {
+            Db::insert(self, table, cols)
+        }
+        fn count(&self, qb: &QueryBuilder) -> Result<i64, String> {
+            Db::count(self, qb)
+        }
+        fn migrate(&self, schema: &TableSchema) -> Result<(), String> {
+            Db::migrate(self, schema)
+        }
+    }
+
     fn to_sql(v: &Value) -> SqlValue {
         match v {
             Value::Null => SqlValue::Null,
@@ -564,6 +612,367 @@ pub mod db {
                 .unwrap()
                 .unwrap();
             assert_eq!(row.get("title").unwrap(), &Json::str("upserted"));
+        }
+    }
+}
+
+/// A runnable PostgreSQL execution layer over the same query builder, backed by
+/// the pure-std [`sutegi_pg`] driver. Available with the `postgres` feature.
+///
+/// This is the cross-pod backend: many app replicas share one database and one
+/// durable view of the data, where the `sqlite` layer is per-process. The API
+/// mirrors [`db::Db`] so a repository written against one can switch to the
+/// other by changing the type it holds.
+#[cfg(feature = "postgres")]
+pub mod pg {
+    use super::{QueryBuilder, TableSchema, Value};
+    use sutegi_json::Json;
+    use sutegi_pg::Config;
+
+    // Re-exported so transaction closures (which receive a `Client`) and direct
+    // pool users don't need a separate `sutegi-pg` dependency.
+    pub use sutegi_pg::{Client, PgValue, Pool};
+
+    /// Translate the query builder's `?` placeholders into PostgreSQL's
+    /// positional `$1, $2, …` form. `?` inside single-quoted string literals is
+    /// left untouched.
+    pub fn to_pg_placeholders(sql: &str) -> String {
+        let mut out = String::with_capacity(sql.len() + 8);
+        let mut n = 0;
+        let mut in_str = false;
+        for c in sql.chars() {
+            match c {
+                '\'' => {
+                    in_str = !in_str;
+                    out.push(c);
+                }
+                '?' if !in_str => {
+                    n += 1;
+                    out.push('$');
+                    out.push_str(&n.to_string());
+                }
+                _ => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// PostgreSQL `CREATE TABLE IF NOT EXISTS` from a schema. Integer primary
+    /// keys become identity columns; `Real` maps to `DOUBLE PRECISION`.
+    pub fn create_table_pg(schema: &TableSchema) -> String {
+        use super::ColType;
+        let mut cols = Vec::new();
+        for c in &schema.columns {
+            if c.primary && c.ty == ColType::Integer {
+                // BY DEFAULT (not ALWAYS) mirrors SQLite's `INTEGER PRIMARY KEY`:
+                // auto-generated when omitted, but explicit values are allowed
+                // (needed for upsert-by-id and seeding).
+                cols.push(format!(
+                    "  {} BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY",
+                    c.name
+                ));
+                continue;
+            }
+            let ty = match c.ty {
+                ColType::Integer => "BIGINT",
+                ColType::Real => "DOUBLE PRECISION",
+                ColType::Text => "TEXT",
+                ColType::Boolean => "BOOLEAN",
+            };
+            let mut def = format!("  {} {}", c.name, ty);
+            if c.primary {
+                def.push_str(" PRIMARY KEY");
+            }
+            if !c.nullable && !c.primary {
+                def.push_str(" NOT NULL");
+            }
+            cols.push(def);
+        }
+        format!(
+            "CREATE TABLE IF NOT EXISTS {} (\n{}\n)",
+            schema.table,
+            cols.join(",\n")
+        )
+    }
+
+    fn to_pg_value(v: &Value) -> PgValue {
+        match v {
+            Value::Null => PgValue::Null,
+            Value::Int(i) => PgValue::Int(*i),
+            Value::Real(r) => PgValue::Real(*r),
+            Value::Text(s) => PgValue::Text(s.clone()),
+            Value::Bool(b) => PgValue::Bool(*b),
+        }
+    }
+
+    /// A PostgreSQL-backed handle, cloneable and shareable across threads (it
+    /// holds a connection [`Pool`]).
+    #[derive(Clone)]
+    pub struct Pg {
+        pool: Pool,
+    }
+
+    impl Pg {
+        /// Wrap an existing connection pool.
+        pub fn new(pool: Pool) -> Pg {
+            Pg { pool }
+        }
+
+        /// Connect using a `postgres://…` URL with a pool of `max_size`.
+        pub fn connect(url: &str, max_size: usize) -> Result<Pg, String> {
+            Ok(Pg {
+                pool: Pool::new(Config::from_url(url)?, max_size),
+            })
+        }
+
+        /// Build from `DATABASE_URL`/`PG*` environment variables.
+        pub fn from_env(max_size: usize) -> Result<Pg, String> {
+            Ok(Pg {
+                pool: Pool::from_env(max_size)?,
+            })
+        }
+
+        /// The underlying pool, for queue drivers and advanced use.
+        pub fn pool(&self) -> &Pool {
+            &self.pool
+        }
+
+        /// Run a `CREATE TABLE IF NOT EXISTS` derived from a schema.
+        pub fn migrate(&self, schema: &TableSchema) -> Result<(), String> {
+            self.pool.batch(&create_table_pg(schema))
+        }
+
+        /// Execute a parameterized statement (`?` placeholders), returning the
+        /// affected row count.
+        pub fn execute(&self, sql: &str, params: &[Value]) -> Result<usize, String> {
+            let bound: Vec<PgValue> = params.iter().map(to_pg_value).collect();
+            self.pool
+                .execute(&to_pg_placeholders(sql), &bound)
+                .map(|n| n as usize)
+        }
+
+        /// Run an arbitrary SELECT (`?` placeholders) and return JSON rows.
+        pub fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Json>, String> {
+            let bound: Vec<PgValue> = params.iter().map(to_pg_value).collect();
+            self.pool.query(&to_pg_placeholders(sql), &bound)
+        }
+
+        /// Insert a row, returning the generated primary key via `RETURNING`.
+        pub fn insert(&self, table: &str, cols: &[(&str, Value)], pk: &str) -> Result<i64, String> {
+            let names: Vec<&str> = cols.iter().map(|(n, _)| *n).collect();
+            let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("${i}")).collect();
+            let sql = format!(
+                "INSERT INTO {} ({}) VALUES ({}) RETURNING {}",
+                table,
+                names.join(", "),
+                placeholders.join(", "),
+                pk
+            );
+            let bound: Vec<PgValue> = cols.iter().map(|(_, v)| to_pg_value(v)).collect();
+            let rows = self.pool.query(&sql, &bound)?;
+            Ok(rows
+                .first()
+                .and_then(|r| r.get(pk).and_then(Json::as_i64))
+                .unwrap_or(0))
+        }
+
+        /// Run a query builder and return rows as JSON objects.
+        pub fn select(&self, qb: &QueryBuilder) -> Result<Vec<Json>, String> {
+            let (sql, params) = qb.build();
+            self.query(&sql, &params)
+        }
+
+        /// Run a query builder and hydrate each row into a typed `FromRow`.
+        pub fn fetch<T: crate::FromRow>(&self, qb: &QueryBuilder) -> Result<Vec<T>, String> {
+            self.select(qb)?.iter().map(T::from_row).collect()
+        }
+
+        /// Fetch the first matching row as a typed value, if any.
+        pub fn fetch_one<T: crate::FromRow>(&self, qb: &QueryBuilder) -> Result<Option<T>, String> {
+            Ok(self.fetch::<T>(qb)?.into_iter().next())
+        }
+
+        /// Count rows matching a query builder.
+        pub fn count(&self, qb: &QueryBuilder) -> Result<i64, String> {
+            let (sql, params) = qb.build_count();
+            let row = self.query_one(&sql, &params)?;
+            Ok(row
+                .and_then(|r| r.get("count").and_then(|j| j.as_f64()))
+                .map(|f| f as i64)
+                .unwrap_or(0))
+        }
+
+        /// Whether any row matches.
+        pub fn exists(&self, qb: &QueryBuilder) -> Result<bool, String> {
+            Ok(self.count(qb)? > 0)
+        }
+
+        /// Run a SELECT and return only the first row, if any.
+        pub fn query_one(&self, sql: &str, params: &[Value]) -> Result<Option<Json>, String> {
+            Ok(self.query(sql, params)?.into_iter().next())
+        }
+
+        /// Run a paginated query (1-based `page`): rows plus the total count.
+        pub fn paginate(
+            &self,
+            qb: &QueryBuilder,
+            page: i64,
+            per_page: i64,
+        ) -> Result<crate::Page<Json>, String> {
+            let total = self.count(qb)?;
+            let page = page.max(1);
+            let per_page = per_page.max(1);
+            let items = self.select(&qb.clone().limit(per_page).offset((page - 1) * per_page))?;
+            Ok(crate::Page {
+                items,
+                total,
+                page,
+                per_page,
+            })
+        }
+
+        /// Typed variant of [`paginate`](Pg::paginate).
+        pub fn paginate_typed<T: crate::FromRow>(
+            &self,
+            qb: &QueryBuilder,
+            page: i64,
+            per_page: i64,
+        ) -> Result<crate::Page<T>, String> {
+            let total = self.count(qb)?;
+            let page = page.max(1);
+            let per_page = per_page.max(1);
+            let items =
+                self.fetch::<T>(&qb.clone().limit(per_page).offset((page - 1) * per_page))?;
+            Ok(crate::Page {
+                items,
+                total,
+                page,
+                per_page,
+            })
+        }
+
+        /// Insert, or update on primary/unique-key conflict (`ON CONFLICT … DO
+        /// UPDATE`). Returns the affected row's primary key.
+        pub fn upsert(
+            &self,
+            table: &str,
+            cols: &[(&str, Value)],
+            conflict: &str,
+            pk: &str,
+        ) -> Result<i64, String> {
+            let names: Vec<&str> = cols.iter().map(|(n, _)| *n).collect();
+            let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("${i}")).collect();
+            let updates: Vec<String> = names
+                .iter()
+                .filter(|n| **n != conflict)
+                .map(|n| format!("{n} = EXCLUDED.{n}"))
+                .collect();
+            let sql = format!(
+                "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO UPDATE SET {} RETURNING {}",
+                table,
+                names.join(", "),
+                placeholders.join(", "),
+                conflict,
+                updates.join(", "),
+                pk
+            );
+            let bound: Vec<PgValue> = cols.iter().map(|(_, v)| to_pg_value(v)).collect();
+            let rows = self.pool.query(&sql, &bound)?;
+            Ok(rows
+                .first()
+                .and_then(|r| r.get(pk).and_then(Json::as_i64))
+                .unwrap_or(0))
+        }
+
+        /// Run `f` inside a single-connection transaction: `BEGIN`, then
+        /// `COMMIT` on `Ok` or `ROLLBACK` on `Err`. The closure receives a
+        /// [`Client`] so every statement runs on the same connection.
+        pub fn transaction<T>(
+            &self,
+            f: impl FnOnce(&mut Client) -> Result<T, String>,
+        ) -> Result<T, String> {
+            self.pool.with(|client| {
+                client.batch("BEGIN")?;
+                match f(client) {
+                    Ok(value) => {
+                        client.batch("COMMIT")?;
+                        Ok(value)
+                    }
+                    Err(e) => {
+                        let _ = client.batch("ROLLBACK");
+                        Err(e)
+                    }
+                }
+            })
+        }
+    }
+
+    impl crate::Backend for Pg {
+        fn select(&self, qb: &QueryBuilder) -> Result<Vec<Json>, String> {
+            Pg::select(self, qb)
+        }
+        fn execute(&self, sql: &str, params: &[Value]) -> Result<usize, String> {
+            Pg::execute(self, sql, params)
+        }
+        fn insert(&self, table: &str, cols: &[(&str, Value)], pk: &str) -> Result<i64, String> {
+            Pg::insert(self, table, cols, pk)
+        }
+        fn count(&self, qb: &QueryBuilder) -> Result<i64, String> {
+            Pg::count(self, qb)
+        }
+        fn migrate(&self, schema: &TableSchema) -> Result<(), String> {
+            Pg::migrate(self, schema)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn placeholder_translation() {
+            assert_eq!(
+                to_pg_placeholders("SELECT * FROM t WHERE a = ? AND b = ?"),
+                "SELECT * FROM t WHERE a = $1 AND b = $2"
+            );
+            // `?` inside a string literal is preserved.
+            assert_eq!(
+                to_pg_placeholders("SELECT '? literal' FROM t WHERE a = ?"),
+                "SELECT '? literal' FROM t WHERE a = $1"
+            );
+        }
+
+        #[test]
+        fn pg_ddl_uses_identity_and_double() {
+            use crate::{ColType, Column, TableSchema};
+            let schema = TableSchema {
+                table: "todos",
+                columns: vec![
+                    Column {
+                        name: "id",
+                        ty: ColType::Integer,
+                        nullable: false,
+                        primary: true,
+                    },
+                    Column {
+                        name: "title",
+                        ty: ColType::Text,
+                        nullable: false,
+                        primary: false,
+                    },
+                    Column {
+                        name: "score",
+                        ty: ColType::Real,
+                        nullable: true,
+                        primary: false,
+                    },
+                ],
+            };
+            let sql = create_table_pg(&schema);
+            assert!(sql.contains("id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY"));
+            assert!(sql.contains("title TEXT NOT NULL"));
+            assert!(sql.contains("score DOUBLE PRECISION"));
+            assert!(!sql.contains("score DOUBLE PRECISION NOT NULL"));
         }
     }
 }

@@ -1,264 +1,322 @@
-//! A small, dependency-free background job queue — sutegi's answer to Laravel
-//! queues, scoped to a single process.
+//! A **durable, cross-pod** job queue backed by PostgreSQL — sutegi's answer to
+//! Laravel queues, built to survive restarts and span replicas.
 //!
-//! Jobs implement [`Job`] and are dispatched to a pool of worker threads. A
-//! failing job is retried up to `tries()` times. The queue tracks counters
-//! ([`Stats`]) that can be surfaced as JSON for introspection. Delayed
-//! dispatch is supported via a per-job timer thread.
+//! Jobs live in a `sutegi_jobs` table. Any number of app pods can enqueue and
+//! process from the same queue: workers claim a job atomically with
+//! `SELECT … FOR UPDATE SKIP LOCKED`, so two workers never grab the same row.
+//! A claim sets a lock timestamp rather than deleting the row, so if a worker
+//! crashes mid-job the row becomes visible again after a visibility timeout —
+//! giving **at-least-once** delivery. Retries and delayed dispatch are columns,
+//! not in-memory timers, so they survive restarts.
 //!
-//! For durable, cross-process queues you'd back this with the `sqlite` layer;
-//! this in-process version covers the common "do it after the response"
-//! case (emails, webhooks, cache warming) with zero dependencies.
+//! Jobs are addressed by **name**: you register a handler per job name, and the
+//! payload travels as JSON. That's what lets a job enqueued on one pod run on
+//! another. Build the queue over a [`sutegi_pg::Pool`]:
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//! use sutegi_queue::Queue;
+//! use sutegi_json::Json;
+//! # fn demo(pool: sutegi_pg::Pool) -> Result<(), String> {
+//! let mut queue = Queue::new(pool);
+//! queue.register("send_email", |payload: &Json| {
+//!     // … do the work, return Err to retry …
+//!     Ok(())
+//! });
+//! queue.migrate()?;
+//! queue.dispatch("send_email", Json::obj(vec![("to", Json::str("a@b.c"))]))?;
+//!
+//! let queue = Arc::new(queue);
+//! let _workers = Arc::clone(&queue).start(4); // background workers until dropped
+//! # Ok(())
+//! # }
+//! ```
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use sutegi_json::Json;
+use sutegi_pg::{PgValue, Pool};
 
-/// A unit of background work.
-pub trait Job: Send + 'static {
-    /// A label for logging/introspection.
-    fn name(&self) -> &str;
+/// A handler for a named job: receives the decoded JSON payload. Returning
+/// `Err` triggers a retry (until the job's attempt budget is exhausted).
+pub type Handler = Arc<dyn Fn(&Json) -> Result<(), String> + Send + Sync>;
 
-    /// Run the job. Returning `Err` triggers a retry (up to `tries()`).
-    fn handle(&self) -> Result<(), String>;
-
-    /// Total attempts before the job is considered failed (default 1).
-    fn tries(&self) -> u32 {
-        1
-    }
-}
-
-/// Live counters for the queue.
-#[derive(Default)]
-struct Counters {
-    dispatched: AtomicU64,
-    processed: AtomicU64,
-    failed: AtomicU64,
-    retried: AtomicU64,
-}
-
-/// A snapshot of queue counters.
-#[derive(Clone, Copy, Debug)]
-pub struct Stats {
-    pub dispatched: u64,
-    pub processed: u64,
-    pub failed: u64,
-    pub retried: u64,
-}
-
-impl Stats {
-    pub fn to_json(&self) -> Json {
-        Json::obj(vec![
-            ("dispatched", Json::int(self.dispatched as i64)),
-            ("processed", Json::int(self.processed as i64)),
-            ("failed", Json::int(self.failed as i64)),
-            ("retried", Json::int(self.retried as i64)),
-        ])
-    }
-}
-
-type BoxedJob = Box<dyn Job>;
-
-/// A background queue with a fixed pool of workers.
+/// A durable queue over a PostgreSQL connection pool.
 pub struct Queue {
-    sender: Option<mpsc::Sender<BoxedJob>>,
-    workers: Vec<thread::JoinHandle<()>>,
-    counters: Arc<Counters>,
+    pool: Pool,
+    handlers: HashMap<String, Handler>,
+    /// How long a claimed-but-unfinished job stays invisible before another
+    /// worker may reclaim it (crash recovery).
+    visibility_timeout: Duration,
+    /// How long an idle worker sleeps before polling for work again.
+    poll_interval: Duration,
+    /// Base retry backoff; the delay before attempt N is `base * N`.
+    retry_backoff: Duration,
 }
 
 impl Queue {
-    /// Create a queue with `workers` background threads.
-    pub fn new(workers: usize) -> Arc<Queue> {
-        let (sender, receiver) = mpsc::channel::<BoxedJob>();
-        let receiver = Arc::new(Mutex::new(receiver));
-        let counters = Arc::new(Counters::default());
+    /// Create a queue over `pool` with sensible defaults (30s visibility
+    /// timeout, 1s poll interval, 5s base retry backoff).
+    pub fn new(pool: Pool) -> Queue {
+        Queue {
+            pool,
+            handlers: HashMap::new(),
+            visibility_timeout: Duration::from_secs(30),
+            poll_interval: Duration::from_secs(1),
+            retry_backoff: Duration::from_secs(5),
+        }
+    }
 
-        let mut handles = Vec::with_capacity(workers.max(1));
+    /// Override the visibility timeout (crash-recovery window).
+    pub fn visibility_timeout(mut self, d: Duration) -> Queue {
+        self.visibility_timeout = d;
+        self
+    }
+
+    /// Override the idle poll interval.
+    pub fn poll_interval(mut self, d: Duration) -> Queue {
+        self.poll_interval = d;
+        self
+    }
+
+    /// Override the base retry backoff.
+    pub fn retry_backoff(mut self, d: Duration) -> Queue {
+        self.retry_backoff = d;
+        self
+    }
+
+    /// Register a handler for jobs dispatched under `name`.
+    pub fn register(
+        &mut self,
+        name: impl Into<String>,
+        handler: impl Fn(&Json) -> Result<(), String> + Send + Sync + 'static,
+    ) {
+        self.handlers.insert(name.into(), Arc::new(handler));
+    }
+
+    /// The underlying connection pool, for sharing or advanced use.
+    pub fn pool(&self) -> &Pool {
+        &self.pool
+    }
+
+    /// Create the `sutegi_jobs` table if it does not already exist.
+    ///
+    /// Safe to call from every pod on boot: PostgreSQL can raise a spurious
+    /// unique-violation when several backends run `CREATE … IF NOT EXISTS`
+    /// against the catalog at the same instant, so that race is treated as
+    /// success (the table ends up created either way).
+    pub fn migrate(&self) -> Result<(), String> {
+        match self.create_schema() {
+            Ok(()) => Ok(()),
+            Err(e) if e.contains("23505") || e.contains("already exists") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn create_schema(&self) -> Result<(), String> {
+        self.pool.batch(
+            "CREATE TABLE IF NOT EXISTS sutegi_jobs (\
+                id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, \
+                queue TEXT NOT NULL DEFAULT 'default', \
+                name TEXT NOT NULL, \
+                payload TEXT NOT NULL, \
+                attempts INTEGER NOT NULL DEFAULT 0, \
+                max_attempts INTEGER NOT NULL DEFAULT 1, \
+                run_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
+                locked_at TIMESTAMPTZ, \
+                failed_at TIMESTAMPTZ, \
+                last_error TEXT, \
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()); \
+             CREATE INDEX IF NOT EXISTS sutegi_jobs_claim_idx \
+                ON sutegi_jobs (run_at) WHERE failed_at IS NULL;",
+        )
+    }
+
+    /// Enqueue a job to run as soon as a worker is free. Returns its row id.
+    pub fn dispatch(&self, name: &str, payload: Json) -> Result<i64, String> {
+        self.enqueue(name, payload, 1, Duration::ZERO)
+    }
+
+    /// Enqueue a job with a retry budget and an optional start delay.
+    pub fn dispatch_with(
+        &self,
+        name: &str,
+        payload: Json,
+        max_attempts: u32,
+        delay: Duration,
+    ) -> Result<i64, String> {
+        self.enqueue(name, payload, max_attempts.max(1), delay)
+    }
+
+    fn enqueue(
+        &self,
+        name: &str,
+        payload: Json,
+        max_attempts: u32,
+        delay: Duration,
+    ) -> Result<i64, String> {
+        let rows = self.pool.query(
+            "INSERT INTO sutegi_jobs (name, payload, max_attempts, run_at) \
+             VALUES ($1, $2, $3, now() + ($4::bigint * interval '1 millisecond')) \
+             RETURNING id",
+            &[
+                PgValue::Text(name.to_string()),
+                PgValue::Text(payload.to_string()),
+                PgValue::Int(max_attempts as i64),
+                PgValue::Int(delay.as_millis() as i64),
+            ],
+        )?;
+        Ok(rows
+            .first()
+            .and_then(|r| r.get("id").and_then(Json::as_i64))
+            .unwrap_or(0))
+    }
+
+    /// Claim and run at most one ready job. Returns `true` if a job ran (so a
+    /// caller can keep draining), `false` if the queue was idle.
+    pub fn run_once(&self) -> Result<bool, String> {
+        let claimed = self.pool.query(
+            "UPDATE sutegi_jobs SET locked_at = now(), attempts = attempts + 1 \
+             WHERE id = (\
+                SELECT id FROM sutegi_jobs \
+                WHERE failed_at IS NULL AND run_at <= now() \
+                  AND (locked_at IS NULL OR locked_at < now() - ($1::bigint * interval '1 second')) \
+                ORDER BY run_at, id \
+                FOR UPDATE SKIP LOCKED \
+                LIMIT 1) \
+             RETURNING id, name, payload, attempts, max_attempts",
+            &[PgValue::Int(self.visibility_timeout.as_secs() as i64)],
+        )?;
+
+        let Some(job) = claimed.into_iter().next() else {
+            return Ok(false);
+        };
+        let id = job.get("id").and_then(Json::as_i64).unwrap_or(0);
+        let name = job
+            .get("name")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_string();
+        let attempts = job.get("attempts").and_then(Json::as_i64).unwrap_or(1);
+        let max_attempts = job.get("max_attempts").and_then(Json::as_i64).unwrap_or(1);
+        let payload = job
+            .get("payload")
+            .and_then(Json::as_str)
+            .and_then(|s| Json::parse(s).ok())
+            .unwrap_or(Json::Null);
+
+        let result = match self.handlers.get(&name) {
+            Some(handler) => handler(&payload),
+            None => Err(format!("no handler registered for job '{name}'")),
+        };
+
+        match result {
+            Ok(()) => {
+                self.pool
+                    .execute("DELETE FROM sutegi_jobs WHERE id = $1", &[PgValue::Int(id)])?;
+            }
+            Err(err) => {
+                if attempts >= max_attempts {
+                    // Terminal: keep the row as a dead-letter record.
+                    self.pool.execute(
+                        "UPDATE sutegi_jobs SET failed_at = now(), locked_at = NULL, last_error = $2 \
+                         WHERE id = $1",
+                        &[PgValue::Int(id), PgValue::Text(err.clone())],
+                    )?;
+                    eprintln!("[queue] job '{name}' #{id} failed terminally: {err}");
+                } else {
+                    // Retry: release the lock and schedule a backed-off retry.
+                    let backoff_secs = self.retry_backoff.as_secs() as i64 * attempts;
+                    self.pool.execute(
+                        "UPDATE sutegi_jobs SET locked_at = NULL, last_error = $2, \
+                         run_at = now() + ($3::bigint * interval '1 second') WHERE id = $1",
+                        &[
+                            PgValue::Int(id),
+                            PgValue::Text(err),
+                            PgValue::Int(backoff_secs),
+                        ],
+                    )?;
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// A snapshot of queue depth by state, as JSON — wire it into `/__queue`.
+    pub fn stats(&self) -> Result<Json, String> {
+        let rows = self.pool.query(
+            "SELECT \
+                count(*) FILTER (WHERE failed_at IS NULL AND run_at <= now() AND locked_at IS NULL) AS ready, \
+                count(*) FILTER (WHERE failed_at IS NULL AND locked_at IS NOT NULL) AS running, \
+                count(*) FILTER (WHERE failed_at IS NULL AND run_at > now()) AS scheduled, \
+                count(*) FILTER (WHERE failed_at IS NOT NULL) AS failed, \
+                count(*) AS total \
+             FROM sutegi_jobs",
+            &[],
+        )?;
+        let row = rows.into_iter().next().unwrap_or(Json::Null);
+        let n = |k: &str| Json::int(row.get(k).and_then(Json::as_i64).unwrap_or(0));
+        Ok(Json::obj(vec![
+            ("ready", n("ready")),
+            ("running", n("running")),
+            ("scheduled", n("scheduled")),
+            ("failed", n("failed")),
+            ("total", n("total")),
+        ]))
+    }
+
+    /// Spawn `workers` background threads that poll and process jobs until the
+    /// returned [`Workers`] handle is dropped (or `stop()` is called).
+    pub fn start(self: Arc<Self>, workers: usize) -> Workers {
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
         for _ in 0..workers.max(1) {
-            let receiver = Arc::clone(&receiver);
-            let counters = Arc::clone(&counters);
-            handles.push(thread::spawn(move || loop {
-                let job = {
-                    let lock = receiver.lock().unwrap();
-                    lock.recv()
-                };
-                match job {
-                    Ok(job) => run_job(job, &counters),
-                    Err(_) => break, // channel closed
+            let queue = Arc::clone(&self);
+            let stop = Arc::clone(&stop);
+            handles.push(thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    match queue.run_once() {
+                        Ok(true) => continue, // keep draining while there's work
+                        Ok(false) => thread::sleep(queue.poll_interval),
+                        Err(e) => {
+                            eprintln!("[queue] worker error: {e}");
+                            thread::sleep(queue.poll_interval);
+                        }
+                    }
                 }
             }));
         }
+        Workers { stop, handles }
+    }
+}
 
-        Arc::new(Queue {
-            sender: Some(sender),
-            workers: handles,
-            counters,
-        })
+/// A running set of queue workers. Dropping it (or calling [`stop`]
+/// (Workers::stop)) signals shutdown and joins the threads.
+pub struct Workers {
+    stop: Arc<AtomicBool>,
+    handles: Vec<thread::JoinHandle<()>>,
+}
+
+impl Workers {
+    /// Signal the workers to stop and wait for in-flight jobs to finish.
+    pub fn stop(mut self) {
+        self.shutdown();
     }
 
-    /// Enqueue a job for background processing.
-    pub fn dispatch(&self, job: impl Job) {
-        self.counters.dispatched.fetch_add(1, Ordering::Relaxed);
-        if let Some(sender) = &self.sender {
-            let _ = sender.send(Box::new(job));
-        }
-    }
-
-    /// Enqueue a job to run after `delay`. Spawns a lightweight timer thread.
-    pub fn dispatch_after(self: &Arc<Self>, delay: Duration, job: impl Job) {
-        self.counters.dispatched.fetch_add(1, Ordering::Relaxed);
-        let queue = Arc::clone(self);
-        let mut boxed: Option<BoxedJob> = Some(Box::new(job));
-        thread::spawn(move || {
-            thread::sleep(delay);
-            if let (Some(sender), Some(job)) = (queue.sender.as_ref(), boxed.take()) {
-                let _ = sender.send(job);
-            }
-        });
-    }
-
-    /// Current counter snapshot.
-    pub fn stats(&self) -> Stats {
-        Stats {
-            dispatched: self.counters.dispatched.load(Ordering::Relaxed),
-            processed: self.counters.processed.load(Ordering::Relaxed),
-            failed: self.counters.failed.load(Ordering::Relaxed),
-            retried: self.counters.retried.load(Ordering::Relaxed),
+    fn shutdown(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        for h in self.handles.drain(..) {
+            let _ = h.join();
         }
     }
 }
 
-fn run_job(job: BoxedJob, counters: &Counters) {
-    let tries = job.tries().max(1);
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        match job.handle() {
-            Ok(()) => {
-                counters.processed.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            Err(err) => {
-                if attempt >= tries {
-                    counters.failed.fetch_add(1, Ordering::Relaxed);
-                    eprintln!(
-                        "[queue] job '{}' failed after {} attempt(s): {}",
-                        job.name(),
-                        attempt,
-                        err
-                    );
-                    return;
-                }
-                counters.retried.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-}
-
-impl Drop for Queue {
+impl Drop for Workers {
     fn drop(&mut self) {
-        // Closing the channel lets idle workers exit; join to finish in-flight jobs.
-        drop(self.sender.take());
-        for worker in self.workers.drain(..) {
-            let _ = worker.join();
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::AtomicU32;
-
-    struct Counting(Arc<AtomicU32>);
-    impl Job for Counting {
-        fn name(&self) -> &str {
-            "counting"
-        }
-        fn handle(&self) -> Result<(), String> {
-            self.0.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
-    }
-
-    struct AlwaysFails;
-    impl Job for AlwaysFails {
-        fn name(&self) -> &str {
-            "always-fails"
-        }
-        fn handle(&self) -> Result<(), String> {
-            Err("nope".into())
-        }
-        fn tries(&self) -> u32 {
-            3
-        }
-    }
-
-    #[test]
-    fn processes_dispatched_jobs() {
-        let counter = Arc::new(AtomicU32::new(0));
-        let queue = Queue::new(4);
-        for _ in 0..20 {
-            queue.dispatch(Counting(Arc::clone(&counter)));
-        }
-        // Dropping the queue drains and joins all workers.
-        let stats = queue.stats();
-        drop(queue);
-        assert!(stats.dispatched == 20);
-        assert_eq!(counter.load(Ordering::Relaxed), 20);
-    }
-
-    /// Poll `cond` until true or ~1s elapses; returns whether it became true.
-    fn wait_until(cond: impl Fn() -> bool) -> bool {
-        for _ in 0..200 {
-            if cond() {
-                return true;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-        cond()
-    }
-
-    #[test]
-    fn retries_then_marks_failed() {
-        let queue = Queue::new(1);
-        queue.dispatch(AlwaysFails); // tries() == 3
-        assert!(
-            wait_until(|| queue.stats().failed == 1),
-            "job should fail terminally"
-        );
-        let s = queue.stats();
-        assert_eq!(s.failed, 1);
-        assert_eq!(s.retried, 2); // 3 attempts → 2 retries before the final failure
-        assert_eq!(s.processed, 0);
-        assert_eq!(s.dispatched, 1);
-    }
-
-    #[test]
-    fn delayed_dispatch_runs_after_delay() {
-        let counter = Arc::new(AtomicU32::new(0));
-        let queue = Queue::new(2);
-        queue.dispatch_after(Duration::from_millis(10), Counting(Arc::clone(&counter)));
-        // Counted as dispatched immediately, but only processed after the delay.
-        assert_eq!(queue.stats().dispatched, 1);
-        assert!(wait_until(|| counter.load(Ordering::Relaxed) == 1));
-        assert!(wait_until(|| queue.stats().processed == 1));
-    }
-
-    #[test]
-    fn stats_serialize_to_json() {
-        let s = Stats {
-            dispatched: 5,
-            processed: 3,
-            failed: 1,
-            retried: 4,
-        };
-        let j = s.to_json();
-        assert_eq!(j.get("dispatched").and_then(Json::as_i64), Some(5));
-        assert_eq!(j.get("failed").and_then(Json::as_i64), Some(1));
-        assert_eq!(j.get("retried").and_then(Json::as_i64), Some(4));
+        self.shutdown();
     }
 }
