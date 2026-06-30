@@ -74,8 +74,12 @@ pub mod binding {
     }
 }
 
-/// Read a config value from the environment with a fallback — small 12-factor
-/// helper so apps configure cleanly across pods (`PORT`, `WORKERS`, etc.).
+/// A clean, std-only configuration layer ([`config::Config`]): typed env
+/// access, `.env` loading, required-var validation, and prefix scoping.
+pub mod config;
+
+/// Read a single env var with a fallback — a shortcut over [`config::Config`]
+/// for the common one-off case (`PORT`, `WORKERS`, …).
 pub fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
@@ -83,6 +87,7 @@ pub fn env_or(key: &str, default: &str) -> String {
 /// The common imports for building an app. Items appear only when their feature
 /// is enabled, so the prelude tracks your build.
 pub mod prelude {
+    pub use crate::config::Config;
     pub use sutegi_json::Json;
     pub use sutegi_web::{
         basic, bearer, cors, cors_preflight, form_body, html, json, json_body, logger, mw,

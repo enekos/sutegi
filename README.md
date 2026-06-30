@@ -95,9 +95,25 @@ Built-in operational endpoints (always on, no feature needed):
 | `GET /__metrics` | Prometheus text (requests total, in-flight, by status class) |
 | `GET /__introspect` | full app surface (routes/models/tools/endpoints) |
 
+### Configuration
+
+A std-only config layer (`sutegi::config::Config`): `.env` loading, typed
+accessors, required-var validation, and prefix scoping.
+
+```rust
+use sutegi::config::Config;
+
+let cfg = Config::load();                  // .env (if present) + process env (env wins)
+let port = cfg.int("PORT", 8080);
+let debug = cfg.bool("DEBUG", false);
+let hosts = cfg.list("ALLOWED_HOSTS");     // comma-separated
+cfg.require_all(&["DATABASE_URL", "API_KEY"])?;   // fail fast, lists all missing
+let db = cfg.prefixed("DB_");              // DB_HOST/DB_PORT → HOST/PORT
+```
+
 ```rust
 App::new("api")
-    .workers(env_or("WORKERS", "8").parse().unwrap_or(8))   // 12-factor config
+    .workers(Config::load().int("WORKERS", 8) as usize)     // 12-factor config
     .readiness(move || db.lock().unwrap().query("SELECT 1", &[]).is_ok())
     .get("/", "health", |_, _| text(200, "ok"))
     .run_graceful("0.0.0.0:8080")?;   // SIGTERM → stop accepting → drain in-flight
