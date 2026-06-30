@@ -1,4 +1,6 @@
 /target
+# Cargo build output anywhere in the tree (e.g. the excluded benches/ workspace)
+target/
 **/*.rs.bk
 Cargo.lock
 .DS_Store
