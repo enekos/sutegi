@@ -1,11 +1,11 @@
-# sutegi Sail — local multi-instance dev. Bring it up with `./sail up`, which
+# sutegi ontzi — local multi-instance dev. Bring it up with `./ontzi up`, which
 # scales the app to several replicas behind an nginx load balancer so you can
 # exercise the same horizontal-scaling shape you'd run in production.
 #
-#   ./sail up            # build + start (3 app replicas + lb on :8080)
-#   ./sail logs          # tail logs
-#   ./sail curl /api/todos
-#   ./sail down
+#   ./ontzi up            # build + start (3 app replicas + lb on :8080)
+#   ./ontzi logs          # tail logs
+#   ./ontzi curl /api/todos
+#   ./ontzi down
 
 services:
   app:

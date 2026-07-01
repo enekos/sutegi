@@ -1,0 +1,19 @@
+[package]
+name = "kv-example"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "sutegi KV demo: a single-node settings/feature-flag store over SQLite (the Kv layer)."
+publish = false
+
+[[bin]]
+name = "kv"
+path = "src/main.rs"
+
+[dependencies]
+# `sqlite` is the single-node backend; `Kv` rides on top of it. No `ai`/`queue`
+# — this is deliberately the small, embedded shape.
+sutegi = { path = "../../crates/sutegi", default-features = false, features = ["orm", "sqlite"] }

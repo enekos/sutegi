@@ -7,7 +7,7 @@
 use sutegi_json::Json;
 use sutegi_orm::pg::Pg;
 use sutegi_orm::row;
-use sutegi_orm::{ColType, Column, FromRow, Model, QueryBuilder, TableSchema, Value};
+use sutegi_orm::{Backend, ColType, Column, FromRow, Model, QueryBuilder, TableSchema, Value};
 
 struct Todo {
     id: i64,
@@ -151,26 +151,58 @@ fn transaction_commits_and_rolls_back() {
         .batch("CREATE TABLE orm_pg_tx (n INTEGER NOT NULL)")
         .unwrap();
 
+    // The transaction closure now receives a `Tx`, which is a `Backend`: the
+    // `?`-placeholder API (and the whole query builder / Model surface) works
+    // inside the transaction, pinned to one connection.
+
     // Rolled-back work leaves no trace.
-    let _ = db.transaction(|c| {
-        c.execute(
-            "INSERT INTO orm_pg_tx (n) VALUES ($1)",
-            &[sutegi_orm::pg::PgValue::Int(1)],
-        )?;
+    let _ = db.transaction(|tx| {
+        tx.execute("INSERT INTO orm_pg_tx (n) VALUES (?)", &[Value::Int(1)])?;
         Err::<(), String>("boom".into())
     });
     assert_eq!(db.count(&QueryBuilder::table("orm_pg_tx")).unwrap(), 0);
 
-    // Committed work persists.
-    db.transaction(|c| {
-        c.execute(
-            "INSERT INTO orm_pg_tx (n) VALUES ($1)",
-            &[sutegi_orm::pg::PgValue::Int(2)],
-        )?;
+    // Committed work persists — and is visible via the query builder inside the
+    // same transaction before commit.
+    db.transaction(|tx| {
+        tx.execute("INSERT INTO orm_pg_tx (n) VALUES (?)", &[Value::Int(2)])?;
+        assert_eq!(tx.count(&QueryBuilder::table("orm_pg_tx"))?, 1);
         Ok(())
     })
     .unwrap();
     assert_eq!(db.count(&QueryBuilder::table("orm_pg_tx")).unwrap(), 1);
 
     db.pool().batch("DROP TABLE orm_pg_tx").unwrap();
+}
+
+#[test]
+fn kv_store_over_postgres() {
+    use sutegi_orm::kv::Kv;
+
+    let Some(db) = db() else {
+        eprintln!("skipping: SUTEGI_PG_TEST_URL not set");
+        return;
+    };
+    db.pool().batch("DROP TABLE IF EXISTS orm_pg_kv").unwrap();
+
+    // The same Kv layer that backs single-node SQLite runs unchanged on the
+    // multi-pod Postgres backend — useful for small shared state (flags/config).
+    let kv = Kv::with_table(db.clone(), "orm_pg_kv");
+    kv.migrate().unwrap();
+
+    kv.set("flags", "beta", &Json::Bool(true)).unwrap();
+    kv.set("flags", "rollout", &Json::obj(vec![("pct", Json::int(25))]))
+        .unwrap();
+    assert_eq!(kv.get("flags", "beta").unwrap(), Some(Json::Bool(true)));
+
+    // Overwrite in place (ON CONFLICT), then confirm no duplicate row.
+    kv.set("flags", "beta", &Json::Bool(false)).unwrap();
+    assert_eq!(kv.get("flags", "beta").unwrap(), Some(Json::Bool(false)));
+    assert_eq!(kv.count("flags").unwrap(), 2);
+    assert_eq!(kv.keys("flags").unwrap(), vec!["beta", "rollout"]);
+
+    assert!(kv.delete("flags", "beta").unwrap());
+    assert_eq!(kv.count("flags").unwrap(), 1);
+
+    db.pool().batch("DROP TABLE orm_pg_kv").unwrap();
 }

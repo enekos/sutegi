@@ -1,6 +1,6 @@
 # sutegi
 
-A **zero-dependency, agent-native web framework for Rust** — Laravel's
+A **zero-dependency, agent-native web framework for Rust** — batteries-included
 ergonomics, built from `std` up. No tokio, no serde, no hyper.
 
 ```rust

@@ -6,10 +6,9 @@
 //!
 //! | Feature | Pulls in | Gives you |
 //! |---------|----------|-----------|
-//! | `orm`      | sutegi-orm      | schema + query builder + migrations |
-//! | `sqlite`   | + bundled rusqlite | a runnable SQLite execution layer (per-pod) |
-//! | `postgres` | sutegi-pg (pure std) | a cross-pod Postgres execution layer |
-//! | `durable-queue` | + sutegi-pg | a cross-pod, DB-backed job queue |
+//! | `orm`      | sutegi-orm      | schema + query builder + migrations + KV |
+//! | `sqlite`   | + bundled rusqlite | SQLite: the single-node execution layer |
+//! | `postgres` | sutegi-pg (pure std) | Postgres: the multi-pod execution layer |
 //! | `derive`   | sutegi-macros (build-time only) | `#[derive(Model)]` |
 //! | `validate` | sutegi-validate | request / tool validation |
 //! | `ai`       | sutegi-ai       | `Tool`/`StreamTool` + `/__tools` |
@@ -89,6 +88,12 @@ pub mod binding {
 /// access, `.env` loading, required-var validation, and prefix scoping.
 pub mod config;
 
+/// A fluent, owned collection type ([`collection::Collection`]) plus the
+/// [`collect`] constructor — chainable `map`/`filter`/`group_by`/`chunk`/… over
+/// any iterable, with zero third-party deps.
+pub mod collection;
+pub use collection::{collect, Collection};
+
 /// Read a single env var with a fallback — a shortcut over [`config::Config`]
 /// for the common one-off case (`PORT`, `WORKERS`, …).
 pub fn env_or(key: &str, default: &str) -> String {
@@ -98,6 +103,7 @@ pub fn env_or(key: &str, default: &str) -> String {
 /// The common imports for building an app. Items appear only when their feature
 /// is enabled, so the prelude tracks your build.
 pub mod prelude {
+    pub use crate::collection::{collect, Collection};
     pub use crate::config::Config;
     pub use sutegi_json::Json;
     pub use sutegi_web::{
@@ -129,6 +135,10 @@ pub mod prelude {
 
     #[cfg(feature = "postgres")]
     pub use sutegi_orm::pg::Pg;
+
+    /// The JSON key/value store — available over either backend.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    pub use sutegi_orm::kv::Kv;
 
     #[cfg(feature = "hex")]
     pub use sutegi_hex::{

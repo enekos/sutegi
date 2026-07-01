@@ -189,7 +189,7 @@ impl App {
     }
 
     /// Register a group of routes sharing a path `prefix` and group-scoped
-    /// `middleware`. Laravel-style: `app.group("/api", vec![mw(auth)], |g| g.get(...))`.
+    /// `middleware`: `app.group("/api", vec![mw(auth)], |g| g.get(...))`.
     pub fn group(
         mut self,
         prefix: &str,

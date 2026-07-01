@@ -1,4 +1,4 @@
-//! The `sutegi` CLI — sutegi's answer to Laravel's `artisan`.
+//! The `sutegi` CLI — scaffold and introspect sutegi apps.
 //!
 //! Scaffolding follows rigid, predictable conventions on purpose: a model is
 //! always `crates or src/models/<snake>.rs` with the same struct/impl shape, a

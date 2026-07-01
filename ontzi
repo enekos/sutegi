@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# sutegi Sail — a thin wrapper over Docker Compose (and kubectl) for local
-# multi-instance dev, mirroring Laravel Sail's ergonomics.
+# sutegi ontzi (Basque: vessel / container) — a thin wrapper over Docker Compose
+# (and kubectl) for local multi-instance dev.
 #
-#   ./sail up [N]        build + start with N app replicas (default 3) + LB on :8080
-#   ./sail down          stop and remove
-#   ./sail build         (re)build the image
-#   ./sail logs [svc]    tail logs (default: all)
-#   ./sail ps            list containers
-#   ./sail curl <path>   curl the load balancer (e.g. ./sail curl /api/todos)
-#   ./sail shell         shell into a fresh builder image (distroless runtime has none)
-#   ./sail k8s [apply|delete]   apply/delete the Kubernetes manifests
+#   ./ontzi up [N]        build + start with N app replicas (default 3) + LB on :8080
+#   ./ontzi down          stop and remove
+#   ./ontzi build         (re)build the image
+#   ./ontzi logs [svc]    tail logs (default: all)
+#   ./ontzi ps            list containers
+#   ./ontzi curl <path>   curl the load balancer (e.g. ./ontzi curl /api/todos)
+#   ./ontzi shell         shell into a fresh builder image (distroless runtime has none)
+#   ./ontzi k8s [apply|delete]   apply/delete the Kubernetes manifests
 #
 # Env: APP=todo|hello (which example to run), DATABASE_PATH=:memory:|/data/app.db
 set -euo pipefail

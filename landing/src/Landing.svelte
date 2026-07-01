@@ -18,7 +18,7 @@
 
   // --- hero scramble ---
   let heroTitle = $state('');
-  const finalTitle = 'Laravel for Rust';
+  const finalTitle = 'Batteries-included Rust';
   onMount(() => {
     let t = 0;
     const iv = setInterval(() => {
@@ -136,7 +136,7 @@ fn main() -> std::io::Result<()> {
 curl localhost:8080/__tools        # LLM tool-calling manifest
 curl -X POST localhost:8080/__tools/create_todo -d '{"title":"ship sutegi"}'`;
 
-  // --- tutorial (Laravel-style guided walkthrough: build a Todo API) ---
+  // --- tutorial (guided walkthrough: build a Todo API) ---
   // Each chapter builds on the last. `lead`, `tip` and `note` are rendered as
   // HTML (they carry inline <code> spans); `code` is verbatim text.
   const tutorial = [
@@ -205,7 +205,7 @@ let page = db.paginate(&Todo::query().order_by("id", true), 2, 20)?;`,
         },
         {
           id: 'validate', icon: ShieldCheck, kicker: 'Step 5', title: 'Validate the input',
-          lead: 'Never trust the request body. sutegi ships a Laravel-Validator-style rule set (plus a JSON Schema validator) that returns structured, per-field errors — hand them straight back to the client as a <code>422</code>. Define the rules, call <code>validate</code>, and you’re done.',
+          lead: 'Never trust the request body. sutegi ships a fluent <code>Validator</code>-style rule set (plus a JSON Schema validator) that returns structured, per-field errors — hand them straight back to the client as a <code>422</code>. Define the rules, call <code>validate</code>, and you’re done.',
           code: `let rules = Ruleset::new()
     .field("email", &[Rule::Required, Rule::Email])
     .field("age",   &[Rule::Integer, Rule::Between(18.0, 120.0)])
@@ -295,12 +295,12 @@ let stats = queue.stats();         // dispatched / processed / failed / retried`
 // GET /__metrics  Prometheus      GET /__introspect  full surface`,
         },
         {
-          id: 'deploy', icon: Rocket, kicker: 'Step 11', title: 'Deploy with Sail',
-          lead: 'Finally, a Laravel-Sail-style harness wraps Docker Compose: spin up N replicas behind an nginx load balancer (with <code>proxy_buffering off</code>, so the SSE streams from Step&nbsp;7 pass straight through), then promote the same shape to Kubernetes — the manifests ship with probes, graceful drain and Prometheus annotations already wired.',
-          code: `./sail up 3            # 3 replicas + LB on http://localhost:8080
-./sail curl /api/todos
-./sail logs
-./sail k8s apply      # apply deploy/k8s/ (probes, drain, metrics)`,
+          id: 'deploy', icon: Rocket, kicker: 'Step 11', title: 'Deploy with ontzi',
+          lead: 'Finally, <code>ontzi</code> (Basque: vessel / container) wraps Docker Compose: spin up N replicas behind an nginx load balancer (with <code>proxy_buffering off</code>, so the SSE streams from Step&nbsp;7 pass straight through), then promote the same shape to Kubernetes — the manifests ship with probes, graceful drain and Prometheus annotations already wired.',
+          code: `./ontzi up 3            # 3 replicas + LB on http://localhost:8080
+./ontzi curl /api/todos
+./ontzi logs
+./ontzi k8s apply      # apply deploy/k8s/ (probes, drain, metrics)`,
           tip: 'That’s the whole journey: a route, a database, validation, an agent interface, streaming, jobs and a production deploy — and your binary still has zero runtime dependencies.',
         },
       ],
@@ -498,7 +498,7 @@ let stats = queue.stats();         // dispatched / processed / failed / retried`
           { icon: Workflow, t: 'Routing & middleware', d: 'Path params, route groups, before/after middleware, typed extractors.' },
           { icon: Database, t: 'ORM & query builder', d: 'Parameterized SELECT/UPDATE/DELETE, migrations, transactions, optional SQLite.' },
           { icon: FileCode, t: '#[derive(Model)]', d: 'Typed models hydrate from rows and serialize to JSON; build-time-only macro.' },
-          { icon: ShieldCheck, t: 'Validation', d: 'Laravel-style rules + JSON Schema, structured per-field errors.' },
+          { icon: ShieldCheck, t: 'Validation', d: 'Fluent rule sets + JSON Schema, structured per-field errors.' },
           { icon: Radio, t: 'Streaming & SSE', d: 'Stream bytes or Server-Sent Events with natural backpressure.' },
           { icon: Cpu, t: 'Background jobs', d: 'In-process queue: workers, retries, delayed dispatch, stats.' },
           { icon: Zap, t: 'Agent-native', d: '/__introspect + /__tools: discover, manifest, invoke — over plain JSON.' },

@@ -1,7 +1,7 @@
 //! Validation, two ways — both producing the same structured, agent-readable
 //! error shape (`{ field: [messages] }`).
 //!
-//! * [`Ruleset`] — a Laravel-`Validator`-style fluent rule builder for request
+//! * [`Ruleset`] — a fluent, `Validator`-style rule builder for request
 //!   bodies: `Ruleset::new().field("email", &[Rule::Required, Rule::Email])`.
 //! * [`validate_schema`] — interprets a useful subset of JSON Schema, so an AI
 //!   tool's declared `input_schema` doubles as its validator with no extra code.
@@ -56,7 +56,7 @@ impl ValidationErrors {
     }
 }
 
-/// A single Laravel-flavored validation rule.
+/// A single validation rule.
 #[derive(Clone, Debug)]
 pub enum Rule {
     Required,

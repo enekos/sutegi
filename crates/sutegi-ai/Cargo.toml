@@ -9,6 +9,6 @@ authors.workspace = true
 description = "First-class LLM primitives for sutegi: tool-calling, structured output, and agent-facing endpoints."
 
 [dependencies]
-sutegi-web = { path = "../sutegi-web", version = "0.2.0" }
-sutegi-json = { path = "../sutegi-json", version = "0.2.0" }
-sutegi-validate = { path = "../sutegi-validate", version = "0.2.0" }
+sutegi-web = { path = "../sutegi-web", version = "0.3.0" }
+sutegi-json = { path = "../sutegi-json", version = "0.3.0" }
+sutegi-validate = { path = "../sutegi-validate", version = "0.3.0" }

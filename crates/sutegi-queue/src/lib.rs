@@ -1,5 +1,5 @@
-//! A **durable, cross-pod** job queue backed by PostgreSQL — sutegi's answer to
-//! Laravel queues, built to survive restarts and span replicas.
+//! A **durable, cross-pod** job queue backed by PostgreSQL — built to survive
+//! restarts and span replicas.
 //!
 //! Jobs live in a `sutegi_jobs` table. Any number of app pods can enqueue and
 //! process from the same queue: workers claim a job atomically with

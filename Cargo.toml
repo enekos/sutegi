@@ -17,13 +17,14 @@ members = [
     "examples/todo",
     "examples/hello",
     "examples/hexagonal",
+    "examples/kv",
 ]
 # The bench runner is its own workspace (depends on the external aatxe SDK by
 # path); excluded so normal builds / tests / publish never touch it.
 exclude = ["benches"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT"

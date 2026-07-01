@@ -4,7 +4,7 @@
 //! * SQLite ORM — `migrate` / `all_typed` / `find_typed` / `create`
 //! * route **groups** + group **middleware** (`/api`, request logger)
 //! * **route-model binding** — `GET /api/todos/:id` hydrates a `Todo` or 404s
-//! * Laravel-style **validation** + a first-class **AI tool** sharing the DB
+//! * fluent **validation** + a first-class **AI tool** sharing the DB
 //!
 //! (The durable, cross-pod job queue lives in `sutegi-queue` and needs a
 //! PostgreSQL pool, so it isn't wired into this self-contained SQLite demo.)
@@ -34,7 +34,7 @@ struct Todo {
 
 type Database = Arc<Mutex<Db>>;
 
-/// Validation rules for creating a todo — Laravel `Validator` style.
+/// Validation rules for creating a todo — fluent `Validator` style.
 fn create_todo_rules() -> Ruleset {
     Ruleset::new()
         .field(

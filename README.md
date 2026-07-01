@@ -1,6 +1,6 @@
 # sutegi — the forge
 
-> Laravel's batteries-included ergonomics, in Rust — built from `std` up, with a
+> Batteries-included web ergonomics, in Rust — built from `std` up, with a
 > tiny binary and an AI agent as a first-class user.
 
 `sutegi` (Basque: *forge / smithy*) is a web framework for Rust with **zero
@@ -48,10 +48,11 @@ fn main() -> std::io::Result<()> {
 | `sutegi-json` | JSON value, serializer, parser (deterministic key order). |
 | `sutegi-http` | HTTP/1.1 parsing + thread-pool server on `std::net`. |
 | `sutegi-web`  | Router, `App` builder, middleware, groups, extractors, streaming (`sse`/`stream`), `/__introspect`. |
-| `sutegi-orm`  | Typed schema, fluent parameterized query builder, migration emitter, optional runnable SQLite layer (`sqlite` feature). |
+| `sutegi-orm`  | Typed schema, fluent parameterized query builder, one `Backend` trait, a JSON key/value store, and two runnable backends: **SQLite** (`sqlite`, single-node) and **Postgres** (`postgres`, multi-pod). |
+| `sutegi-pg`   | Pure-`std` PostgreSQL driver: wire protocol v3 over blocking TCP, SCRAM-SHA-256 auth, connection pool. No async runtime, no C library. |
 | `sutegi-macros` | `#[derive(Model)]` — schema, typed JSON hydration, inserts. Compile-time only (syn/quote never reach your binary). |
-| `sutegi-validate` | Laravel-`Validator`-style rule sets **and** a JSON Schema subset validator, with structured errors. |
-| `sutegi-queue` | Zero-dep in-process job queue: background workers, retries, delayed dispatch, introspectable stats. |
+| `sutegi-validate` | Fluent `Validator`-style rule sets **and** a JSON Schema subset validator, with structured errors. |
+| `sutegi-queue` | Durable, cross-pod job queue backed by Postgres (`FOR UPDATE SKIP LOCKED` claim, visibility-timeout retries, dead-letter). |
 | `sutegi-ai`   | `Tool` trait, registry, LLM manifest, `/__tools` endpoints (args validated against each tool's schema). |
 | `sutegi-hex`  | Opinionated hexagonal/clean-architecture primitives: `AppError`, `UseCase` ports, `respond` adapter glue. |
 | `sutegi`      | Facade crate + `prelude`. |
@@ -65,20 +66,24 @@ what you use:
 
 | Feature | Default? | Pulls in |
 |---------|:--------:|----------|
-| `orm`      | ✓ | schema + query builder + migrations |
+| `orm`      | ✓ | schema + query builder + `Backend` trait + KV store |
 | `derive`   | ✓ | `#[derive(Model)]` (build-time syn/quote only) |
 | `validate` | ✓ | request / tool validation |
 | `ai`       | ✓ | `Tool`/`StreamTool` + `/__tools` |
-| `queue`    | ✓ | background jobs |
-| `sqlite`   |   | bundled, runnable SQLite execution |
+| `sqlite`   |   | SQLite backend — the **single-node** runnable store (bundled) |
+| `postgres` |   | Postgres backend — the **multi-pod** runnable store (pure std) |
+| `queue`    |   | durable, cross-pod job queue (Postgres-backed) |
 | `graceful` |   | SIGTERM/SIGINT draining (libc) |
 | `hex`      |   | hexagonal/clean-architecture primitives |
+| `auth`     |   | signed-cookie sessions (HMAC-SHA256) |
 
 ```toml
 # Minimal HTTP service — core only:
 sutegi = { version = "*", default-features = false }
-# Just routing + SQLite ORM:
+# Single-node app with the SQLite backend + KV:
 sutegi = { version = "*", default-features = false, features = ["sqlite"] }
+# Multi-pod app on Postgres:
+sutegi = { version = "*", default-features = false, features = ["postgres"] }
 ```
 
 Measured: the core-only `hello` example is **~362 KB**; the full `todo` example
@@ -124,24 +129,32 @@ connections, and lets in-flight requests finish before exit — exactly what a
 Kubernetes rolling update needs. (`run_until(addr, flag)` gives you manual
 control without the signal feature.)
 
-**Honest caveat on state.** The request/route/AI surface is stateless and scales
-horizontally today. But the in-process queue and (in-memory/file) SQLite are
-**per-pod** — a job dispatched on one pod runs there; a todo written on one pod
-isn't on another. For shared state across pods, point at a shared volume, or wait
-for the planned network-DB (Postgres) + durable-queue drivers.
+**State: pick a backend for the deployment.** The request/route/AI surface is
+stateless and scales horizontally. For data, sutegi is opinionated:
 
-## Sail — local multi-instance dev
+- **One instance → SQLite** (`sqlite`). Embedded, zero-ops, single writer. Plus
+  the `Kv` key/value store for config/cache/sessions/flags.
+- **Many pods → Postgres** (`postgres`) + the durable queue (`queue`). A shared,
+  crash-safe source of truth all replicas talk to — pure-`std` driver, no async
+  runtime, no C library.
 
-A Laravel-Sail-style harness wraps Docker Compose so you run the same
-horizontally-scaled shape locally: N app replicas behind an nginx load balancer
-(configured `proxy_buffering off`, so SSE streams pass straight through).
+Both backends implement the same `Backend` trait and drive the same query
+builder + `Model` surface, so moving from one to the other changes the type you
+hold, not your handlers.
+
+## Ontzi — local multi-instance dev
+
+`ontzi` (Basque: *vessel / container*) is a small harness that wraps Docker
+Compose so you run the same horizontally-scaled shape locally: N app replicas
+behind an nginx load balancer (configured `proxy_buffering off`, so SSE streams
+pass straight through).
 
 ```bash
-./sail up 3            # build + 3 app replicas + LB on http://localhost:8080
-./sail curl /api/todos
-./sail logs
-./sail down
-./sail k8s apply       # or apply the Kubernetes manifests (deploy/k8s/)
+./ontzi up 3            # build + 3 app replicas + LB on http://localhost:8080
+./ontzi curl /api/todos
+./ontzi logs
+./ontzi down
+./ontzi k8s apply       # or apply the Kubernetes manifests (deploy/k8s/)
 ```
 
 `deploy/k8s/deployment.yaml` shows the production shape: 3 replicas, liveness/
@@ -183,16 +196,26 @@ A sutegi app is drivable by an LLM with no source access and no integration code
 
 See [`AGENTS.md`](./AGENTS.md) for the full agent-facing contract.
 
-## Database (the `sqlite` feature)
+## Data: two backends, one API
 
 The core ships **no** database driver — the query builder just emits
-`(sql, params)`, keeping the default binary tiny. Opt in to a runnable, bundled
-SQLite layer with `--features sqlite`:
+`(sql, params)`, keeping the default binary tiny. Opt in to a runnable backend,
+and sutegi is opinionated about which:
+
+- **SQLite** (`--features sqlite`) — the **single-node** store. Embedded,
+  zero-ops, one writer. Bundled; grows the binary to ~1.3 MB.
+- **Postgres** (`--features postgres`) — the **multi-pod** store. A shared,
+  durable server many replicas talk to. Pure `std`, no async runtime, no C
+  library, so the zero-dep core stays ~378 KB.
+
+Both implement the same [`Backend`] trait, and `Model` is written once against
+it — **swap the backend, not your handlers**:
 
 ```rust
-use sutegi::prelude::*;          // brings in Db when the feature is on
+use sutegi::prelude::*;          // brings in Db / Pg / Kv / Backend when enabled
 
-let db = Db::memory()?;          // or Db::open("app.db")?
+let db = Db::memory()?;          // single-node: or Db::open("app.db")?
+// let db = Pg::from_env(8)?;    // multi-pod: same code from here down
 Todo::migrate(&db)?;             // CREATE TABLE from the model schema
 
 let id = Todo::create(&db, &[("title", Value::Text("ship sutegi".into()))])?;
@@ -200,8 +223,7 @@ let one  = Todo::find(&db, Value::Int(id))?;   // Option<Json>
 let all  = Todo::all(&db)?;                     // Vec<Json>
 ```
 
-Rows come back as JSON objects. Enabling `sqlite` grows the binary to ~1.3 MB
-(bundled SQLite); the zero-dep core remains ~378 KB.
+Rows come back as JSON objects.
 
 The query layer covers reads and writes, all parameterized:
 
@@ -225,15 +247,36 @@ QueryBuilder::table("todos")
 UpdateBuilder::table("todos").set("done", Value::Bool(true)).filter("id", "=", Value::Int(5)).build();
 DeleteBuilder::table("todos").filter("id", "=", Value::Int(5)).build();
 
-// Runnable (sqlite): transactions, counts, existence, upsert, pagination.
-db.transaction(|tx| { tx.insert("todos", &[/* … */])?; Ok(()) })?;     // COMMIT / ROLLBACK
+// Runnable: transactions, counts, existence, upsert, pagination — all on the
+// `Backend` trait, identical on SQLite and Postgres. The transaction closure
+// receives a `Backend` (SQLite `&Db`, Postgres `Tx`), so the query builder and
+// Model helpers work inside it.
+db.transaction(|tx| { tx.insert("todos", &[/* … */], "id")?; Ok(()) })?;  // COMMIT / ROLLBACK
 let n = Todo::count(&db)?;                                              // i64
 let ok = db.exists(&Todo::query().filter("id", "=", Value::Int(1)))?;  // bool
-db.upsert("todos", &[("id", Value::Int(1)), ("title", Value::Text("x".into()))], "id")?;
+db.upsert("todos", &[("id", Value::Int(1)), ("title", Value::Text("x".into()))], "id", "id")?;  // conflict col, pk
 Todo::update(&db, Value::Int(1), &[("done", Value::Bool(true))])?;     // by primary key
 Todo::delete(&db, Value::Int(1))?;
 let page = db.paginate(&Todo::query().order_by("id", true), 2, 20)?;   // Page { items, total, page, … }
 let one: Option<Todo> = db.fetch_one(&Todo::query().filter("id", "=", Value::Int(1)))?;
+```
+
+### `Kv` — a JSON key/value store (either backend)
+
+Not everything wants a schema. `Kv` is a namespaced JSON key/value store over any
+`Backend` — one table, single-statement reads/writes. It's the natural fit for
+config, caches, feature flags, and sessions on a single SQLite node (and works on
+Postgres for small *shared* state). See [`examples/kv`](./examples/kv).
+
+```rust
+use sutegi::prelude::*;
+
+let kv = Kv::new(Db::open("app.db")?);
+kv.migrate()?;
+kv.set("config", "theme", &Json::str("dark"))?;
+let theme = kv.get("config", "theme")?;              // Some(Json::Str("dark"))
+let flags = kv.scan("flags")?;                        // Vec<(String, Json)>
+kv.delete("config", "theme")?;
 ```
 
 ### Typed models with `#[derive(Model)]`
@@ -301,12 +344,35 @@ queue.dispatch(Notify { to: "a@b.com".into() });
 let stats = queue.stats();           // { dispatched, processed, failed, retried } — JSON-able
 ```
 
+## Collections
+
+`collect(..)` wraps any iterable in a `Collection<T>` — a fluent, chainable API
+for the everyday shaping that raw `Iterator` makes verbose (`filter`/`reject`,
+`map`/`filter_map`, `group_by`, `partition`, `chunk`, `unique`, `implode`,
+`tap`/`pipe`, …). It's a thin layer over `Vec<T>`: it `Deref`s to `[T]` and
+round-trips through `Vec`/iterators, so it adds no allocation over doing the
+work by hand.
+
+```rust
+use sutegi::collect;
+
+let report = collect(orders)
+    .filter(|o| o.paid)
+    .group_by(|o| o.country.clone())      // HashMap<String, Collection<Order>>
+    .into_iter()
+    .map(|(country, os)| format!("{country}: {}", os.sum_by(|o| o.total)))
+    .collect::<Vec<_>>();
+
+// Numeric chains read left-to-right:
+let total: i64 = collect(vec![1, 2, 3, 4]).filter(|n| n % 2 == 0).map(|n| n * 10).sum();
+```
+
 ## Validation
 
 Two entry points, one structured error shape (`{ field: [messages] }`):
 
 ```rust
-// Laravel-style request validation
+// Fluent request validation
 let rules = Ruleset::new()
     .field("title",    &[Rule::Required, Rule::Str, Rule::MinLen(1), Rule::MaxLen(200)])
     .field("email",    &[Rule::Required, Rule::Email])
@@ -411,14 +477,15 @@ with concurrency across the worker pool. Numbers are machine-dependent — run
 
 ## Status
 
-Early but increasingly capable. Typed models (`#[derive(Model)]`), a runnable
-SQLite ORM (opt-in `sqlite`), validation (requests + AI tool args), route groups
-+ middleware, route-model binding, and a background job queue all work and are
-exercised by the `todo` example. Streaming responses (SSE + raw) and streaming
-AI tools are supported. Every pillar is an opt-in compile feature; the runtime
-ships health/readiness/metrics endpoints and graceful shutdown for pods, with a
-Sail-style Docker/k8s harness. HTTP is 1.1, connection-per-request, no TLS. Next:
-network DB (Postgres) + durable queue driver for true cross-pod state,
-form-encoded bodies, keep-alive, relations/joins in the query builder.
+Early but increasingly capable. Typed models (`#[derive(Model)]`), a query
+builder + `Backend` trait over **two runnable backends** (SQLite single-node,
+pure-`std` Postgres multi-pod), a JSON `Kv` store, validation (requests + AI tool
+args), route groups + middleware, route-model binding, and a **durable, cross-pod
+job queue** (Postgres) all work and are exercised by the `todo`/`kv` examples.
+Streaming responses (SSE + raw) and streaming AI tools are supported. Every pillar
+is an opt-in compile feature; the runtime ships health/readiness/metrics endpoints
+and graceful shutdown for pods, with an `ontzi` Docker/k8s harness. HTTP is 1.1,
+connection-per-request. Next: TLS to Postgres, form-encoded bodies, keep-alive,
+relations/joins in the query builder.
 
 MIT © 2026 Eneko Sarasola
