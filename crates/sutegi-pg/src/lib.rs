@@ -9,10 +9,12 @@
 //!   so every query is parameterized and injection-safe.
 //! - Rows decoded straight into [`sutegi_json::Json`], typed by column OID —
 //!   the same machine-readable shape the rest of sutegi speaks.
+//! - **Per-connection prepared-statement caching** (on by default): a SQL
+//!   string is `Parse`d into a named statement once, then reused with only
+//!   `Bind`/`Execute` on repeat. Toggle with [`Config::statement_cache`].
 //!
 //! What it does not (yet): TLS (terminate at the LB / mesh, or run inside the
-//! cluster network), binary result format, prepared-statement caching,
-//! `COPY`, and `LISTEN/NOTIFY`.
+//! cluster network), binary result format, `COPY`, and `LISTEN/NOTIFY`.
 
 mod crypto;
 mod pool;
@@ -30,6 +32,12 @@ pub enum PgValue {
     Real(f64),
     Text(String),
     Bool(bool),
+    /// A JSON document, sent as text. The server coerces it to `json`/`jsonb`
+    /// from the target column type (parameter types are inferred).
+    Json(String),
+    /// An embedding vector in pgvector's `[1,2,3]` text form (target column
+    /// type `vector`, provided by the pgvector extension).
+    Vector(String),
 }
 
 /// Connection settings. Build from a URL ([`Config::from_url`]), the
@@ -43,6 +51,9 @@ pub struct Config {
     pub dbname: String,
     /// Applied as the socket connect/read/write timeout when set.
     pub timeout: Option<Duration>,
+    /// Reuse server-side prepared statements per connection (the default).
+    /// Set `false` to force every query through an unnamed statement.
+    pub statement_cache: bool,
 }
 
 impl Default for Config {
@@ -54,6 +65,7 @@ impl Default for Config {
             password: None,
             dbname: "postgres".into(),
             timeout: Some(Duration::from_secs(30)),
+            statement_cache: true,
         }
     }
 }
@@ -111,6 +123,7 @@ impl Config {
                 percent_decode(&dbname)
             },
             timeout: Some(Duration::from_secs(30)),
+            statement_cache: true,
         })
     }
 
@@ -129,6 +142,7 @@ impl Config {
             password: var("PGPASSWORD"),
             dbname: var("PGDATABASE").unwrap_or_else(|| "postgres".into()),
             timeout: Some(Duration::from_secs(30)),
+            statement_cache: true,
         })
     }
 }

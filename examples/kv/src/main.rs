@@ -1,7 +1,10 @@
-//! A single-node settings / feature-flag store built on sutegi's `Kv` layer
-//! over SQLite — the embedded, zero-ops shape (no server to run, one file on
-//! disk). The same `Kv` API also runs over Postgres for small shared state;
-//! here we lean into SQLite's single-node sweet spot.
+//! A single-node settings / feature-flag store on sutegi's `Kv` layer over
+//! SQLite — the embedded, zero-ops shape (one file on disk, no server to run
+//! beyond this one). The same `Kv` API also runs over Postgres for small shared
+//! state; here we lean into SQLite's single-node sweet spot.
+//!
+//! The store is ordinary app state: `.state(kv)`, then `c.state::<Kv<Db>>()` in
+//! any handler. No `Arc<Mutex<…>>`, no per-route clones.
 //!
 //! ```text
 //! curl -X PUT  localhost:8080/kv/config/theme -d '"dark"'
@@ -11,104 +14,58 @@
 //! curl -X DELETE localhost:8080/kv/config/theme
 //! ```
 
-use std::sync::{Arc, Mutex};
-
 use sutegi::orm::kv::Kv;
-use sutegi::orm::{db::Db, Backend};
 use sutegi::prelude::*;
 
-type Store = Arc<Mutex<Kv<Db>>>;
-
-fn err(code: u16, msg: impl Into<String>) -> Response {
-    json(code, &Json::obj(vec![("error", Json::str(msg.into()))]))
-}
+type Store = Kv<Db>;
 
 fn main() -> std::io::Result<()> {
-    // One embedded file — or `Db::memory()` for a throwaway store.
-    let db = Db::open(&sutegi::env_or("KV_PATH", "kv.db")).expect("open db");
+    // One embedded file (override with KV_PATH) — pooled and Send+Sync.
+    let db = Db::open(&std::env::var("KV_PATH").unwrap_or_else(|_| "kv.db".to_string()))
+        .expect("open db");
+    let ready = db.clone();
     let kv = Kv::new(db);
     kv.migrate().expect("migrate kv");
-    let kv: Store = Arc::new(Mutex::new(kv));
 
-    let get_kv = Arc::clone(&kv);
-    let set_kv = Arc::clone(&kv);
-    let del_kv = Arc::clone(&kv);
-    let scan_kv = Arc::clone(&kv);
-    let ready_kv = Arc::clone(&kv);
-
-    let app = App::new("kv-demo")
-        .workers(sutegi::env_or("WORKERS", "8").parse().unwrap_or(8))
-        // Readiness gates traffic on the store being reachable.
-        .readiness(move || {
-            ready_kv
-                .lock()
-                .map(|kv| kv.backend().query("SELECT 1", &[]).is_ok())
-                .unwrap_or(false)
-        })
-        .get("/", "Health check.", |_req, _p| text(200, "sutegi kv up"))
-        .get("/kv/:ns/:key", "Read a value.", move |_req, p| {
-            let (ns, key) = (p.get("ns"), p.get("key"));
-            let (Some(ns), Some(key)) = (ns, key) else {
-                return err(400, "ns and key required");
-            };
-            match get_kv.lock().unwrap().get(ns, key) {
-                Ok(Some(v)) => json(200, &v),
-                Ok(None) => err(404, "not found"),
-                Err(e) => err(500, e),
-            }
-        })
+    App::new("kv-demo")
+        .state(kv)
+        .readiness(move || ready.query("SELECT 1", &[]).is_ok())
+        .get("/", "Health check.", |_| "sutegi kv up")
         .get(
-            "/kv/:ns",
-            "List a namespace as an object.",
-            move |_req, p| {
-                let Some(ns) = p.get("ns") else {
-                    return err(400, "ns required");
-                };
-                match scan_kv.lock().unwrap().scan(ns) {
-                    Ok(pairs) => json(
-                        200,
-                        &Json::obj(pairs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect()),
-                    ),
-                    Err(e) => err(500, e),
-                }
-            },
-        )
-        .put(
             "/kv/:ns/:key",
-            "Write a value (body = JSON).",
-            move |req, p| {
-                let (Some(ns), Some(key)) = (p.get("ns"), p.get("key")) else {
-                    return err(400, "ns and key required");
-                };
-                let value = match json_body(req) {
-                    Ok(b) => b,
-                    Err(e) => return err(400, e),
-                };
-                match set_kv.lock().unwrap().set(ns, key, &value) {
-                    Ok(()) => json(200, &value),
-                    Err(e) => err(500, e),
+            "Read a value.",
+            |c| -> Result<Response, Error> {
+                match c.state::<Store>().get(ns(c), key(c))? {
+                    Some(v) => Ok(json(200, &v)),
+                    None => Err(Error::not_found("not found")),
                 }
             },
         )
-        .delete("/kv/:ns/:key", "Delete a value.", move |_req, p| {
-            let (Some(ns), Some(key)) = (p.get("ns"), p.get("key")) else {
-                return err(400, "ns and key required");
-            };
-            match del_kv.lock().unwrap().delete(ns, key) {
-                Ok(removed) => json(200, &Json::obj(vec![("deleted", Json::Bool(removed))])),
-                Err(e) => err(500, e),
-            }
-        });
+        .get("/kv/:ns", "List a namespace as an object.", |c| {
+            let pairs = c.state::<Store>().scan(ns(c))?;
+            Ok::<_, Error>(json(
+                200,
+                &Json::obj(pairs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect()),
+            ))
+        })
+        .put("/kv/:ns/:key", "Write a value (body = JSON).", |c| {
+            let value = c.json()?;
+            c.state::<Store>().set(ns(c), key(c), &value)?;
+            Ok::<_, Error>(json(200, &value))
+        })
+        .delete("/kv/:ns/:key", "Delete a value.", |c| {
+            let removed = c.state::<Store>().delete(ns(c), key(c))?;
+            Ok::<_, Error>(json(
+                200,
+                &Json::obj(vec![("deleted", Json::Bool(removed))]),
+            ))
+        })
+        .serve()
+}
 
-    let addr = std::env::args().nth(1).unwrap_or_else(|| {
-        format!(
-            "{}:{}",
-            sutegi::env_or("HOST", "0.0.0.0"),
-            sutegi::env_or("PORT", "8080")
-        )
-    });
-    println!("sutegi kv-demo on http://{addr}");
-    println!("  ops:  /__health | /__ready | /__metrics | /__introspect");
-    println!("  app:  GET/PUT/DELETE /kv/:ns/:key | GET /kv/:ns");
-    app.run(&addr)
+fn ns<'a>(c: &'a Ctx) -> &'a str {
+    c.param("ns").unwrap_or("")
+}
+fn key<'a>(c: &'a Ctx) -> &'a str {
+    c.param("key").unwrap_or("")
 }

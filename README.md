@@ -13,7 +13,7 @@ Three design goals, held simultaneously:
 | Goal | How |
 |------|-----|
 | **From the ground up** | Every component is original std-only code you can read in one sitting. |
-| **Minimum binary size** | No async runtime; size-optimized release profile. The demo app + server is **~378 KB**. |
+| **Minimum binary size** | No async runtime; size-optimized release profile. A minimal core-only service is **~394 KB**. |
 | **Agent-native** | Routes, models, and tools are introspectable as JSON at runtime; tools are a first-class concept with a built-in LLM manifest + invocation endpoint. |
 
 ## Quickstart
@@ -26,18 +26,60 @@ cargo run -p todo-example -- 127.0.0.1:8080
 curl localhost:8080/__introspect              # full app surface as JSON
 curl localhost:8080/__tools                   # LLM tool-calling manifest
 curl -X POST localhost:8080/__tools/create_todo -d '{"title":"ship sutegi"}'
-curl localhost:8080/todos
+curl localhost:8080/api/todos
 ```
 
-A minimal app:
+A minimal app — handlers take one `Ctx` and return anything that is
+`IntoResponse`; `serve()` reads `HOST`/`PORT`/`WORKERS` (or `argv[1]`) and drains
+gracefully on SIGTERM:
 
 ```rust
 use sutegi::prelude::*;
 
 fn main() -> std::io::Result<()> {
     App::new("hello")
-        .get("/", "Health check", |_req, _params| text(200, "sutegi up"))
-        .run("127.0.0.1:8080")
+        .get("/", "Health check", |_| "sutegi up")
+        .get("/hello/:name", "Greet", |c| format!("hi, {}", c.param("name").unwrap_or("world")))
+        .serve()
+}
+```
+
+The whole `todo` demo — typed model, validation, pooled SQLite state, an HTTP
+CRUD surface, and an AI tool — is ~60 lines:
+
+```rust
+use sutegi::prelude::*;
+
+#[derive(Model, Validate)]
+#[model(table = "todos")]
+struct Todo {
+    #[model(primary)] id: i64,
+    #[validate(required, str, min_len = 1, max_len = 200)] title: String,
+    done: bool,
+}
+
+fn main() -> std::io::Result<()> {
+    let db = Db::open_or_memory("DATABASE_PATH");   // pooled, Send + Sync — no Arc/Mutex
+    Todo::migrate(&db).unwrap();
+
+    App::new("todo")
+        .state(db)
+        .get("/api/todos", "list", |c| -> Result<Json, Error> {
+            Ok(Json::arr(Todo::all_typed(c.db::<Db>())?.iter().map(Todo::to_json).collect()))
+        })
+        .get("/api/todos/:id", "show", |c| c.model::<Todo, Db>("id").map(|t| t.to_json()))
+        .post("/api/todos", "create", |c| {
+            let todo: Todo = c.validated()?;          // parse + validate → 422 on failure
+            let id = todo.save(c.db::<Db>())?;         // typed insert; DB assigns the id
+            Ok::<_, Error>((201, Todo { id, ..todo }.to_json()))
+        })
+        .tool("create_todo", "Create a todo",
+            schema::object(vec![("title", schema::string("the title"))], &["title"]),
+            |c, args| {
+                let todo = Todo::from_input(&args)?;   // args already schema-validated
+                Ok(Todo { id: todo.save(c.db::<Db>())?, ..todo }.to_json())
+            })
+        .serve()
 }
 ```
 
@@ -50,10 +92,10 @@ fn main() -> std::io::Result<()> {
 | `sutegi-web`  | Router, `App` builder, middleware, groups, extractors, streaming (`sse`/`stream`), `/__introspect`. |
 | `sutegi-orm`  | Typed schema, fluent parameterized query builder, one `Backend` trait, a JSON key/value store, and two runnable backends: **SQLite** (`sqlite`, single-node) and **Postgres** (`postgres`, multi-pod). |
 | `sutegi-pg`   | Pure-`std` PostgreSQL driver: wire protocol v3 over blocking TCP, SCRAM-SHA-256 auth, connection pool. No async runtime, no C library. |
-| `sutegi-macros` | `#[derive(Model)]` — schema, typed JSON hydration, inserts. Compile-time only (syn/quote never reach your binary). |
+| `sutegi-macros` | `#[derive(Model)]` (schema, hydration, `save`, `from_input`) and `#[derive(Validate)]` (field-attr rulesets). Compile-time only (syn/quote never reach your binary). |
 | `sutegi-validate` | Fluent `Validator`-style rule sets **and** a JSON Schema subset validator, with structured errors. |
 | `sutegi-queue` | Durable, cross-pod job queue backed by Postgres (`FOR UPDATE SKIP LOCKED` claim, visibility-timeout retries, dead-letter). |
-| `sutegi-ai`   | `Tool` trait, registry, LLM manifest, `/__tools` endpoints (args validated against each tool's schema). |
+| `sutegi-ai`   | The agent surface (`schema` helpers, `ToolCtx`). Tools are first-class on the `App` (`App::tool`/`stream_tool`), auto-mounted at `/__tools` with schema-validated args. |
 | `sutegi-hex`  | Opinionated hexagonal/clean-architecture primitives: `AppError`, `UseCase` ports, `respond` adapter glue. |
 | `sutegi`      | Facade crate + `prelude`. |
 | `sutegi-cli`  | The `sutegi` command: scaffold apps/models/routes, `introspect` a live app. |
@@ -68,8 +110,8 @@ what you use:
 |---------|:--------:|----------|
 | `orm`      | ✓ | schema + query builder + `Backend` trait + KV store |
 | `derive`   | ✓ | `#[derive(Model)]` (build-time syn/quote only) |
-| `validate` | ✓ | request / tool validation |
-| `ai`       | ✓ | `Tool`/`StreamTool` + `/__tools` |
+| `validate` | ✓ | request / tool validation + `Ctx::validate`/`validated` |
+| `ai`       | ✓ | agent surface (`schema` helpers, `ToolCtx`) for `App::tool` |
 | `sqlite`   |   | SQLite backend — the **single-node** runnable store (bundled) |
 | `postgres` |   | Postgres backend — the **multi-pod** runnable store (pure std) |
 | `queue`    |   | durable, cross-pod job queue (Postgres-backed) |
@@ -86,8 +128,8 @@ sutegi = { version = "*", default-features = false, features = ["sqlite"] }
 sutegi = { version = "*", default-features = false, features = ["postgres"] }
 ```
 
-Measured: the core-only `hello` example is **~362 KB**; the full `todo` example
-(every pillar + bundled SQLite) is **~1.28 MB**.
+Measured: the core-only `hello` example is **~394 KB**; the full `todo` example
+(every pillar + bundled SQLite) is **~1.31 MB**.
 
 ## Running at scale (pods)
 
@@ -117,17 +159,19 @@ let db = cfg.prefixed("DB_");              // DB_HOST/DB_PORT → HOST/PORT
 ```
 
 ```rust
+let ready = db.clone();                                  // Db is Send + Sync + Clone
 App::new("api")
-    .workers(Config::load().int("WORKERS", 8) as usize)     // 12-factor config
-    .readiness(move || db.lock().unwrap().query("SELECT 1", &[]).is_ok())
-    .get("/", "health", |_, _| text(200, "ok"))
-    .run_graceful("0.0.0.0:8080")?;   // SIGTERM → stop accepting → drain in-flight
+    .state(db)
+    .readiness(move || ready.query("SELECT 1", &[]).is_ok())
+    .get("/", "health", |_| "ok")
+    .serve()?;   // HOST/PORT/WORKERS from env; SIGTERM → stop accepting → drain
 ```
 
-`run_graceful` (the `graceful` feature) traps SIGTERM/SIGINT, stops accepting new
-connections, and lets in-flight requests finish before exit — exactly what a
-Kubernetes rolling update needs. (`run_until(addr, flag)` gives you manual
-control without the signal feature.)
+`serve()` is the one-call entrypoint. Under the hood it uses `run_graceful` (the
+`graceful` feature), which traps SIGTERM/SIGINT, stops accepting new connections,
+and lets in-flight requests finish before exit — exactly what a Kubernetes
+rolling update needs. (`run(addr)` serves forever; `run_until(addr, flag)` gives
+manual control without the signal feature.)
 
 **State: pick a backend for the deployment.** The request/route/AI surface is
 stateless and scales horizontally. For data, sutegi is opinionated:
@@ -206,7 +250,7 @@ and sutegi is opinionated about which:
   zero-ops, one writer. Bundled; grows the binary to ~1.3 MB.
 - **Postgres** (`--features postgres`) — the **multi-pod** store. A shared,
   durable server many replicas talk to. Pure `std`, no async runtime, no C
-  library, so the zero-dep core stays ~378 KB.
+  library, so the zero-dep core stays ~394 KB.
 
 Both implement the same [`Backend`] trait, and `Model` is written once against
 it — **swap the backend, not your handlers**:
@@ -214,16 +258,18 @@ it — **swap the backend, not your handlers**:
 ```rust
 use sutegi::prelude::*;          // brings in Db / Pg / Kv / Backend when enabled
 
-let db = Db::memory()?;          // single-node: or Db::open("app.db")?
+let db = Db::memory()?;          // single-node: or Db::open("app.db")? (pooled)
 // let db = Pg::from_env(8)?;    // multi-pod: same code from here down
 Todo::migrate(&db)?;             // CREATE TABLE from the model schema
 
-let id = Todo::create(&db, &[("title", Value::Text("ship sutegi".into()))])?;
-let one  = Todo::find(&db, Value::Int(id))?;   // Option<Json>
-let all  = Todo::all(&db)?;                     // Vec<Json>
+let id = Todo { id: 0, title: "ship sutegi".into(), done: false }.save(&db)?;  // typed insert
+let one: Option<Todo> = Todo::find_typed(&db, Value::Int(id))?;
+let all: Vec<Todo>    = Todo::all_typed(&db)?;
 ```
 
-Rows come back as JSON objects.
+`Db` is a pooled, `Send + Sync + Clone` handle — hand it to `App::state(db)` and
+read it back with `c.db::<Db>()`; no `Arc<Mutex<…>>`. Untyped rows come back as
+JSON objects (`Todo::find`/`Todo::all`).
 
 The query layer covers reads and writes, all parameterized:
 
@@ -282,25 +328,29 @@ kv.delete("config", "theme")?;
 ### Typed models with `#[derive(Model)]`
 
 ```rust
-#[derive(Model)]
+#[derive(Model, Validate)]
 #[model(table = "todos")]
 struct Todo {
     #[model(primary)]
     id: i64,
+    #[validate(required, str, min_len = 1, max_len = 200)]
     title: String,
     done: bool,          // round-trips cleanly (SQLite stores 0/1, you get a bool)
     note: Option<String>,// Option<T> => nullable column
 }
 
-let todos: Vec<Todo> = Todo::all_typed(&db)?;     // hydrated structs
-let one: Option<Todo> = Todo::find_typed(&db, Value::Int(1))?;
-let id = Todo::create(&db, &Todo { id: 0, title: "x".into(), done: false, note: None }.to_values()[1..])?;
+let todos: Vec<Todo> = Todo::all_typed(&db)?;                 // hydrated structs
+let one:  Option<Todo> = Todo::find_typed(&db, Value::Int(1))?;
+let id = Todo { id: 0, title: "x".into(), done: false, note: None }.save(&db)?;  // insert, DB assigns id
 let body: Json = one.unwrap().to_json();          // booleans serialize as real booleans
 ```
 
-The derive generates the schema, `FromRow` hydration, `to_values()` (inserts),
-and `to_json()`. Its build-time deps don't affect your runtime binary; turn it
-off with `default-features = false` if you prefer hand-written models.
+`#[derive(Model)]` generates the schema, `FromRow` hydration, `save()` (insert),
+`to_json()`, and `from_input()` (lenient hydrate from a partial client payload).
+`#[derive(Validate)]` turns `#[validate(...)]` field attributes into the model's
+own `Ruleset`, so `c.validated::<Todo>()` parses, validates, and hydrates a body
+in one step. Build-time deps (syn/quote) never reach your runtime binary; turn
+the derives off with `default-features = false` for hand-written models.
 
 ### Route groups + middleware
 
@@ -319,29 +369,36 @@ App::new("api")
 
 Group middleware runs before each route in the group; patterns are prefixed.
 
-### Route-model binding (with `sqlite`)
+### Route-model binding (with a backend)
+
+`Ctx::model` hydrates a model straight from a path parameter over the backend in
+state, returning a ready `404`/`500` `Error` you can `?`:
 
 ```rust
-// GET /api/todos/:id  — hydrate a Todo from the path param, or return 404/500.
-move |_req, p| match sutegi::binding::model::<Todo>(&db.lock().unwrap(), p, "id") {
-    Ok(todo) => json(200, &todo.to_json()),
-    Err(resp) => resp,
-}
+// GET /api/todos/:id  — hydrate a Todo from the path param, or 404/500.
+.get("/api/todos/:id", "show", |c| c.model::<Todo, Db>("id").map(|t| t.to_json()))
 ```
 
-### Background jobs
+### Background jobs (durable, cross-pod)
+
+The queue is Postgres-backed (`queue` feature), so jobs survive a crash and are
+claimed exactly once across pods (`FOR UPDATE SKIP LOCKED` + a visibility
+timeout, with retries and a dead-letter column):
 
 ```rust
-struct Notify { to: String }
-impl Job for Notify {
-    fn name(&self) -> &str { "notify" }
-    fn handle(&self) -> Result<(), String> { /* send … */ Ok(()) }
-    fn tries(&self) -> u32 { 3 }     // retried on Err
-}
+use std::sync::Arc;
+use sutegi::queue::Queue;
 
-let queue = Queue::new(4);           // Arc<Queue>, 4 workers
-queue.dispatch(Notify { to: "a@b.com".into() });
-let stats = queue.stats();           // { dispatched, processed, failed, retried } — JSON-able
+let mut queue = Queue::new(pg.pool().clone());   // over a Pg connection pool
+queue.register("notify", |args| { /* send … */ Ok(()) });  // named handler
+queue.migrate()?;                                 // create sutegi_jobs
+
+// Enqueue from anywhere (any pod):
+queue.dispatch("notify", Json::obj(vec![("to", Json::str("a@b.com"))]))?;
+
+// Run workers (crash-safe, at-least-once, cross-pod):
+let workers = Arc::new(queue).start(4);           // 4 worker threads
+// … later: workers.stop();
 ```
 
 ## Collections
@@ -369,7 +426,27 @@ let total: i64 = collect(vec![1, 2, 3, 4]).filter(|n| n % 2 == 0).map(|n| n * 10
 
 ## Validation
 
-Two entry points, one structured error shape (`{ field: [messages] }`):
+Three entry points, one structured error shape (`{ field: [messages] }`). The
+terse path is `#[derive(Validate)]` on the model plus `c.validated::<T>()`, which
+parses, validates, and hydrates a request body in one step (a `422` with the
+field errors on failure):
+
+```rust
+#[derive(Model, Validate)]
+struct Signup {
+    #[validate(required, str, min_len = 3, max_len = 20)] username: String,
+    #[validate(required, email)] email: String,
+    #[validate(min = 18)] age: i64,
+}
+
+// In a handler:
+.post("/signup", "create", |c| {
+    let signup: Signup = c.validated()?;   // 422 { "errors": { "email": [...] } } on failure
+    Ok::<_, Error>((201, signup.to_json()))
+})
+```
+
+Or drive a `Ruleset` directly (what the derive builds), sharing the same shape:
 
 ```rust
 // Fluent request validation
@@ -404,7 +481,7 @@ close", valid HTTP/1.1).
 
 ```rust
 // Server-Sent Events — the natural transport for LLM tokens.
-.get("/stream", "SSE demo", |_req, _p| sse(|sink| {
+.get("/stream", "SSE demo", |_| sse(|sink| {
     for i in 1..=3 {
         sink.data(&format!("tick {i}"))?;     // each frame is flushed immediately
         std::thread::sleep(std::time::Duration::from_millis(80));
@@ -413,27 +490,24 @@ close", valid HTTP/1.1).
 }))
 
 // Or raw byte streaming (NDJSON, large exports, …):
-.get("/export", "stream rows", |_req, _p| stream(200, "application/x-ndjson", |sink| {
+.get("/export", "stream rows", |_| stream(200, "application/x-ndjson", |sink| {
     for row in rows() { sink.write_str(&format!("{}\n", row.to_json()))?; }
     Ok(())
 }))
 ```
 
-Streaming tools for agents implement `StreamTool` and are invoked over SSE at
-`POST /__tools/:name/stream`:
+Streaming AI tools are registered with `stream_tool` and invoked over SSE at
+`POST /__tools/:name/stream`; the closure shares app state and emits tokens
+through the `SseSink`:
 
 ```rust
-struct StreamAnswer;
-impl StreamTool for StreamAnswer {
-    fn name(&self) -> &str { "stream_answer" }
-    fn description(&self) -> &str { "Stream an answer token-by-token." }
-    fn parameters(&self) -> Json { schema::object(vec![("prompt", schema::string("…"))], &["prompt"]) }
-    fn run(&self, args: Json, sink: &mut SseSink) -> std::io::Result<()> {
-        for tok in answer(&args).split(' ') { sink.data(tok)?; }
+.stream_tool("stream_answer", "Stream an answer token-by-token.",
+    schema::object(vec![("prompt", schema::string("the prompt"))], &["prompt"]),
+    |_c, args, sink| {
+        let prompt = args.get("prompt").and_then(Json::as_str).unwrap_or("");
+        for tok in prompt.split(' ') { sink.data(tok)?; }
         sink.event("done", "{}")
-    }
-}
-// registry.add_stream(StreamAnswer)
+    })
 ```
 
 The `/__tools` manifest marks these with `"streaming": true`, so an agent knows

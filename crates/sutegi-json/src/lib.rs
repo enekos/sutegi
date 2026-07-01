@@ -21,6 +21,14 @@ pub enum Json {
     Obj(BTreeMap<String, Json>),
 }
 
+impl Default for Json {
+    /// `Json::Null` — the natural empty value (so structs with a `Json` field
+    /// can still `#[derive(Default)]`).
+    fn default() -> Json {
+        Json::Null
+    }
+}
+
 impl Json {
     /// Build a `Json::Str` from anything string-like.
     pub fn str(s: impl Into<String>) -> Json {

@@ -22,7 +22,10 @@ jobs:
     # thing that exercises them.
     services:
       postgres:
-        image: postgres:16
+        # pgvector image = stock Postgres 16 + the pgvector extension, so the
+        # embedding-column tests (vector(dim), pgvector distance operators) run
+        # in CI alongside the plain jsonb / query-builder / durable-queue tests.
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: sutegi
           POSTGRES_PASSWORD: secret

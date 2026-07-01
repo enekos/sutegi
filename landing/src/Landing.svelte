@@ -19,6 +19,7 @@
   // --- hero scramble ---
   let heroTitle = $state('');
   const finalTitle = 'Batteries-included Rust';
+  // hero secondary line unchanged: "built from std up"
   onMount(() => {
     let t = 0;
     const iv = setInterval(() => {
@@ -119,17 +120,23 @@
 
   // --- code snippets (kept as strings so braces are literal text) ---
   const codeCargo = `[dependencies]
-# default = ["derive", "orm", "validate", "ai", "queue"]
-sutegi = { version = "*", features = ["sqlite", "graceful"] }
-# minimal HTTP service:
+# default = ["derive", "orm", "validate", "ai"]
+sutegi = { version = "*", features = ["sqlite", "graceful"] }  # single-node
+# multi-pod: swap in Postgres + the durable queue instead
+# sutegi = { version = "*", features = ["postgres", "queue", "graceful"] }
+# minimal HTTP service, nothing else compiled in:
 # sutegi = { version = "*", default-features = false }`;
 
   const codeMain = `use sutegi::prelude::*;
 
 fn main() -> std::io::Result<()> {
     App::new("hello")
-        .get("/", "Health check", |_req, _p| text(200, "sutegi up"))
-        .run_graceful("0.0.0.0:8080")
+        // handler: one &Ctx in, anything IntoResponse out
+        .get("/", "Health check", |_| "sutegi up")
+        .get("/hello/:name", "Greet", |c| {
+            format!("hi, {}", c.param("name").unwrap_or("world"))
+        })
+        .serve()   // reads HOST/PORT/WORKERS; graceful drain on SIGTERM
 }`;
 
   const codeTalk = `curl localhost:8080/__introspect   # full app surface as JSON
@@ -151,16 +158,16 @@ curl -X POST localhost:8080/__tools/create_todo -d '{"title":"ship sutegi"}'`;
         },
         {
           id: 'route', icon: Workflow, kicker: 'Step 2', title: 'Your first route',
-          lead: 'A handler is just a closure that receives the request and its path params and returns a response. Let’s boot a server with a health check, then add a route that reads an <code>:id</code> from the path. Run it with <code>cargo run</code> and you have a live HTTP/1.1 server.',
+          lead: 'A handler is a closure that takes one <code>&Ctx</code> and returns anything that is <code>IntoResponse</code> — a <code>&str</code>/<code>String</code>, a <code>Json</code>, a <code>(u16, Json)</code> pair, <code>()</code> for a 204, an <code>Error</code>, or a <code>Result&lt;T, Error&gt;</code> so <code>?</code> just works. Read path params off the <code>Ctx</code>. Call <code>.serve()</code> and you have a live HTTP/1.1 server.',
           code: `use sutegi::prelude::*;
 
 fn main() -> std::io::Result<()> {
     App::new("todo-api")
-        .get("/", "Health check", |_req, _p| text(200, "sutegi up"))
-        .get("/todos/:id", "Show one todo", |_req, p| {
-            text(200, p.get("id").unwrap())
+        .get("/", "Health check", |_| "sutegi up")
+        .get("/todos/:id", "Show one todo", |c| {
+            format!("todo #{}", c.param("id").unwrap_or("?"))
         })
-        .run_graceful("0.0.0.0:8080")
+        .serve()   // reads HOST/PORT/WORKERS (or argv[1])
 }`,
           note: 'Every route you register also shows up in <code>/__introspect</code>. You never write that endpoint — sutegi assembles your app’s whole surface for you. We’ll lean on it in Step&nbsp;6.',
         },
@@ -171,49 +178,79 @@ fn main() -> std::io::Result<()> {
       chapters: [
         {
           id: 'model', icon: FileCode, kicker: 'Step 3', title: 'Model your data',
-          lead: 'Echoing a path param is fun for about ten seconds. Let’s give the app something real to store. Derive <code>Model</code> on a plain struct and sutegi handles hydration from rows and JSON serialization — bools round-trip cleanly and <code>Option&lt;T&gt;</code> becomes a nullable column. The macro runs at build time, so none of its machinery reaches your binary.',
-          code: `#[derive(Model)]
+          lead: 'Echoing a path param is fun for about ten seconds. Let’s give the app something real to store. Derive <code>Model</code> <em>and</em> <code>Validate</code> on a plain struct: <code>Model</code> gives you schema, migrations, typed reads and <code>save()</code>; <code>Validate</code> reads the <code>#[validate(...)]</code> field attrs and generates the model’s ruleset. Bools round-trip cleanly and <code>Option&lt;T&gt;</code> becomes a nullable column. Both macros run at build time, so none of their machinery reaches your binary.',
+          code: `#[derive(Model, Validate)]
 #[model(table = "todos")]
 struct Todo {
     #[model(primary)]
     id: i64,
+    #[validate(required, str, min_len = 1, max_len = 200)]
     title: String,
     done: bool,            // round-trips as a real bool
     note: Option<String>,  // Option<T> => nullable column
     #[model(skip)]
     cached: bool,          // not persisted; default-initialized
 }`,
-          tip: 'Drop the <code>#[model(table = "…")]</code> line and the name is inferred as snake_case + plural — <code>Todo</code> becomes <code>todos</code> automatically.',
+          tip: 'Drop the <code>#[model(table = "…")]</code> line and the name is inferred as snake_case + plural — <code>Todo</code> becomes <code>todos</code> automatically. The struct is the single source of truth: table, JSON, <code>save()</code> and validation all derive from it.',
         },
         {
           id: 'orm', icon: Database, kicker: 'Step 4', title: 'Talk to the database',
-          lead: 'With a model in hand, the query builder gives you a parameterized, driver-agnostic way to read and write — OR groups, <code>IS NULL</code>, <code>LIKE</code>, joins and pagination all included, plus a raw escape hatch. Migrate the table, insert a row, compose a query. Enable the <code>sqlite</code> feature and it all runs against a bundled engine with no external database to install.',
-          code: `Todo::migrate(&db)?;
-let id = Todo::create(&db, &[("title", Value::Text("x".into()))])?;
+          lead: 'Shared state replaces the hand-rolled <code>Arc&lt;Mutex&lt;Db&gt;&gt;</code>. <code>Db</code> is now a pooled, <code>Send + Sync + Clone</code> handle — no Mutex. Register it once with <code>.state(db)</code>, then reach it from any handler via <code>c.db::&lt;Db&gt;()</code>. Migrate the table, then read and write through your typed model: <code>Todo::all_typed</code>, <code>Todo::find_typed</code>, <code>todo.save</code> (insert, DB assigns the pk). <code>c.model::&lt;Todo, Db&gt;("id")</code> is route-model binding — it parses the path param, loads the row, and hands you a typed <code>Todo</code> or a 404.',
+          code: `let db = Db::open_or_memory("DATABASE_PATH");  // or Db::memory()
+Todo::migrate(&db).unwrap();
 
-QueryBuilder::table("todos")
-    .filter("done", "=", Value::Bool(false))
-    .or_group(&[("priority", "=", Value::Text("high".into())),
-                ("pinned", "=", Value::Bool(true))])   // AND (a OR b)
-    .where_not_null("title").like("title", "%sutegi%")
-    .join("users", "users.id", "todos.user_id")
-    .order_by("id", true).build();
+App::new("todo")
+    .state(db)                                // shared, no Mutex
+    .get("/todos", "list", |c| -> Result<Json, Error> {
+        let all = Todo::all_typed(c.db::<Db>())?;
+        Ok(Json::arr(all.iter().map(Todo::to_json).collect()))
+    })
+    .get("/todos/:id", "show", |c| {          // route-model binding
+        c.model::<Todo, Db>("id").map(|t| t.to_json())
+    })
+    .post("/todos", "create", |c| {
+        let todo: Todo = c.validated()?;      // parse + validate -> 422
+        let id = todo.save(c.db::<Db>())?;    // typed insert; DB assigns id
+        Ok::<_, Error>((201, Todo { id, ..todo }.to_json()))
+    })
+    .serve()`,
+          tip: 'Prefer raw SQL? The parameterized query builder is still there — OR groups, <code>IS NULL</code>, <code>LIKE</code>, joins, transactions and pagination — <code>db.query("SELECT 1", &[])</code> is the escape hatch.',
+        },
+        {
+          id: 'backend', icon: Boxes, kicker: 'Step 4b', title: 'Two backends, one trait',
+          lead: 'This is the key story. Everything above is written against the <code>Backend</code> trait, not a concrete engine. <code>Db</code> (SQLite, <code>sqlite</code> feature) is the single-node store — one file on disk, zero ops. <code>Pg</code> (Postgres, a <strong>pure-std</strong> wire driver, <code>postgres</code> feature) is the multi-pod store. Both implement <code>Backend</code>, so <code>Model</code> is written once against it: swap <code>Db</code> for <code>Pg::from_env(8)?</code> and every handler above is unchanged. There is also <code>Kv&lt;B&gt;</code> — a namespaced JSON key/value store over either backend.',
+          code: `// single node — an embedded file, nothing to run
+let db = Db::open_pool("app.db", 8);
 
-db.transaction(|tx| { tx.insert("todos", &[/* … */])?; Ok(()) })?;
-Todo::update(&db, Value::Int(id), &[("done", Value::Bool(true))])?;
-let page = db.paginate(&Todo::query().order_by("id", true), 2, 20)?;`,
+// multi-pod — same Model code, Postgres underneath
+let pg = Pg::from_env(8)?;      // reads DATABASE_URL
+Todo::migrate(&pg).unwrap();
+let all = Todo::all_typed(&pg)?;   // identical call site
+
+// a namespaced JSON key/value store over either backend
+let kv = Kv::new(db);              // or Kv::new(pg)
+kv.migrate()?;
+kv.set("config", "theme", &Json::str("dark"))?;
+let theme = kv.get("config", "theme")?;   // Option<Json>
+let all_flags = kv.scan("flags")?;        // Vec<(String, Json)>`,
+          note: 'Write your domain against <code>Backend</code>, choose the store at boot. SQLite for local dev, edge and single-node; Postgres when you scale to many pods — the handlers never learn which one they got.',
         },
         {
           id: 'validate', icon: ShieldCheck, kicker: 'Step 5', title: 'Validate the input',
-          lead: 'Never trust the request body. sutegi ships a fluent <code>Validator</code>-style rule set (plus a JSON Schema validator) that returns structured, per-field errors — hand them straight back to the client as a <code>422</code>. Define the rules, call <code>validate</code>, and you’re done.',
-          code: `let rules = Ruleset::new()
+          lead: 'Never trust the request body. In Step&nbsp;3 the <code>#[validate(...)]</code> attrs already generated the model’s ruleset, so the create handler just calls <code>c.validated::&lt;Todo&gt;()</code> — parse the body, validate it, hydrate a typed model, or return a <code>422</code> with structured per-field errors. Need an ad-hoc ruleset (a login form, a filter)? Build one and call <code>c.validate(&rules)</code>. The available rules cover the common cases.',
+          code: `// (a) model-driven: the ruleset comes from #[derive(Validate)]
+.post("/todos", "create", |c| {
+    let todo: Todo = c.validated()?;   // 422 on any field error
+    /* … */
+})
+
+// (b) ad-hoc ruleset for a shape without a model
+let rules = Ruleset::new()
     .field("email", &[Rule::Required, Rule::Email])
     .field("age",   &[Rule::Integer, Rule::Between(18.0, 120.0)])
     .field("site",  &[Rule::Url])
     .field("password_confirmation", &[Rule::Same("password".into())]);
-
-rules.validate(&body)?;   // Err(ValidationErrors) -> errs.to_json()
-// { "email": ["The email must be a valid email address."] }`,
+let body = c.validate(&rules)?;   // Err -> { "email": ["… valid email …"] }`,
           note: 'You get this on the agent surface for free too: AI tool arguments are validated against each tool’s schema automatically — more on that next.',
         },
       ],
@@ -223,25 +260,30 @@ rules.validate(&body)?;   // Err(ValidationErrors) -> errs.to_json()
       chapters: [
         {
           id: 'agent', icon: Zap, kicker: 'Step 6', title: 'Make it agent-native',
-          lead: 'Here’s where sutegi differs from every other framework. Implement <code>Tool</code> for a capability and it’s instantly exposed to an LLM: a manifest at <code>/__tools</code>, a validated invocation endpoint, and an SSE variant for streaming tools. An agent can discover your whole app via <code>/__introspect</code> and act on it over plain JSON — no SDK, no glue layer.',
-          code: `struct CreateTodo;
-impl Tool for CreateTodo {
-    fn name(&self) -> &str { "create_todo" }
-    fn description(&self) -> &str { "Create a todo." }
-    fn parameters(&self) -> Json {
-        schema::object(vec![("title", schema::string("the title"))], &["title"])
-    }
-    fn call(&self, args: Json) -> Result<Json, String> { /* … */ }
-}
-// GET  /__tools             -> manifest  { name, description, input_schema }
-// POST /__tools/create_todo -> invoke (args validated -> 422 on failure)
-// POST /__tools/:name/stream -> SSE for streaming tools`,
-          tip: 'That’s the entire integration. Point any agent at <code>/__introspect</code> for the surface and <code>/__tools</code> for the call manifest — the same app you built for humans is now drivable by a model.',
+          lead: 'Here’s where sutegi differs from every other framework. Tools are first-class on the <code>App</code>: register a closure with <code>.tool(...)</code> and it’s instantly exposed to an LLM — a manifest at <code>/__tools</code>, a validated invocation endpoint, and an SSE variant via <code>.stream_tool(...)</code>. The closure shares app state through an owned <code>ToolCtx</code> (<code>c.db::&lt;Db&gt;()</code>, <code>c.state::&lt;T&gt;()</code>) and gets the already schema-validated <code>Json</code> args. An agent discovers your whole app via <code>/__introspect</code> and acts on it over plain JSON — no SDK, no glue layer.',
+          code: `.tool("create_todo", "Create a todo",
+    schema::object(vec![("title", schema::string("the title"))], &["title"]),
+    |c, args| {
+        let todo = Todo::from_input(&args)?;   // args already schema-validated
+        let id = todo.save(c.db::<Db>())?;
+        Ok(Todo { id, ..todo }.to_json())
+    })
+.stream_tool("stream_answer", "Stream tokens over SSE",
+    schema::object(vec![("prompt", schema::string("the prompt"))], &["prompt"]),
+    |_c, args, sink| {
+        let prompt = args.get("prompt").and_then(Json::as_str).unwrap_or("");
+        for tok in prompt.split(' ') { sink.data(tok)?; }
+        sink.event("done", "{}")
+    })
+// GET  /__tools               -> manifest { name, description, input_schema }
+// POST /__tools/create_todo   -> invoke (args validated -> 422 on failure)
+// POST /__tools/:name/stream  -> SSE for streaming tools`,
+          tip: 'That’s the entire integration — the old <code>Tool</code>/<code>StreamTool</code> traits and <code>ToolRegistry</code> are gone. Point any agent at <code>/__introspect</code> for the surface and <code>/__tools</code> for the call manifest — the same app you built for humans is now drivable by a model.',
         },
         {
           id: 'stream', icon: Radio, kicker: 'Step 7', title: 'Stream responses',
-          lead: 'Because the server is blocking and thread-per-connection, streaming is trivial and naturally backpressured — there’s no executor to fight. Send raw bytes or Server-Sent Events; each frame flushes immediately. It’s the same transport that carries live LLM tokens back to a UI.',
-          code: `.get("/stream", "SSE demo", |_req, _p| sse(|sink| {
+          lead: 'Because the server is blocking and thread-per-connection, streaming is trivial and naturally backpressured — there’s no executor to fight. Send raw bytes or Server-Sent Events; each frame flushes immediately. It’s the same transport that carries live LLM tokens back to a UI (and the one <code>.stream_tool</code> rides on).',
+          code: `.get("/stream", "SSE demo", |_| sse(|sink| {
     for token in answer().split(' ') {
         sink.data(token)?;        // each frame flushed immediately
     }
@@ -250,17 +292,19 @@ impl Tool for CreateTodo {
         },
         {
           id: 'jobs', icon: Cpu, kicker: 'Step 8', title: 'Defer the slow work',
-          lead: 'Some work shouldn’t block the response — sending mail, calling a webhook. The in-process queue gives you worker threads, retries, delayed dispatch and introspectable stats, with zero dependencies like everything else. Return <code>Err</code> from <code>handle</code> and the job is retried up to <code>tries()</code> times.',
-          code: `struct Notify { to: String }
-impl Job for Notify {
-    fn name(&self) -> &str { "notify" }
-    fn handle(&self) -> Result<(), String> { /* send … */ Ok(()) }
-    fn tries(&self) -> u32 { 3 }   // retried on Err
-}
+          lead: 'Some work shouldn’t block the response — sending mail, calling a webhook. The durable queue (<code>queue</code> feature) is <strong>Postgres-backed and cross-pod</strong>: it claims jobs with <code>FOR UPDATE SKIP LOCKED</code>, so any pod can pull the next one, and visibility-timeout retries recover from a crashed worker. Register a handler by name, <code>dispatch</code> a JSON payload, and <code>start</code> N worker threads.',
+          code: `use sutegi::queue::{Queue, Workers};
 
-let queue = Queue::new(4);
-queue.dispatch(Notify { to: "a@b.com".into() });
-let stats = queue.stats();         // dispatched / processed / failed / retried`,
+let mut queue = Queue::new(Pg::from_env(8)?.pool().clone());
+queue.migrate()?;                              // creates sutegi_jobs
+queue.register("notify", |payload| {
+    let to = payload.get("to").and_then(Json::as_str).unwrap_or("");
+    /* send … */ Ok(())                        // Err -> retried w/ backoff
+});
+
+queue.dispatch("notify", Json::obj(vec![("to", Json::str("a@b.com"))]))?;
+let workers: Workers = std::sync::Arc::new(queue).start(4);   // cross-pod`,
+          note: 'The old in-process <code>Job</code> trait and <code>Queue::new(4)</code> worker-pool are gone — the queue is durable now, so a job survives a pod restart and dead-letters after its retries are spent.',
         },
       ],
     },
@@ -269,27 +313,34 @@ let stats = queue.stats();         // dispatched / processed / failed / retried`
       chapters: [
         {
           id: 'hex', icon: Layers, kicker: 'Step 9', title: 'Structure for growth',
-          lead: 'As the app grows, the hexagonal toolkit keeps it honest: your domain stays pure, the application layer depends on port traits, and adapters (HTTP, AI, SQLite) plug in at the edges. One use case, many transports — and fully testable without ever starting a server.',
+          lead: 'As the app grows, the hexagonal toolkit keeps it honest: your domain stays pure, the application layer depends on port traits, and adapters (HTTP, AI, and a repo over either <code>Backend</code>) plug in at the edges. One use case, many transports — and fully testable without ever starting a server.',
           code: `impl UseCase for CreateTodo {
     type Input = String;          // title
     type Output = Todo;
     fn execute(&self, title: String) -> AppResult<Todo> {
         let todo = Todo::new(title).map_err(AppError::invalid)?;
-        let id = self.repo.insert(&todo)?;   // outbound port
+        let id = self.repo.insert(&todo)?;   // outbound port (Db or Pg)
         Ok(Todo { id, ..todo })
     }
 }
-// inbound HTTP adapter:
-.post("/todos", "Create", move |req, _p| respond_created(uc.execute(title)))`,
-          note: 'The very same <code>CreateTodo</code> use case can back both an HTTP route and the AI tool from Step&nbsp;6. Write the logic once; expose it everywhere.',
+// inbound HTTP adapter — new &Ctx handler, respond_created maps AppResult:
+.post("/todos", "Create", move |c| {
+    let title = c.json().ok()
+        .and_then(|b| b.get("title").and_then(Json::as_str).map(str::to_string))
+        .unwrap_or_default();
+    respond_created(create.execute(title))
+})`,
+          note: 'The very same <code>CreateTodo</code> use case can back both an HTTP route and the AI tool from Step&nbsp;6, over whichever <code>Backend</code> the composition root injects. Write the logic once; expose it everywhere.',
         },
         {
           id: 'ops', icon: Server, kicker: 'Step 10', title: 'Ship to production',
-          lead: 'You’re ready to deploy. The operational endpoints are always on, and <code>run_graceful</code> drains in-flight requests on SIGTERM before exiting — exactly what a Kubernetes rolling update needs. Wire a readiness probe to whatever “healthy” means for your app.',
-          code: `App::new("api")
-    .workers(env_or("WORKERS", "8").parse().unwrap_or(8))
-    .readiness(move || db.lock().unwrap().query("SELECT 1", &[]).is_ok())
-    .run_graceful("0.0.0.0:8080")?;
+          lead: 'You’re ready to deploy. The operational endpoints are always on, and <code>.serve()</code> drains in-flight requests on SIGTERM before exiting — exactly what a Kubernetes rolling update needs. <code>Db</code> is <code>Clone</code>, so clone a handle for the readiness probe before you hand ownership to <code>.state()</code>, and wire it to whatever “healthy” means for your app.',
+          code: `let ready = db.clone();   // probe keeps its own pooled handle
+App::new("api")
+    .state(db)
+    .readiness(move || ready.query("SELECT 1", &[]).is_ok())
+    .serve()?;   // reads HOST/PORT/WORKERS; graceful drain on SIGTERM
+                 // (.run(addr) / .run_graceful(addr) still exist)
 
 // GET /__health   liveness        GET /__ready    readiness (200/503)
 // GET /__metrics  Prometheus      GET /__introspect  full surface`,
@@ -383,7 +434,7 @@ let stats = queue.stats();         // dispatched / processed / failed / retried`
           <span class="bg-clip-text text-transparent bg-gradient-to-r from-[#ff6a3d] to-[#ffaa33]">built from std up</span>
         </h1>
         <p class="text-base sm:text-lg text-[#a0a0b0] max-w-xl mx-auto lg:mx-0 leading-relaxed">
-          <strong class="text-white">sutegi</strong> (Basque: <em>forge</em>) is a batteries-included web framework with <strong class="text-white">zero third-party dependencies</strong>. The HTTP/1.1 server, JSON, router, ORM, and LLM tool layer are all hand-built on <code class="text-[#ff6a3d]">std</code> — a tiny binary, and an AI agent as a first-class user.
+          <strong class="text-white">sutegi</strong> (Basque: <em>forge</em>) is a batteries-included web framework with <strong class="text-white">zero third-party dependencies</strong> — every layer hand-built on <code class="text-[#ff6a3d]">std</code>. Handlers take one <code class="text-[#ff6a3d]">&amp;Ctx</code> and return anything; <code class="text-[#ff6a3d]">.state()</code> shares a pooled DB, <code class="text-[#ff6a3d]">.serve()</code> boots it. One <strong class="text-white">Backend</strong> trait, two stores — SQLite single-node or Postgres multi-pod. A complete Todo app is ~60 lines, and an AI agent is a first-class user.
         </p>
         <div class="flex flex-col sm:flex-row gap-3 sm:gap-4 pt-2 justify-center lg:justify-start">
           <a href="#quickstart" class="px-6 py-3 bg-[#ff6a3d] text-[#1a0d06] rounded-full font-semibold text-sm transition-all hover:shadow-[0_0_25px_rgba(255,106,61,0.4)] hover:-translate-y-0.5 flex items-center justify-center gap-2">
@@ -450,7 +501,7 @@ let stats = queue.stats();         // dispatched / processed / failed / retried`
       </div>
       <div class="mt-6 sm:mt-8 bg-gradient-to-br from-[#ff6a3d]/10 to-[#ffaa33]/10 border border-white/10 rounded-xl p-5 sm:p-6 text-center">
         <p class="text-[#d0d0e0] text-sm sm:text-base leading-relaxed max-w-2xl mx-auto">
-          No tokio. No serde. No hyper. The HTTP/1.1 parser, JSON codec, router, ORM query builder, and tool layer are all original code you can read in an afternoon.
+          No tokio. No serde. No hyper — not even a Postgres driver crate. The HTTP/1.1 parser, JSON codec, router, ORM, the pure-std Postgres wire driver, and the tool layer are all original code you can read in an afternoon.
         </p>
       </div>
     </div>
@@ -468,7 +519,7 @@ let stats = queue.stats();         // dispatched / processed / failed / retried`
           <div class="absolute -top-3 -left-3 w-8 h-8 rounded-full bg-[#ff6a3d] text-[#1a0d06] font-bold text-sm flex items-center justify-center shadow-lg">1</div>
           <FileCode class="text-[#ff6a3d] mb-3" size={26} />
           <h3 class="text-white font-semibold mb-2">Define</h3>
-          <p class="text-[#9090a0] text-sm leading-relaxed">Routes as closures, models with <code>#[derive(Model)]</code>, and tools as <code>Tool</code> impls. Each registers its own metadata.</p>
+          <p class="text-[#9090a0] text-sm leading-relaxed">Routes as <code>&Ctx</code> closures, models with <code>#[derive(Model, Validate)]</code>, and AI tools as <code>.tool(...)</code> closures. Each registers its own metadata.</p>
         </div>
         <div class="relative bg-[#13121a] border border-white/5 rounded-xl p-5 sm:p-6">
           <div class="absolute -top-3 -left-3 w-8 h-8 rounded-full bg-[#ffaa33] text-[#1a0d06] font-bold text-sm flex items-center justify-center shadow-lg">2</div>
@@ -495,14 +546,14 @@ let stats = queue.stats();         // dispatched / processed / failed / retried`
       </div>
       <div class="grid sm:grid-cols-2 lg:grid-cols-4 gap-4 sm:gap-6">
         {#each [
-          { icon: Workflow, t: 'Routing & middleware', d: 'Path params, route groups, before/after middleware, typed extractors.' },
-          { icon: Database, t: 'ORM & query builder', d: 'Parameterized SELECT/UPDATE/DELETE, migrations, transactions, optional SQLite.' },
-          { icon: FileCode, t: '#[derive(Model)]', d: 'Typed models hydrate from rows and serialize to JSON; build-time-only macro.' },
-          { icon: ShieldCheck, t: 'Validation', d: 'Fluent rule sets + JSON Schema, structured per-field errors.' },
-          { icon: Radio, t: 'Streaming & SSE', d: 'Stream bytes or Server-Sent Events with natural backpressure.' },
-          { icon: Cpu, t: 'Background jobs', d: 'In-process queue: workers, retries, delayed dispatch, stats.' },
-          { icon: Zap, t: 'Agent-native', d: '/__introspect + /__tools: discover, manifest, invoke — over plain JSON.' },
-          { icon: Layers, t: 'Hexagonal toolkit', d: 'AppError, UseCase ports, adapter glue for clean, testable apps.' },
+          { icon: Workflow, t: 'Routing & Ctx', d: 'Path params, route groups, middleware; one &Ctx in, any IntoResponse out.' },
+          { icon: Boxes, t: 'Two backends, one trait', d: 'SQLite (single-node) or Postgres (multi-pod) behind the Backend trait — swap without touching handlers.' },
+          { icon: Database, t: 'ORM & shared state', d: 'Pooled Send+Sync Db via .state(); typed reads, save(), route-model binding, query builder.' },
+          { icon: FileCode, t: '#[derive(Model, Validate)]', d: 'Schema, migrations, JSON and the validation ruleset — all from one struct, at build time.' },
+          { icon: Plug, t: 'Kv store', d: 'Namespaced JSON key/value over either backend: set / get / scan / delete.' },
+          { icon: Radio, t: 'Streaming & SSE', d: 'Stream bytes or Server-Sent Events with natural backpressure; same transport as stream tools.' },
+          { icon: Cpu, t: 'Durable queue', d: 'Postgres-backed, cross-pod: SKIP LOCKED claim, visibility-timeout retries, dead-letter.' },
+          { icon: Zap, t: 'Agent-native', d: '.tool() / .stream_tool() closures auto-mount /__tools; /__introspect exposes the whole surface.' },
         ] as f}
           {@const Icon = f.icon}
           <div class="group bg-[#13121a] border border-white/5 p-5 sm:p-6 rounded-xl hover:border-[#ff6a3d]/40 transition-all hover:-translate-y-1 hover:shadow-[0_0_20px_rgba(255,106,61,0.1)]">
@@ -525,10 +576,10 @@ let stats = queue.stats();         // dispatched / processed / failed / retried`
       <div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-4 sm:gap-6">
         {#each [
           { icon: Zap, t: 'Agent tool servers', d: 'Expose capabilities to an LLM with a built-in manifest and validated invocation — no glue layer.' },
-          { icon: Boxes, t: 'Internal microservices', d: 'A small, dependency-light service with health/readiness/metrics and graceful shutdown out of the box.' },
-          { icon: Plug, t: 'Edge & embedded', d: 'A ~362 KB binary with no async runtime fits where a full stack will not.' },
+          { icon: Boxes, t: 'Internal microservices', d: 'Start single-node on SQLite; scale to many pods on Postgres + the durable queue without rewriting handlers.' },
+          { icon: Plug, t: 'Edge & embedded', d: 'A ~362 KB binary with no async runtime and one embedded SQLite file fits where a full stack will not.' },
           { icon: FileCode, t: 'LLM-generated apps', d: 'Rigid scaffolding conventions mean a model can extend the codebase correctly with minimal context.' },
-          { icon: Server, t: 'JSON APIs & CRUD', d: 'Routing + ORM + validation + jobs cover the everyday backend without pulling a framework zoo.' },
+          { icon: Server, t: 'JSON APIs & CRUD', d: 'Routing + typed models + validation cover the everyday backend without pulling a framework zoo.' },
           { icon: Radio, t: 'Streaming endpoints', d: 'SSE token streams for chat/AI UIs, backpressured by the thread-per-connection model.' },
         ] as u}
           {@const Icon = u.icon}

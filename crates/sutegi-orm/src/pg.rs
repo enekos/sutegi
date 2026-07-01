@@ -59,11 +59,16 @@ pub fn create_table_pg(schema: &TableSchema) -> String {
             ));
             continue;
         }
-        let ty = match c.ty {
-            ColType::Integer => "BIGINT",
-            ColType::Real => "DOUBLE PRECISION",
-            ColType::Text => "TEXT",
-            ColType::Boolean => "BOOLEAN",
+        let ty: String = match c.ty {
+            ColType::Integer => "BIGINT".into(),
+            ColType::Real => "DOUBLE PRECISION".into(),
+            ColType::Text => "TEXT".into(),
+            ColType::Boolean => "BOOLEAN".into(),
+            ColType::Json => "JSONB".into(),
+            // pgvector: `vector(dim)` when the dimension is known, else the
+            // unconstrained `vector`. Requires the pgvector extension.
+            ColType::Vector { dim: Some(d) } => format!("vector({d})"),
+            ColType::Vector { dim: None } => "vector".into(),
         };
         let mut def = format!("  {} {}", c.name, ty);
         if c.primary {
@@ -88,6 +93,8 @@ fn to_pg_value(v: &Value) -> PgValue {
         Value::Real(r) => PgValue::Real(*r),
         Value::Text(s) => PgValue::Text(s.clone()),
         Value::Bool(b) => PgValue::Bool(*b),
+        Value::Json(j) => PgValue::Json(j.to_string()),
+        Value::Vector(vec) => PgValue::Vector(crate::value::vector_to_text(vec)),
     }
 }
 
@@ -327,6 +334,38 @@ mod tests {
         assert!(sql.contains("title TEXT NOT NULL"));
         assert!(sql.contains("score DOUBLE PRECISION"));
         assert!(!sql.contains("score DOUBLE PRECISION NOT NULL"));
+    }
+
+    #[test]
+    fn pg_ddl_maps_json_and_vector() {
+        let schema = TableSchema {
+            table: "docs",
+            columns: vec![
+                Column {
+                    name: "meta",
+                    ty: ColType::Json,
+                    nullable: false,
+                    primary: false,
+                },
+                Column {
+                    name: "embedding",
+                    ty: ColType::Vector { dim: Some(384) },
+                    nullable: true,
+                    primary: false,
+                },
+                Column {
+                    name: "loose",
+                    ty: ColType::Vector { dim: None },
+                    nullable: true,
+                    primary: false,
+                },
+            ],
+        };
+        let sql = create_table_pg(&schema);
+        assert!(sql.contains("meta JSONB NOT NULL"));
+        assert!(sql.contains("embedding vector(384)"));
+        assert!(sql.contains("loose vector"));
+        assert!(!sql.contains("loose vector("));
     }
 
     #[test]

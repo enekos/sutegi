@@ -7,7 +7,8 @@
 //! the full surface of the application as JSON — so an AI agent can discover
 //! what the app can do without ever reading the source.
 
-use std::collections::BTreeMap;
+use std::any::{Any, TypeId};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -15,12 +16,182 @@ use std::time::Duration;
 pub use sutegi_http::{Body, Limits, Method, Request, Response, SseSink, StreamSink};
 use sutegi_json::Json;
 
+mod respond;
+pub use respond::{Error, IntoResponse};
+
+pub mod schema;
+
 /// Path parameters captured from a route pattern (`:name` segments).
 pub type Params = BTreeMap<String, String>;
 
-/// A request handler: receives the request and captured params, returns a
-/// response. Must be shareable across worker threads.
-pub type Handler = Box<dyn Fn(&Request, &Params) -> Response + Send + Sync + 'static>;
+/// A type-indexed bag of shared application state, populated by [`App::state`]
+/// and read back with [`Ctx::state`].
+type StateMap = HashMap<TypeId, Arc<dyn Any + Send + Sync>>;
+
+fn state_ref<T: Any + Send + Sync>(map: &StateMap) -> Option<&T> {
+    map.get(&TypeId::of::<T>())
+        .and_then(|a| a.downcast_ref::<T>())
+}
+
+fn state_or_panic<T: Any + Send + Sync>(map: &StateMap) -> &T {
+    state_ref(map).unwrap_or_else(|| {
+        panic!(
+            "no state of type `{}` registered — add it with `App::state(...)`",
+            std::any::type_name::<T>()
+        )
+    })
+}
+
+/// Everything a request handler needs: the [`Request`], the captured path
+/// [`Params`], and typed access to shared application state.
+///
+/// Handlers take a single `&Ctx` and return anything that is [`IntoResponse`]
+/// — including `Result<_, Error>`, so `?` works:
+///
+/// ```ignore
+/// app.post("/todos", "create", |c| {
+///     let todo: Todo = c.validated()?;      // parse + validate the body
+///     let id = todo.save(c.db::<Db>())?;    // shared state, no Arc/Mutex
+///     Ok((201, Todo { id, ..todo }.to_json()))
+/// });
+/// ```
+pub struct Ctx<'a> {
+    /// The raw request.
+    pub req: &'a Request,
+    /// Path parameters captured from the route pattern.
+    pub params: Params,
+    state: Arc<StateMap>,
+}
+
+impl Ctx<'_> {
+    /// A captured path parameter (`:name`), if present.
+    pub fn param(&self, key: &str) -> Option<&str> {
+        self.params.get(key).map(String::as_str)
+    }
+
+    /// A request header, case-insensitively.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.req.header(name)
+    }
+
+    /// The query string parsed into a map.
+    pub fn query(&self) -> BTreeMap<String, String> {
+        query_params(self.req)
+    }
+
+    /// A form-encoded body parsed into a map.
+    pub fn form(&self) -> BTreeMap<String, String> {
+        form_body(self.req)
+    }
+
+    /// The request body parsed as JSON (empty body → empty object; malformed
+    /// body → a `400` [`Error`]).
+    pub fn json(&self) -> Result<Json, Error> {
+        json_body(self.req).map_err(Error::bad_request)
+    }
+
+    /// Shared state of type `T`, registered via [`App::state`].
+    ///
+    /// Panics if no state of that type was registered — a wiring bug, caught on
+    /// the first request. Use [`Ctx::try_state`] for the fallible form.
+    pub fn state<T: Any + Send + Sync>(&self) -> &T {
+        state_or_panic(&self.state)
+    }
+
+    /// Shared state of type `T`, or `None` if it was never registered.
+    pub fn try_state<T: Any + Send + Sync>(&self) -> Option<&T> {
+        state_ref(&self.state)
+    }
+
+    /// The database backend held in state — sugar for [`Ctx::state`] pinned to a
+    /// [`Backend`](sutegi_orm::Backend) type. `c.db::<Db>()` / `c.db::<Pg>()`.
+    #[cfg(feature = "orm")]
+    pub fn db<B: sutegi_orm::Backend + Any + Send + Sync>(&self) -> &B {
+        self.state::<B>()
+    }
+
+    /// Route-model binding: hydrate model `T` from the `key` path parameter over
+    /// the backend `B` held in state, or return a ready `404`/`500` [`Error`].
+    /// `c.model::<Todo, Db>("id")?`.
+    #[cfg(feature = "orm")]
+    pub fn model<T, B>(&self, key: &str) -> Result<T, Error>
+    where
+        T: sutegi_orm::Model + sutegi_orm::row::FromRow,
+        B: sutegi_orm::Backend + Any + Send + Sync,
+    {
+        let raw = self
+            .param(key)
+            .ok_or_else(|| Error::not_found("not found"))?;
+        let id = match raw.parse::<i64>() {
+            Ok(n) => sutegi_orm::Value::Int(n),
+            Err(_) => sutegi_orm::Value::Text(raw.to_string()),
+        };
+        match T::find_typed(self.db::<B>(), id) {
+            Ok(Some(m)) => Ok(m),
+            Ok(None) => Err(Error::not_found("not found")),
+            Err(e) => Err(Error::internal(e)),
+        }
+    }
+
+    /// Parse the JSON body and validate it against `rules`, returning the parsed
+    /// [`Json`] on success or a `422` [`Error`] carrying the field errors.
+    #[cfg(feature = "validate")]
+    pub fn validate(&self, rules: &sutegi_validate::Ruleset) -> Result<Json, Error> {
+        let body = self.json()?;
+        if let Err(errs) = rules.validate(&body) {
+            return Err(Error::unprocessable("validation failed").with_fields(errs.to_json()));
+        }
+        Ok(body)
+    }
+
+    /// Parse **and** validate the JSON body into a typed model in one step,
+    /// using the model's own [`Validate`](sutegi_validate::Validate) rules and
+    /// the lenient [`FromInput`](sutegi_orm::FromInput) hydrator (so a partial
+    /// create payload — no `id`, no defaulted flags — still works).
+    /// `let todo: Todo = c.validated()?;`
+    #[cfg(all(feature = "validate", feature = "orm"))]
+    pub fn validated<T>(&self) -> Result<T, Error>
+    where
+        T: sutegi_orm::FromInput + sutegi_validate::Validate,
+    {
+        let body = self.json()?;
+        if let Err(errs) = T::rules().validate(&body) {
+            return Err(Error::unprocessable("validation failed").with_fields(errs.to_json()));
+        }
+        T::from_input(&body).map_err(Error::unprocessable)
+    }
+}
+
+/// The owned context handed to AI tool closures ([`App::tool`] /
+/// [`App::stream_tool`]). Like [`Ctx`] it exposes typed state, but it owns its
+/// data so a streaming tool can keep using it after the response has begun.
+pub struct ToolCtx {
+    state: Arc<StateMap>,
+    /// Path parameters (always empty for `/__tools/:name` beyond `name`).
+    pub params: Params,
+}
+
+impl ToolCtx {
+    /// Shared state of type `T`, registered via [`App::state`].
+    pub fn state<T: Any + Send + Sync>(&self) -> &T {
+        state_or_panic(&self.state)
+    }
+
+    /// Shared state of type `T`, or `None` if it was never registered.
+    pub fn try_state<T: Any + Send + Sync>(&self) -> Option<&T> {
+        state_ref(&self.state)
+    }
+
+    /// The database backend held in state (see [`Ctx::db`]).
+    #[cfg(feature = "orm")]
+    pub fn db<B: sutegi_orm::Backend + Any + Send + Sync>(&self) -> &B {
+        self.state::<B>()
+    }
+}
+
+/// A request handler: takes a [`Ctx`], returns a [`Response`]. Registered forms
+/// accept any [`IntoResponse`]; this is the boxed, erased form the router runs.
+pub type Handler = Box<dyn Fn(&Ctx) -> Response + Send + Sync + 'static>;
 
 /// A middleware: inspects a request before routing. Returning `Some(resp)`
 /// short-circuits (e.g. auth rejection); `None` lets the request continue.
@@ -40,6 +211,33 @@ pub fn mw(f: impl Fn(&Request) -> Option<Response> + Send + Sync + 'static) -> M
     std::sync::Arc::new(f)
 }
 
+/// A non-streaming tool body: validated JSON args in, JSON (or [`Error`]) out.
+type UnaryToolFn = Box<dyn Fn(&ToolCtx, Json) -> Result<Json, Error> + Send + Sync + 'static>;
+
+/// A streaming tool body: emits Server-Sent Events through the [`SseSink`].
+type StreamToolFn =
+    Box<dyn Fn(&ToolCtx, Json, &mut SseSink) -> std::io::Result<()> + Send + Sync + 'static>;
+
+/// The callable body of an AI tool.
+enum ToolBody {
+    Unary(UnaryToolFn),
+    Stream(StreamToolFn),
+}
+
+/// A registered AI tool: name, description, JSON-Schema parameters, and body.
+struct ToolDef {
+    name: String,
+    description: String,
+    schema: Json,
+    body: ToolBody,
+}
+
+impl ToolDef {
+    fn is_stream(&self) -> bool {
+        matches!(self.body, ToolBody::Stream(_))
+    }
+}
+
 struct Route {
     method: Method,
     pattern: String,
@@ -49,14 +247,16 @@ struct Route {
     middleware: Vec<Mw>,
 }
 
-/// The application: a builder you configure with routes, models, tools, and
-/// middleware, then `run()`.
+/// The application: a builder you configure with routes, state, tools, and
+/// middleware, then `serve()` (or `run()`).
 pub struct App {
     name: String,
     routes: Vec<Route>,
     middleware: Vec<Middleware>,
     models: Vec<Json>,
     tools: Vec<Json>,
+    tool_defs: Vec<ToolDef>,
+    state: StateMap,
     workers: usize,
     readiness: Option<Box<dyn Fn() -> bool + Send + Sync + 'static>>,
     after: Vec<AfterMiddleware>,
@@ -120,11 +320,23 @@ impl App {
             middleware: Vec::new(),
             models: Vec::new(),
             tools: Vec::new(),
+            tool_defs: Vec::new(),
+            state: StateMap::new(),
             workers: 8,
             readiness: None,
             after: Vec::new(),
             limits: Limits::default(),
         }
+    }
+
+    /// Register a piece of shared application state, retrievable in any handler
+    /// via [`Ctx::state`] (or [`Ctx::db`] for a database backend). One value per
+    /// type; registering the same type again replaces it. The value must be
+    /// `Send + Sync` (e.g. a pooled [`Db`](sutegi_orm::db::Db) or
+    /// [`Pg`](sutegi_orm::pg::Pg), or your own `AppState` struct).
+    pub fn state<T: Any + Send + Sync>(mut self, value: T) -> App {
+        self.state.insert(TypeId::of::<T>(), Arc::new(value));
+        self
     }
 
     /// Replace the server resource limits (body/header caps, socket timeout).
@@ -170,20 +382,56 @@ impl App {
     }
 
     /// Register a route for any method, with a doc string surfaced via
-    /// `/__introspect`.
-    pub fn route(
+    /// `/__introspect`. The handler takes a [`Ctx`] and returns any
+    /// [`IntoResponse`].
+    pub fn route<R: IntoResponse>(
         mut self,
         method: Method,
         pattern: &str,
         doc: &str,
-        handler: impl Fn(&Request, &Params) -> Response + Send + Sync + 'static,
+        handler: impl Fn(&Ctx) -> R + Send + Sync + 'static,
     ) -> App {
         self.routes.push(Route {
             method,
             pattern: pattern.to_string(),
             doc: doc.to_string(),
-            handler: Box::new(handler),
+            handler: Box::new(move |c: &Ctx| handler(c).into_response()),
             middleware: Vec::new(),
+        });
+        self
+    }
+
+    /// Register a non-streaming AI tool: a `name`, a `description`, its JSON
+    /// Schema `parameters` (build with [`schema`]), and a closure that receives
+    /// the shared state via [`ToolCtx`] and the validated JSON `args`. Mounted
+    /// automatically at `POST /__tools/:name` and listed in the `/__tools`
+    /// manifest + `/__introspect`.
+    pub fn tool<F>(mut self, name: &str, description: &str, parameters: Json, call: F) -> App
+    where
+        F: Fn(&ToolCtx, Json) -> Result<Json, Error> + Send + Sync + 'static,
+    {
+        self.tool_defs.push(ToolDef {
+            name: name.to_string(),
+            description: description.to_string(),
+            schema: parameters,
+            body: ToolBody::Unary(Box::new(call)),
+        });
+        self
+    }
+
+    /// Register a streaming AI tool, invoked at `POST /__tools/:name/stream` and
+    /// answered as Server-Sent Events. The closure emits tokens through the
+    /// [`SseSink`]; it owns its [`ToolCtx`], so it may keep streaming after the
+    /// response has begun.
+    pub fn stream_tool<F>(mut self, name: &str, description: &str, parameters: Json, run: F) -> App
+    where
+        F: Fn(&ToolCtx, Json, &mut SseSink) -> std::io::Result<()> + Send + Sync + 'static,
+    {
+        self.tool_defs.push(ToolDef {
+            name: name.to_string(),
+            description: description.to_string(),
+            schema: parameters,
+            body: ToolBody::Stream(Box::new(run)),
         });
         self
     }
@@ -205,38 +453,38 @@ impl App {
         self
     }
 
-    pub fn get(
+    pub fn get<R: IntoResponse>(
         self,
         pattern: &str,
         doc: &str,
-        handler: impl Fn(&Request, &Params) -> Response + Send + Sync + 'static,
+        handler: impl Fn(&Ctx) -> R + Send + Sync + 'static,
     ) -> App {
         self.route(Method::Get, pattern, doc, handler)
     }
 
-    pub fn post(
+    pub fn post<R: IntoResponse>(
         self,
         pattern: &str,
         doc: &str,
-        handler: impl Fn(&Request, &Params) -> Response + Send + Sync + 'static,
+        handler: impl Fn(&Ctx) -> R + Send + Sync + 'static,
     ) -> App {
         self.route(Method::Post, pattern, doc, handler)
     }
 
-    pub fn put(
+    pub fn put<R: IntoResponse>(
         self,
         pattern: &str,
         doc: &str,
-        handler: impl Fn(&Request, &Params) -> Response + Send + Sync + 'static,
+        handler: impl Fn(&Ctx) -> R + Send + Sync + 'static,
     ) -> App {
         self.route(Method::Put, pattern, doc, handler)
     }
 
-    pub fn delete(
+    pub fn delete<R: IntoResponse>(
         self,
         pattern: &str,
         doc: &str,
-        handler: impl Fn(&Request, &Params) -> Response + Send + Sync + 'static,
+        handler: impl Fn(&Ctx) -> R + Send + Sync + 'static,
     ) -> App {
         self.route(Method::Delete, pattern, doc, handler)
     }
@@ -296,18 +544,23 @@ impl App {
 
     /// Build the request service closure (shared by every `run*` variant).
     fn into_service(
-        self,
+        mut self,
     ) -> (
         usize,
         Limits,
         impl Fn(Request) -> Response + Send + Sync + 'static,
     ) {
+        // Mount any registered AI tools as routes + introspection entries.
+        if !self.tool_defs.is_empty() {
+            self = self.mount_tools();
+        }
         let limits = self.limits;
         let introspect = self.introspection();
         let routes = Arc::new(self.routes);
         let middleware = Arc::new(self.middleware);
         let after = Arc::new(self.after);
         let readiness = Arc::new(self.readiness);
+        let state = Arc::new(self.state);
         let metrics = Arc::new(Metrics::default());
         let workers = self.workers;
 
@@ -350,7 +603,12 @@ impl App {
                             return resp;
                         }
                     }
-                    return (route.handler)(&req, &params);
+                    let ctx = Ctx {
+                        req: &req,
+                        params,
+                        state: Arc::clone(&state),
+                    };
+                    return (route.handler)(&ctx);
                 }
 
                 // Distinguish "no such path" from "wrong method".
@@ -396,6 +654,148 @@ impl App {
         crate::signal::install(Arc::clone(&flag));
         self.run_until(addr, flag)
     }
+
+    /// The one-call production entrypoint. Resolves the bind address from
+    /// `argv[1]`, else `HOST:PORT` (defaults `0.0.0.0:8080`); honours a `WORKERS`
+    /// env override; prints a short banner; and drains gracefully on SIGTERM
+    /// when the `graceful` feature is on (falling back to [`App::run`]).
+    pub fn serve(mut self) -> std::io::Result<()> {
+        if let Some(n) = std::env::var("WORKERS").ok().and_then(|w| w.parse().ok()) {
+            self.workers = n;
+        }
+        let addr = std::env::args().nth(1).unwrap_or_else(|| {
+            let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+            let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
+            format!("{host}:{port}")
+        });
+        println!("sutegi · {} on http://{addr}", self.name);
+        println!("  ops: /__health /__ready /__metrics /__introspect");
+        #[cfg(feature = "graceful")]
+        {
+            self.run_graceful(&addr)
+        }
+        #[cfg(not(feature = "graceful"))]
+        {
+            self.run(&addr)
+        }
+    }
+
+    /// Turn registered [`ToolDef`]s into `/__tools*` routes + introspection
+    /// entries. Called once from [`App::into_service`].
+    fn mount_tools(mut self) -> App {
+        let defs = Arc::new(std::mem::take(&mut self.tool_defs));
+        for d in defs.iter() {
+            self = self.register_tool(manifest_entry(
+                &d.name,
+                &d.description,
+                d.schema.clone(),
+                d.is_stream(),
+            ));
+        }
+        let manifest = Json::arr(
+            defs.iter()
+                .map(|d| manifest_entry(&d.name, &d.description, d.schema.clone(), d.is_stream()))
+                .collect(),
+        );
+        self = self.get(
+            "/__tools",
+            "List callable AI tools as an LLM tool-calling manifest.",
+            move |_c| json(200, &manifest),
+        );
+        let invoke = Arc::clone(&defs);
+        self = self.post(
+            "/__tools/:name",
+            "Invoke an AI tool by name with a JSON argument object.",
+            move |c: &Ctx| tool_invoke(&invoke, c),
+        );
+        let stream = Arc::clone(&defs);
+        self = self.post(
+            "/__tools/:name/stream",
+            "Invoke a streaming AI tool by name; response is text/event-stream (SSE).",
+            move |c: &Ctx| tool_stream(&stream, c),
+        );
+        self
+    }
+}
+
+fn manifest_entry(name: &str, description: &str, parameters: Json, streaming: bool) -> Json {
+    Json::obj(vec![
+        ("name", Json::str(name)),
+        ("description", Json::str(description)),
+        ("input_schema", parameters),
+        ("streaming", Json::Bool(streaming)),
+    ])
+}
+
+/// Validate `args` against a tool's declared schema (when the `validate` feature
+/// is on); returns a ready `422` [`Error`] on failure.
+#[allow(unused_variables)]
+fn validate_tool_args(schema: &Json, args: &Json) -> Result<(), Error> {
+    #[cfg(feature = "validate")]
+    if let Err(errs) = sutegi_validate::validate_schema(schema, args) {
+        return Err(Error::unprocessable("validation failed").with_fields(errs.to_json()));
+    }
+    Ok(())
+}
+
+fn tool_invoke(defs: &[ToolDef], c: &Ctx) -> Response {
+    let name = c.param("name").unwrap_or("").to_string();
+    let args = match c.json() {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    let def = match defs.iter().find(|d| d.name == name && !d.is_stream()) {
+        Some(d) => d,
+        None => return Error::not_found(format!("unknown tool '{name}'")).into_response(),
+    };
+    if let Err(e) = validate_tool_args(&def.schema, &args) {
+        return e.into_response();
+    }
+    let tctx = ToolCtx {
+        state: Arc::clone(&c.state),
+        params: c.params.clone(),
+    };
+    match &def.body {
+        ToolBody::Unary(f) => match f(&tctx, args) {
+            Ok(out) => json(200, &out),
+            Err(e) => e.into_response(),
+        },
+        ToolBody::Stream(_) => Error::bad_request(format!(
+            "'{name}' is a streaming tool; POST /__tools/{name}/stream"
+        ))
+        .into_response(),
+    }
+}
+
+fn tool_stream(defs: &Arc<Vec<ToolDef>>, c: &Ctx) -> Response {
+    let name = c.param("name").unwrap_or("").to_string();
+    let args = match c.json() {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    let def = match defs.iter().find(|d| d.name == name && d.is_stream()) {
+        Some(d) => d,
+        None => {
+            return Error::not_found(format!("unknown streaming tool '{name}'")).into_response()
+        }
+    };
+    if let Err(e) = validate_tool_args(&def.schema, &args) {
+        return e.into_response();
+    }
+    // Everything the SSE producer needs must be owned (it runs after we return).
+    let tctx = ToolCtx {
+        state: Arc::clone(&c.state),
+        params: c.params.clone(),
+    };
+    let defs = Arc::clone(defs);
+    sse(move |sink| {
+        if let Some(def) = defs.iter().find(|d| d.name == name && d.is_stream()) {
+            if let ToolBody::Stream(f) = &def.body {
+                return f(&tctx, args, sink);
+            }
+        }
+        Ok(())
+    })
 }
 
 /// SIGTERM/SIGINT handling for graceful shutdown (only with the `graceful` feature).
@@ -434,52 +834,52 @@ pub struct Group {
 }
 
 impl Group {
-    pub fn route(
+    pub fn route<R: IntoResponse>(
         mut self,
         method: Method,
         pattern: &str,
         doc: &str,
-        handler: impl Fn(&Request, &Params) -> Response + Send + Sync + 'static,
+        handler: impl Fn(&Ctx) -> R + Send + Sync + 'static,
     ) -> Group {
         self.routes.push(Route {
             method,
             pattern: join_prefix(&self.prefix, pattern),
             doc: doc.to_string(),
-            handler: Box::new(handler),
+            handler: Box::new(move |c: &Ctx| handler(c).into_response()),
             middleware: self.middleware.clone(),
         });
         self
     }
 
-    pub fn get(
+    pub fn get<R: IntoResponse>(
         self,
         p: &str,
         doc: &str,
-        h: impl Fn(&Request, &Params) -> Response + Send + Sync + 'static,
+        h: impl Fn(&Ctx) -> R + Send + Sync + 'static,
     ) -> Group {
         self.route(Method::Get, p, doc, h)
     }
-    pub fn post(
+    pub fn post<R: IntoResponse>(
         self,
         p: &str,
         doc: &str,
-        h: impl Fn(&Request, &Params) -> Response + Send + Sync + 'static,
+        h: impl Fn(&Ctx) -> R + Send + Sync + 'static,
     ) -> Group {
         self.route(Method::Post, p, doc, h)
     }
-    pub fn put(
+    pub fn put<R: IntoResponse>(
         self,
         p: &str,
         doc: &str,
-        h: impl Fn(&Request, &Params) -> Response + Send + Sync + 'static,
+        h: impl Fn(&Ctx) -> R + Send + Sync + 'static,
     ) -> Group {
         self.route(Method::Put, p, doc, h)
     }
-    pub fn delete(
+    pub fn delete<R: IntoResponse>(
         self,
         p: &str,
         doc: &str,
-        h: impl Fn(&Request, &Params) -> Response + Send + Sync + 'static,
+        h: impl Fn(&Ctx) -> R + Send + Sync + 'static,
     ) -> Group {
         self.route(Method::Delete, p, doc, h)
     }
@@ -1021,11 +1421,8 @@ mod tests {
     fn group_prefixes_routes_and_introspects() {
         // Build an app with a prefixed group; introspection reflects the joined paths.
         let app = App::new("t").group("/api", vec![], |g| {
-            g.get("/users", "list", |_r, _p| text(200, "ok")).post(
-                "/users/:id",
-                "update",
-                |_r, _p| text(200, "ok"),
-            )
+            g.get("/users", "list", |_c| text(200, "ok"))
+                .post("/users/:id", "update", |_c| text(200, "ok"))
         });
         let intro = app.introspection();
         let routes = intro.get("routes").and_then(Json::as_array).unwrap();
@@ -1035,5 +1432,56 @@ mod tests {
             .collect();
         assert!(patterns.contains(&"/api/users"));
         assert!(patterns.contains(&"/api/users/:id"));
+    }
+
+    #[test]
+    fn into_response_covers_common_return_types() {
+        assert_eq!("hi".into_response().status, 200);
+        assert_eq!(String::from("hi").into_response().status, 200);
+        assert_eq!(().into_response().status, 204);
+        assert_eq!((201, Json::Null).into_response().status, 201);
+        assert_eq!((404, "nope").into_response().status, 404);
+        let ok: Result<&str, Error> = Ok("ok");
+        assert_eq!(ok.into_response().status, 200);
+        let err: Result<&str, Error> = Err(Error::not_found("gone"));
+        assert_eq!(err.into_response().status, 404);
+    }
+
+    #[test]
+    fn error_renders_message_and_fields() {
+        let resp = Error::unprocessable("bad")
+            .with_fields(Json::obj(vec![("title", Json::str("required"))]))
+            .into_response();
+        assert_eq!(resp.status, 422);
+        // 500 by default from a String via `?`.
+        let from_string: Error = "boom".to_string().into();
+        assert_eq!(from_string.status, 500);
+    }
+
+    #[test]
+    fn ctx_reads_typed_state_and_params() {
+        let mut state = StateMap::new();
+        state.insert(TypeId::of::<u32>(), Arc::new(7u32));
+        let state = Arc::new(state);
+        let req = Request {
+            method: Method::Get,
+            path: "/x/9".into(),
+            query: "a=1".into(),
+            version: "HTTP/1.1".into(),
+            headers: vec![],
+            body: vec![],
+            peer: None,
+        };
+        let mut params = Params::new();
+        params.insert("id".into(), "9".into());
+        let ctx = Ctx {
+            req: &req,
+            params,
+            state: Arc::clone(&state),
+        };
+        assert_eq!(ctx.param("id"), Some("9"));
+        assert_eq!(*ctx.state::<u32>(), 7);
+        assert_eq!(ctx.try_state::<String>(), None);
+        assert_eq!(ctx.query().get("a").map(String::as_str), Some("1"));
     }
 }

@@ -8,98 +8,275 @@
 //! replicas sharing one database, reach for the Postgres backend
 //! ([`crate::pg::Pg`]) instead — same [`Backend`] API, so the app code doesn't
 //! change.
+//!
+//! [`Db`] is a cheap-to-clone, `Send + Sync` handle over a small connection
+//! pool, so it drops straight into [`App::state`](../../sutegi_web/struct.App.html)
+//! with no user-visible `Mutex`. File-backed databases run in WAL mode so
+//! several pooled connections can read while one writes; an in-memory database
+//! is inherently a single connection (a second would be a *different*
+//! database), so [`Db::memory`] pins the pool to size 1.
 
 use crate::backend::Backend;
 use crate::value::{create_table_sql, TableSchema, Value};
 use rusqlite::{params_from_iter, types::Value as SqlValue, Connection};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::sync::{Arc, Condvar, Mutex};
 use sutegi_json::Json;
 
-/// A single SQLite connection. Cheap to create; not `Clone` (wrap in
-/// `Arc<Mutex<Db>>` to share across threads, as the framework does).
-pub struct Db {
-    conn: Connection,
+/// Where a pool's connections come from.
+enum Source {
+    /// A private in-memory database (size-1 pool).
+    Memory,
+    /// A file on disk, opened in WAL mode.
+    File(String),
 }
 
-impl Db {
-    /// Open an in-memory database (great for tests and demos).
-    pub fn memory() -> Result<Db, String> {
-        Connection::open_in_memory()
-            .map(|conn| Db { conn })
-            .map_err(|e| e.to_string())
+struct Inner {
+    /// Idle, ready-to-use connections.
+    idle: Vec<Connection>,
+    /// Live connections (idle + checked out). Capped at `max_size`.
+    open: usize,
+}
+
+/// A small blocking SQLite connection pool. Connections are opened lazily up to
+/// `max_size` and returned on checkin.
+struct SqlitePool {
+    source: Source,
+    max_size: usize,
+    state: (Mutex<Inner>, Condvar),
+}
+
+impl SqlitePool {
+    fn new(source: Source, max_size: usize) -> SqlitePool {
+        SqlitePool {
+            source,
+            max_size: max_size.max(1),
+            state: (
+                Mutex::new(Inner {
+                    idle: Vec::new(),
+                    open: 0,
+                }),
+                Condvar::new(),
+            ),
+        }
     }
 
-    /// Open (or create) a database file.
-    pub fn open(path: &str) -> Result<Db, String> {
-        Connection::open(path)
-            .map(|conn| Db { conn })
-            .map_err(|e| e.to_string())
-    }
-
-    /// Run `f` inside a transaction: BEGIN, then COMMIT on `Ok` or ROLLBACK on
-    /// `Err`. The closure receives `&Db`, which is a [`Backend`], so the whole
-    /// query builder + `Model` surface works inside the transaction.
-    pub fn transaction<T>(&self, f: impl FnOnce(&Db) -> Result<T, String>) -> Result<T, String> {
-        self.conn
-            .execute_batch("BEGIN")
-            .map_err(|e| e.to_string())?;
-        match f(self) {
-            Ok(value) => {
-                self.conn
-                    .execute_batch("COMMIT")
+    fn connect(&self) -> Result<Connection, String> {
+        match &self.source {
+            Source::Memory => Connection::open_in_memory().map_err(|e| e.to_string()),
+            Source::File(path) => {
+                let conn = Connection::open(path).map_err(|e| e.to_string())?;
+                // WAL lets pooled readers proceed alongside a writer; the busy
+                // timeout absorbs brief write contention instead of erroring.
+                conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
                     .map_err(|e| e.to_string())?;
-                Ok(value)
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
+                Ok(conn)
             }
         }
     }
+
+    /// Check a connection out, run `f`, and return it to the pool. A connection
+    /// is only reused, never silently swapped, so a transaction pinned inside
+    /// `f` stays on one connection.
+    fn with<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T, String>) -> Result<T, String> {
+        let mut conn = self.checkout()?;
+        let result = f(&mut conn);
+        self.checkin(conn);
+        result
+    }
+
+    fn checkout(&self) -> Result<Connection, String> {
+        let (lock, cvar) = &self.state;
+        let mut inner = lock.lock().unwrap();
+        loop {
+            if let Some(conn) = inner.idle.pop() {
+                return Ok(conn);
+            }
+            if inner.open < self.max_size {
+                inner.open += 1;
+                drop(inner);
+                match self.connect() {
+                    Ok(conn) => return Ok(conn),
+                    Err(e) => {
+                        let mut inner = lock.lock().unwrap();
+                        inner.open -= 1;
+                        cvar.notify_one();
+                        return Err(e);
+                    }
+                }
+            }
+            inner = cvar.wait(inner).unwrap();
+        }
+    }
+
+    fn checkin(&self, conn: Connection) {
+        let (lock, cvar) = &self.state;
+        let mut inner = lock.lock().unwrap();
+        inner.idle.push(conn);
+        cvar.notify_one();
+    }
+}
+
+/// A pooled SQLite handle: cheap to [`clone`](Clone), `Send + Sync`, and a
+/// [`Backend`]. Share it across worker threads by cloning (it's an `Arc`
+/// inside) or by handing it to [`App::state`](../../sutegi_web/struct.App.html).
+#[derive(Clone)]
+pub struct Db {
+    pool: Arc<SqlitePool>,
+}
+
+impl Db {
+    /// Open a private in-memory database (great for tests and demos). Always a
+    /// single connection — the data lives only as long as this `Db`.
+    pub fn memory() -> Result<Db, String> {
+        let db = Db {
+            pool: Arc::new(SqlitePool::new(Source::Memory, 1)),
+        };
+        // Materialize the single connection now so the DB exists eagerly.
+        db.pool.with(|_| Ok(()))?;
+        Ok(db)
+    }
+
+    /// Open (or create) a database file with a small default pool (WAL mode).
+    /// Use [`Db::open_pool`] to size the pool to your worker count.
+    pub fn open(path: &str) -> Result<Db, String> {
+        Db::open_pool(path, 4)
+    }
+
+    /// Open (or create) a database file with a pool of `size` connections.
+    pub fn open_pool(path: &str, size: usize) -> Result<Db, String> {
+        let db = Db {
+            pool: Arc::new(SqlitePool::new(Source::File(path.to_string()), size)),
+        };
+        // Fail fast if the file can't be opened / WAL can't be set.
+        db.pool.with(|_| Ok(()))?;
+        Ok(db)
+    }
+
+    /// Open the file named by the `env_key` environment variable, or fall back
+    /// to an in-memory database when it is unset — the common "persist in
+    /// prod, ephemeral in dev/tests" shape.
+    ///
+    /// ```ignore
+    /// let db = Db::open_or_memory("DATABASE_PATH");
+    /// ```
+    pub fn open_or_memory(env_key: &str) -> Db {
+        match std::env::var(env_key) {
+            Ok(path) => Db::open(&path).expect("open database"),
+            Err(_) => Db::memory().expect("open in-memory database"),
+        }
+    }
+
+    /// Run `f` inside a transaction on a single pinned connection: `BEGIN`, then
+    /// `COMMIT` on `Ok` or `ROLLBACK` on `Err`. The closure receives a [`Tx`],
+    /// which is a [`Backend`], so the whole query builder + `Model` surface
+    /// works inside the transaction.
+    pub fn transaction<T>(&self, f: impl FnOnce(&Tx) -> Result<T, String>) -> Result<T, String> {
+        self.pool.with(|conn| {
+            conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+            let tx = Tx {
+                conn: RefCell::new(conn),
+            };
+            match f(&tx) {
+                Ok(value) => {
+                    tx.conn
+                        .borrow_mut()
+                        .execute_batch("COMMIT")
+                        .map_err(|e| e.to_string())?;
+                    Ok(value)
+                }
+                Err(e) => {
+                    let _ = tx.conn.borrow_mut().execute_batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+    }
+}
+
+/// Run one query on a checked-out connection and collect rows as JSON objects.
+fn query_conn(conn: &Connection, sql: &str, params: &[Value]) -> Result<Vec<Json>, String> {
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let col_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let bound: Vec<SqlValue> = params.iter().map(to_sql).collect();
+    let rows = stmt
+        .query_map(params_from_iter(bound), |row| {
+            let mut obj = BTreeMap::new();
+            for (i, name) in col_names.iter().enumerate() {
+                let v: SqlValue = row.get(i)?;
+                obj.insert(name.clone(), sql_to_json(v));
+            }
+            Ok(Json::Obj(obj))
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+fn execute_conn(conn: &Connection, sql: &str, params: &[Value]) -> Result<usize, String> {
+    let bound: Vec<SqlValue> = params.iter().map(to_sql).collect();
+    conn.execute(sql, params_from_iter(bound))
+        .map_err(|e| e.to_string())
+}
+
+/// `INSERT INTO … VALUES (…)` returning the new rowid — shared by [`Db`] / [`Tx`].
+fn insert_conn(conn: &Connection, table: &str, cols: &[(&str, Value)]) -> Result<i64, String> {
+    let names: Vec<&str> = cols.iter().map(|(n, _)| *n).collect();
+    let placeholders = vec!["?"; cols.len()].join(", ");
+    let sql = format!(
+        "INSERT INTO {} ({}) VALUES ({})",
+        table,
+        names.join(", "),
+        placeholders
+    );
+    let bound: Vec<SqlValue> = cols.iter().map(|(_, v)| to_sql(v)).collect();
+    conn.execute(&sql, params_from_iter(bound))
+        .map_err(|e| e.to_string())?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// `INSERT … ON CONFLICT(conflict) DO UPDATE …` returning the rowid.
+fn upsert_conn(
+    conn: &Connection,
+    table: &str,
+    cols: &[(&str, Value)],
+    conflict: &str,
+) -> Result<i64, String> {
+    let names: Vec<&str> = cols.iter().map(|(n, _)| *n).collect();
+    let placeholders = vec!["?"; cols.len()].join(", ");
+    let updates: Vec<String> = names
+        .iter()
+        .filter(|n| **n != conflict)
+        .map(|n| format!("{} = excluded.{}", n, n))
+        .collect();
+    let sql = format!(
+        "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT({}) DO UPDATE SET {}",
+        table,
+        names.join(", "),
+        placeholders,
+        conflict,
+        updates.join(", ")
+    );
+    let bound: Vec<SqlValue> = cols.iter().map(|(_, v)| to_sql(v)).collect();
+    conn.execute(&sql, params_from_iter(bound))
+        .map_err(|e| e.to_string())?;
+    Ok(conn.last_insert_rowid())
 }
 
 impl Backend for Db {
     fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Json>, String> {
-        let mut stmt = self.conn.prepare(sql).map_err(|e| e.to_string())?;
-        let col_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
-        let bound: Vec<SqlValue> = params.iter().map(to_sql).collect();
-        let rows = stmt
-            .query_map(params_from_iter(bound), |row| {
-                let mut obj = BTreeMap::new();
-                for (i, name) in col_names.iter().enumerate() {
-                    let v: SqlValue = row.get(i)?;
-                    obj.insert(name.clone(), sql_to_json(v));
-                }
-                Ok(Json::Obj(obj))
-            })
-            .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())
+        self.pool.with(|conn| query_conn(conn, sql, params))
     }
 
     fn execute(&self, sql: &str, params: &[Value]) -> Result<usize, String> {
-        let bound: Vec<SqlValue> = params.iter().map(to_sql).collect();
-        self.conn
-            .execute(sql, params_from_iter(bound))
-            .map_err(|e| e.to_string())
+        self.pool.with(|conn| execute_conn(conn, sql, params))
     }
 
     // SQLite uses the implicit rowid / `last_insert_rowid()`, so the named
     // primary key is not needed here.
     fn insert(&self, table: &str, cols: &[(&str, Value)], _pk: &str) -> Result<i64, String> {
-        let names: Vec<&str> = cols.iter().map(|(n, _)| *n).collect();
-        let placeholders = vec!["?"; cols.len()].join(", ");
-        let sql = format!(
-            "INSERT INTO {} ({}) VALUES ({})",
-            table,
-            names.join(", "),
-            placeholders
-        );
-        let bound: Vec<SqlValue> = cols.iter().map(|(_, v)| to_sql(v)).collect();
-        self.conn
-            .execute(&sql, params_from_iter(bound))
-            .map_err(|e| e.to_string())?;
-        Ok(self.conn.last_insert_rowid())
+        self.pool.with(|conn| insert_conn(conn, table, cols))
     }
 
     fn upsert(
@@ -109,30 +286,55 @@ impl Backend for Db {
         conflict: &str,
         _pk: &str,
     ) -> Result<i64, String> {
-        let names: Vec<&str> = cols.iter().map(|(n, _)| *n).collect();
-        let placeholders = vec!["?"; cols.len()].join(", ");
-        let updates: Vec<String> = names
-            .iter()
-            .filter(|n| **n != conflict)
-            .map(|n| format!("{} = excluded.{}", n, n))
-            .collect();
-        let sql = format!(
-            "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT({}) DO UPDATE SET {}",
-            table,
-            names.join(", "),
-            placeholders,
-            conflict,
-            updates.join(", ")
-        );
-        let bound: Vec<SqlValue> = cols.iter().map(|(_, v)| to_sql(v)).collect();
-        self.conn
-            .execute(&sql, params_from_iter(bound))
-            .map_err(|e| e.to_string())?;
-        Ok(self.conn.last_insert_rowid())
+        self.pool
+            .with(|conn| upsert_conn(conn, table, cols, conflict))
+    }
+
+    fn migrate(&self, schema: &TableSchema) -> Result<(), String> {
+        self.pool.with(|conn| {
+            conn.execute_batch(&create_table_sql(schema))
+                .map_err(|e| e.to_string())
+        })
+    }
+}
+
+/// A transaction handle: a [`Backend`] pinned to a single connection for the
+/// duration of a [`Db::transaction`] closure. Uses interior mutability because
+/// the trait takes `&self` while `rusqlite` wants `&mut` for `execute`.
+pub struct Tx<'a> {
+    conn: RefCell<&'a mut Connection>,
+}
+
+impl Backend for Tx<'_> {
+    fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Json>, String> {
+        let conn = self.conn.borrow();
+        query_conn(&conn, sql, params)
+    }
+
+    fn execute(&self, sql: &str, params: &[Value]) -> Result<usize, String> {
+        let conn = self.conn.borrow();
+        execute_conn(&conn, sql, params)
+    }
+
+    fn insert(&self, table: &str, cols: &[(&str, Value)], _pk: &str) -> Result<i64, String> {
+        let conn = self.conn.borrow();
+        insert_conn(&conn, table, cols)
+    }
+
+    fn upsert(
+        &self,
+        table: &str,
+        cols: &[(&str, Value)],
+        conflict: &str,
+        _pk: &str,
+    ) -> Result<i64, String> {
+        let conn = self.conn.borrow();
+        upsert_conn(&conn, table, cols, conflict)
     }
 
     fn migrate(&self, schema: &TableSchema) -> Result<(), String> {
         self.conn
+            .borrow()
             .execute_batch(&create_table_sql(schema))
             .map_err(|e| e.to_string())
     }
@@ -145,6 +347,10 @@ fn to_sql(v: &Value) -> SqlValue {
         Value::Real(r) => SqlValue::Real(*r),
         Value::Text(s) => SqlValue::Text(s.clone()),
         Value::Bool(b) => SqlValue::Integer(if *b { 1 } else { 0 }),
+        // SQLite has no JSON or vector type: store the canonical serialization
+        // as TEXT. The typed row extractors parse it back on the way out.
+        Value::Json(j) => SqlValue::Text(j.to_string()),
+        Value::Vector(vec) => SqlValue::Text(crate::value::vector_to_text(vec)),
     }
 }
 
@@ -235,7 +441,7 @@ mod tests {
         assert_eq!(db.execute(&sql, &params).unwrap(), 1);
 
         // Rollback leaves state untouched. Note the closure uses the Backend
-        // API on `&Db` — the transaction seam is backend-agnostic now.
+        // API on `&Tx` — the transaction seam is backend-agnostic now.
         let _ = db.transaction(|tx| {
             tx.insert(
                 "todos",
@@ -318,5 +524,30 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.get("title").unwrap(), &Json::str("upserted"));
+    }
+
+    #[test]
+    fn clone_shares_one_database() {
+        // A cloned handle shares the same pool, so writes are visible across
+        // clones — this is what makes `Db` safe to hand to `App::state`.
+        let db = Db::memory().unwrap();
+        db.migrate(&todos_schema()).unwrap();
+        let db2 = db.clone();
+        db2.insert(
+            "todos",
+            &[
+                ("title", Value::Text("shared".into())),
+                ("done", Value::Bool(false)),
+            ],
+            "id",
+        )
+        .unwrap();
+        assert_eq!(db.count(&QueryBuilder::table("todos")).unwrap(), 1);
+    }
+
+    #[test]
+    fn pooled_file_db_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Db>();
     }
 }

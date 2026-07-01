@@ -87,6 +87,24 @@ pub enum Rule {
     Same(String),
 }
 
+/// A type that carries its own [`Ruleset`], so an incoming request body can be
+/// validated against the model it will be hydrated into. Implement it by hand,
+/// or derive it with `#[derive(Validate)]` plus `#[validate(...)]` field
+/// attributes. Consumed by `Ctx::validated::<T>()` in `sutegi-web`.
+///
+/// ```ignore
+/// #[derive(Model, Validate)]
+/// struct Todo {
+///     #[model(primary)] id: i64,
+///     #[validate(required, min_len = 1, max_len = 200)] title: String,
+///     done: bool,
+/// }
+/// ```
+pub trait Validate {
+    /// The rules this type's incoming JSON must satisfy.
+    fn rules() -> Ruleset;
+}
+
 /// A set of `field -> rules` mappings, validated against a JSON object.
 #[derive(Default)]
 pub struct Ruleset {

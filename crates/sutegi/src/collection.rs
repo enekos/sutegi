@@ -234,11 +234,11 @@ impl<T> Collection<T> {
     }
 
     /// Sum a numeric projection of each item.
-    pub fn sum_by<N, F: FnMut(&T) -> N>(&self, mut f: F) -> N
+    pub fn sum_by<N, F: FnMut(&T) -> N>(&self, f: F) -> N
     where
         N: std::iter::Sum,
     {
-        self.items.iter().map(|x| f(x)).sum()
+        self.items.iter().map(f).sum()
     }
 }
 
@@ -267,7 +267,11 @@ impl<T: Eq + Hash + Clone> Collection<T> {
     /// Drop duplicates in O(n) using a hash set, keeping first occurrences.
     pub fn unique_hashed(self) -> Collection<T> {
         let mut seen = std::collections::HashSet::new();
-        collect(self.items.into_iter().filter(move |x| seen.insert(x.clone())))
+        collect(
+            self.items
+                .into_iter()
+                .filter(move |x| seen.insert(x.clone())),
+        )
     }
 }
 
@@ -430,7 +434,8 @@ mod tests {
 
     #[test]
     fn group_by_key() {
-        let groups = collect(vec!["ant", "bee", "arc", "bat"]).group_by(|s| s.chars().next().unwrap());
+        let groups =
+            collect(vec!["ant", "bee", "arc", "bat"]).group_by(|s| s.chars().next().unwrap());
         let mut a = groups[&'a'].clone().into_vec();
         let mut b = groups[&'b'].clone().into_vec();
         a.sort();
@@ -443,7 +448,9 @@ mod tests {
     fn sort_variants() {
         assert_eq!(collect(vec![3, 1, 2]).sort().into_vec(), vec![1, 2, 3]);
         assert_eq!(
-            collect(vec!["ccc", "a", "bb"]).sort_by_key(|s| s.len()).into_vec(),
+            collect(vec!["ccc", "a", "bb"])
+                .sort_by_key(|s| s.len())
+                .into_vec(),
             vec!["a", "bb", "ccc"]
         );
         assert_eq!(collect(vec![1, 3, 2]).max(), Some(&3));

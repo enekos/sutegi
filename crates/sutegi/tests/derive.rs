@@ -131,3 +131,79 @@ fn to_json_renders_real_booleans_and_omits_skipped() {
     // The skipped field never appears.
     assert!(j.get("cached").is_none());
 }
+
+#[test]
+fn from_input_defaults_absent_columns() {
+    // A partial client payload (only `title`) hydrates: `id`/`done` default,
+    // while `from_row` on the same object would error on the missing `id`.
+    let partial = Json::obj(vec![("title", Json::str("via agent"))]);
+    assert!(Todo::from_row(&partial).is_err());
+    let todo = Todo::from_input(&partial).unwrap();
+    assert_eq!(todo.id, 0);
+    assert_eq!(todo.title, "via agent");
+    assert!(!todo.done);
+    // A nullable column left absent stays None (not defaulted to a value).
+    assert_eq!(todo.note, None);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn save_inserts_and_lets_the_backend_assign_the_id() {
+    let db = Db::memory().unwrap();
+    Todo::migrate(&db).unwrap();
+    // The `id` on the struct is ignored — the backend assigns it.
+    let first = Todo {
+        id: 0,
+        title: "ship".into(),
+        done: false,
+        note: None,
+        cached: 0,
+    };
+    assert_eq!(first.save(&db).unwrap(), 1);
+    let second = Todo {
+        id: 999,
+        title: "again".into(),
+        done: true,
+        note: Some("n".into()),
+        cached: 0,
+    };
+    assert_eq!(second.save(&db).unwrap(), 2);
+    let all = Todo::all_typed(&db).unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].title, "ship");
+}
+
+#[cfg(feature = "validate")]
+#[derive(Validate)]
+#[allow(dead_code)]
+struct Signup {
+    #[validate(required, str, min_len = 3, max_len = 20)]
+    username: String,
+    #[validate(required, email)]
+    email: String,
+    #[validate(min = 18)]
+    age: i64,
+}
+
+#[cfg(feature = "validate")]
+#[test]
+fn derive_validate_builds_a_working_ruleset() {
+    let rules = Signup::rules();
+    // A well-formed payload passes.
+    let ok = Json::obj(vec![
+        ("username", Json::str("eneko")),
+        ("email", Json::str("e@example.com")),
+        ("age", Json::int(30)),
+    ]);
+    assert!(rules.validate(&ok).is_ok());
+    // Each violated field is reported.
+    let bad = Json::obj(vec![
+        ("username", Json::str("x")),
+        ("email", Json::str("nope")),
+        ("age", Json::int(12)),
+    ]);
+    let errs = rules.validate(&bad).unwrap_err().to_json();
+    assert!(errs.get("username").is_some());
+    assert!(errs.get("email").is_some());
+    assert!(errs.get("age").is_some());
+}

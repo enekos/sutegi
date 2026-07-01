@@ -9,6 +9,5 @@ authors.workspace = true
 description = "First-class LLM primitives for sutegi: tool-calling, structured output, and agent-facing endpoints."
 
 [dependencies]
-sutegi-web = { path = "../sutegi-web", version = "0.3.0" }
-sutegi-json = { path = "../sutegi-json", version = "0.3.0" }
-sutegi-validate = { path = "../sutegi-validate", version = "0.3.0" }
+# Tools + the schema helpers now live in web core; this crate re-exports them.
+sutegi-web = { path = "../sutegi-web", version = "0.4.0" }

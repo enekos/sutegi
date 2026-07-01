@@ -176,6 +176,65 @@ fn transaction_commits_and_rolls_back() {
 }
 
 #[test]
+fn migrations_run_and_roll_back_over_postgres() {
+    use sutegi_orm::migrate::{Migration, Migrator};
+
+    let Some(db) = db() else {
+        eprintln!("skipping: SUTEGI_PG_TEST_URL not set");
+        return;
+    };
+    db.pool().batch("DROP TABLE IF EXISTS orm_pg_mig").unwrap();
+    db.pool()
+        .batch("DROP TABLE IF EXISTS _sutegi_migrations")
+        .unwrap();
+
+    let migrator = || {
+        Migrator::new().add(Migration::reversible(
+            "20260701_000001",
+            "create_orm_pg_mig",
+            |c| {
+                c.execute(
+                    "CREATE TABLE orm_pg_mig (id BIGINT PRIMARY KEY, label TEXT NOT NULL)",
+                    &[],
+                )
+                .map(|_| ())
+            },
+            |c| c.execute("DROP TABLE orm_pg_mig", &[]).map(|_| ()),
+        ))
+    };
+
+    // Forward: creates the table + records history (INSERT with ? → $n, and the
+    // BEGIN/COMMIT wrapper both go over the wire protocol).
+    assert_eq!(migrator().run(&db).unwrap(), vec!["20260701_000001"]);
+    db.execute(
+        "INSERT INTO orm_pg_mig (id, label) VALUES (?, ?)",
+        &[Value::Int(1), Value::Text("ok".into())],
+    )
+    .unwrap();
+    assert_eq!(
+        db.query("SELECT COUNT(*) AS c FROM orm_pg_mig", &[])
+            .unwrap()[0]
+            .get("c")
+            .and_then(Json::as_i64),
+        Some(1)
+    );
+    // Idempotent.
+    assert!(migrator().run(&db).unwrap().is_empty());
+
+    // Rollback drops the table and clears the history row.
+    assert_eq!(
+        migrator().rollback(&db, 1).unwrap(),
+        vec!["20260701_000001"]
+    );
+    assert!(db.query("SELECT 1 FROM orm_pg_mig", &[]).is_err());
+    assert!(migrator().status(&db).unwrap().iter().all(|s| !s.applied));
+
+    db.pool()
+        .batch("DROP TABLE IF EXISTS _sutegi_migrations")
+        .unwrap();
+}
+
+#[test]
 fn kv_store_over_postgres() {
     use sutegi_orm::kv::Kv;
 

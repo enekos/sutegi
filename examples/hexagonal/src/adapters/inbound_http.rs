@@ -29,21 +29,22 @@ pub fn register(
     complete: Arc<CompleteTodo>,
 ) -> App {
     app.group("/api", vec![], move |g| {
-        g.get("/todos", "List all todos.", move |_req, _p| {
+        g.get("/todos", "List all todos.", move |_c| {
             respond(list.execute(()))
         })
-        .post("/todos", "Create a todo.", move |req, _p| {
+        .post("/todos", "Create a todo.", move |c| {
             // Inbound translation: HTTP body → use-case input.
-            let title = json_body(req)
+            let title = c
+                .json()
                 .ok()
-                .and_then(|b| b.get("title").and_then(|j| j.as_str()).map(str::to_string))
+                .and_then(|b| b.get("title").and_then(Json::as_str).map(str::to_string))
                 .unwrap_or_default();
             respond_created(create.execute(title))
         })
         .post(
             "/todos/:id/complete",
             "Mark a todo complete.",
-            move |_req, p| match p.get("id").and_then(|s| s.parse::<i64>().ok()) {
+            move |c| match c.param("id").and_then(|s| s.parse::<i64>().ok()) {
                 Some(id) => respond(complete.execute(id)),
                 None => AppError::invalid("id must be an integer").to_response(),
             },

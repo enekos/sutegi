@@ -12,12 +12,26 @@ use crate::{Config, PgValue};
 /// Protocol version 3.0 (`0x00030000`).
 const PROTOCOL_VERSION: i32 = 196608;
 
+/// Cap on distinct statements cached per connection. Once reached, further
+/// novel SQL runs through the unnamed statement rather than growing without
+/// bound (the server keeps every named statement alive for the session).
+const STMT_CACHE_MAX: usize = 256;
+
 /// One live connection to a backend.
 pub struct Client {
     write: TcpStream,
     read: std::io::BufReader<TcpStream>,
     /// Set once the connection is known to be broken so the pool drops it.
     broken: bool,
+    /// SQL text → server-side prepared-statement name, so a repeated query
+    /// skips the `Parse` step. Empty/disabled means always use the unnamed
+    /// statement. Reset implicitly when the connection (and this `Client`) is
+    /// dropped, which is also when the server forgets the statements.
+    stmt_cache: BTreeMap<String, String>,
+    /// Monotonic id for minting unique prepared-statement names.
+    stmt_seq: u32,
+    /// Whether to cache prepared statements at all (from [`Config`]).
+    cache_enabled: bool,
 }
 
 impl Client {
@@ -51,6 +65,9 @@ impl Client {
             write: stream,
             read,
             broken: false,
+            stmt_cache: BTreeMap::new(),
+            stmt_seq: 0,
+            cache_enabled: cfg.statement_cache,
         };
         client.startup(cfg)?;
         Ok(client)
@@ -213,23 +230,78 @@ impl Client {
         !self.broken && self.batch("SELECT 1").is_ok()
     }
 
-    /// The extended-query exchange: Parse → Bind → Describe → Execute → Sync,
-    /// then collect rows and the affected-row count.
+    /// The extended-query exchange, with per-connection statement caching.
+    ///
+    /// A novel SQL string is `Parse`d into a named statement and remembered;
+    /// on repeat only `Bind`/`Execute` are sent. A cached plan can be
+    /// invalidated by DDL run on the same connection (PostgreSQL raises
+    /// "cached plan must not change result type"); we detect that, evict the
+    /// entry, and retry once with a fresh `Parse`.
     fn extended(&mut self, sql: &str, params: &[PgValue]) -> Result<(Vec<Json>, u64), String> {
+        let (name, need_parse) = self.resolve_statement(sql);
+        match self.extended_once(sql, params, &name, need_parse) {
+            Ok(res) => {
+                // Only commit a freshly-parsed *named* statement to the cache
+                // after it round-trips cleanly (a Parse error must not leave a
+                // phantom entry).
+                if self.cache_enabled && need_parse && !name.is_empty() {
+                    self.stmt_cache.insert(sql.to_string(), name);
+                }
+                Ok(res)
+            }
+            Err(e) => {
+                if !need_parse && !self.broken && e.contains("cached plan") {
+                    // Reused a statement the server invalidated: drop it and
+                    // retry, which mints and parses a fresh one.
+                    self.stmt_cache.remove(sql);
+                    return self.extended(sql, params);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Resolve the prepared-statement name to Bind against, and whether this
+    /// call must `Parse` first. Returns an empty name for the unnamed
+    /// statement (caching off, or the per-connection cache is full).
+    fn resolve_statement(&mut self, sql: &str) -> (String, bool) {
+        pick_statement(
+            &self.stmt_cache,
+            &mut self.stmt_seq,
+            self.cache_enabled,
+            sql,
+        )
+    }
+
+    /// One Parse(?)→Bind→Describe→Execute→Sync round-trip against `stmt_name`
+    /// (empty = unnamed), collecting rows and the affected-row count.
+    fn extended_once(
+        &mut self,
+        sql: &str,
+        params: &[PgValue],
+        stmt_name: &str,
+        parse: bool,
+    ) -> Result<(Vec<Json>, u64), String> {
         let mut out = Vec::new();
+        let name_bytes = stmt_name.as_bytes();
 
-        // Parse: unnamed statement, no declared parameter types (server infers).
-        out.extend(frame(b'P', |b| {
-            b.push(0); // statement name ""
-            b.extend_from_slice(sql.as_bytes());
-            b.push(0);
-            b.extend_from_slice(&0i16.to_be_bytes()); // 0 parameter type OIDs
-        }));
+        // Parse: named (or unnamed) statement, no declared parameter types
+        // (the server infers them). Skipped when the statement is cached.
+        if parse {
+            out.extend(frame(b'P', |b| {
+                b.extend_from_slice(name_bytes);
+                b.push(0);
+                b.extend_from_slice(sql.as_bytes());
+                b.push(0);
+                b.extend_from_slice(&0i16.to_be_bytes()); // 0 parameter type OIDs
+            }));
+        }
 
-        // Bind: unnamed portal/statement, all params text format, results text.
+        // Bind: unnamed portal against `stmt_name`, all params text, results text.
         out.extend(frame(b'B', |b| {
             b.push(0); // portal ""
-            b.push(0); // statement ""
+            b.extend_from_slice(name_bytes);
+            b.push(0);
             b.extend_from_slice(&1i16.to_be_bytes()); // one format code...
             b.extend_from_slice(&0i16.to_be_bytes()); // ...= text, applies to all
             b.extend_from_slice(&(params.len() as i16).to_be_bytes());
@@ -323,6 +395,29 @@ impl Client {
     }
 }
 
+/// Decide which prepared statement to Bind against, and whether a `Parse` is
+/// needed first. Pure so the caching policy can be tested without a socket.
+/// Returns `("", true)` for the unnamed statement (caching off or cache full),
+/// `(name, false)` for a cache hit, or a freshly-minted `(name, true)` to parse.
+fn pick_statement(
+    cache: &BTreeMap<String, String>,
+    seq: &mut u32,
+    enabled: bool,
+    sql: &str,
+) -> (String, bool) {
+    if !enabled {
+        return (String::new(), true);
+    }
+    if let Some(name) = cache.get(sql) {
+        return (name.clone(), false);
+    }
+    if cache.len() >= STMT_CACHE_MAX {
+        return (String::new(), true);
+    }
+    *seq += 1;
+    (format!("sutegi_s{}", seq), true)
+}
+
 /// Build a tagged frame whose length prefix is filled in after the body.
 fn frame(tag: u8, build: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
     let mut body = Vec::new();
@@ -342,6 +437,10 @@ fn encode_param(p: &PgValue) -> Option<Vec<u8>> {
         PgValue::Real(r) => Some(r.to_string().into_bytes()),
         PgValue::Text(s) => Some(s.clone().into_bytes()),
         PgValue::Bool(b) => Some(if *b { b"t".to_vec() } else { b"f".to_vec() }),
+        // JSON and vectors travel as text; the server casts them to the target
+        // column type (json/jsonb, or pgvector's `vector`).
+        PgValue::Json(s) => Some(s.clone().into_bytes()),
+        PgValue::Vector(s) => Some(s.clone().into_bytes()),
     }
 }
 
@@ -414,6 +513,12 @@ fn decode_value(oid: i32, raw: &[u8]) -> Json {
             .parse::<f64>()
             .map(Json::Num)
             .unwrap_or_else(|_| Json::str(text.into_owned())), // float4/float8/numeric
+        // json (114) / jsonb (3802): decode straight into structured JSON, so a
+        // JSON column arrives as a real object/array, not a string.
+        114 | 3802 => Json::parse(&text).unwrap_or_else(|_| Json::str(text.into_owned())),
+        // Everything else (text, timestamps, and pgvector's `vector`, whose OID
+        // is extension-assigned) comes back as a string; typed extractors parse
+        // it further where needed.
         _ => Json::str(text.into_owned()),
     }
 }
@@ -600,6 +705,56 @@ mod tests {
         let msg = parse_error(body);
         assert!(msg.contains("28P01"));
         assert!(msg.contains("password authentication failed"));
+    }
+
+    #[test]
+    fn statement_cache_policy() {
+        let mut seq = 0u32;
+
+        // Disabled: always the unnamed statement, always parse, seq untouched.
+        let cache = BTreeMap::new();
+        assert_eq!(
+            pick_statement(&cache, &mut seq, false, "SELECT 1"),
+            (String::new(), true)
+        );
+        assert_eq!(seq, 0);
+
+        // Enabled miss: mint a fresh name and parse it.
+        let mut cache = BTreeMap::new();
+        let (name, parse) = pick_statement(&cache, &mut seq, true, "SELECT 1");
+        assert_eq!((name.as_str(), parse), ("sutegi_s1", true));
+        // Caller commits it on success; a hit then skips Parse.
+        cache.insert("SELECT 1".to_string(), name);
+        assert_eq!(
+            pick_statement(&cache, &mut seq, true, "SELECT 1"),
+            ("sutegi_s1".to_string(), false)
+        );
+        // A different SQL mints the next name.
+        assert_eq!(
+            pick_statement(&cache, &mut seq, true, "SELECT 2"),
+            ("sutegi_s2".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn statement_cache_falls_back_to_unnamed_when_full() {
+        let mut seq = 0u32;
+        let mut cache = BTreeMap::new();
+        for i in 0..STMT_CACHE_MAX {
+            cache.insert(format!("q{i}"), format!("sutegi_s{i}"));
+        }
+        // Cache full + novel SQL: unnamed statement, no seq bump.
+        assert_eq!(
+            pick_statement(&cache, &mut seq, true, "novel"),
+            (String::new(), true)
+        );
+        assert_eq!(seq, 0);
+        // A still-cached SQL is unaffected.
+        cache.insert("hot".to_string(), "sutegi_hot".to_string());
+        assert_eq!(
+            pick_statement(&cache, &mut seq, true, "hot"),
+            ("sutegi_hot".to_string(), false)
+        );
     }
 
     #[test]

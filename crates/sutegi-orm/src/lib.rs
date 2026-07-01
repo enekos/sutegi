@@ -25,9 +25,19 @@ mod backend;
 mod builder;
 mod value;
 
-pub use backend::{row, Backend, FromRow, Model};
+pub use backend::{row, Backend, FromInput, FromRow, Model};
 pub use builder::{DeleteBuilder, Page, QueryBuilder, UpdateBuilder};
 pub use value::{create_table_sql, schema_json, ColType, Column, TableSchema, Value};
+
+/// Versioned, up/down migrations with a `_sutegi_migrations` history table,
+/// over any [`Backend`].
+pub mod migrate;
+
+/// First-class embeddings: the [`embedding::Vector`] type, similarity
+/// [`embedding::Metric`]s, and nearest-neighbour search over any [`Backend`].
+pub mod embedding;
+
+pub use embedding::{Metric, Vector};
 
 /// The bundled SQLite execution layer (single-node). Requires `sqlite`.
 #[cfg(feature = "sqlite")]

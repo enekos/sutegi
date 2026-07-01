@@ -6,7 +6,7 @@
 //!
 //! | Feature | Pulls in | Gives you |
 //! |---------|----------|-----------|
-//! | `orm`      | sutegi-orm      | schema + query builder + migrations + KV |
+//! | `orm`      | sutegi-orm      | schema + query builder + migrations + JSON/vector columns + embeddings + KV |
 //! | `sqlite`   | + bundled rusqlite | SQLite: the single-node execution layer |
 //! | `postgres` | sutegi-pg (pure std) | Postgres: the multi-pod execution layer |
 //! | `derive`   | sutegi-macros (build-time only) | `#[derive(Model)]` |
@@ -41,9 +41,10 @@ pub use sutegi_session as session;
 #[cfg(feature = "validate")]
 pub use sutegi_validate as validate;
 
-/// The `#[derive(Model)]` macro (requires the `derive` feature).
+/// The `#[derive(Model)]` and `#[derive(Validate)]` macros (require the
+/// `derive` feature; `Validate` additionally needs `validate`).
 #[cfg(feature = "derive")]
-pub use sutegi_macros::Model;
+pub use sutegi_macros::{Model, Validate};
 
 /// Route-model binding: hydrate a typed model straight from a path parameter,
 /// or return a ready-made error response. Works over any runnable backend
@@ -88,6 +89,113 @@ pub mod binding {
 /// access, `.env` loading, required-var validation, and prefix scoping.
 pub mod config;
 
+/// Versioned migrations plus a CLI runner for the app binary.
+///
+/// Define a [`Migrator`](sutegi_orm::migrate::Migrator) in your app, then let
+/// [`migrate::dispatch`] intercept the `migrate` / `migrate:rollback` /
+/// `migrate:status` subcommands before you start serving:
+///
+/// ```ignore
+/// let db = Db::open("app.db")?;
+/// if sutegi::migrate::dispatch(&migrations(), &db) {
+///     return Ok(()); // a migrate subcommand ran; don't start the server
+/// }
+/// app.run("0.0.0.0:8080")
+/// ```
+///
+/// Then `myapp migrate` applies pending migrations, `myapp migrate:rollback [n]`
+/// rolls back the last `n` batches (default 1), and `myapp migrate:status`
+/// prints the ledger. Same binary serves and migrates — the Rails/Laravel shape.
+#[cfg(feature = "orm")]
+pub mod migrate {
+    pub use sutegi_orm::migrate::{
+        status_json, Migration, MigrationOps, MigrationStatus, Migrator,
+    };
+    use sutegi_orm::Backend;
+
+    /// Inspect `std::env::args()` for a `migrate*` subcommand and run it against
+    /// `conn`. Returns `true` if a subcommand was handled (the caller should
+    /// stop and exit), `false` if there was no migrate subcommand (carry on and
+    /// serve). On a migration error it prints the error and exits the process
+    /// with status 1, so CI and deploy scripts see a real failure.
+    pub fn dispatch<B: Backend>(migrator: &Migrator, conn: &B) -> bool {
+        let args: Vec<String> = std::env::args().collect();
+        match args.get(1).map(String::as_str) {
+            Some("migrate") => finish("migrate", migrator.run(conn).map(report_applied)),
+            Some("migrate:rollback") => {
+                let batches = args
+                    .get(2)
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(1);
+                finish(
+                    "migrate:rollback",
+                    migrator.rollback(conn, batches).map(report_rolled),
+                )
+            }
+            Some("migrate:status") => {
+                finish("migrate:status", migrator.status(conn).map(report_status))
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn finish(cmd: &str, result: Result<(), String>) {
+        if let Err(e) = result {
+            eprintln!("{cmd}: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    fn report_applied(versions: Vec<String>) {
+        if versions.is_empty() {
+            println!("migrate: already up to date");
+        } else {
+            println!("migrate: applied {} migration(s):", versions.len());
+            for v in versions {
+                println!("  ↑ {v}");
+            }
+        }
+    }
+
+    fn report_rolled(versions: Vec<String>) {
+        if versions.is_empty() {
+            println!("migrate:rollback: nothing to roll back");
+        } else {
+            println!(
+                "migrate:rollback: reverted {} migration(s):",
+                versions.len()
+            );
+            for v in versions {
+                println!("  ↓ {v}");
+            }
+        }
+    }
+
+    fn report_status(statuses: Vec<MigrationStatus>) {
+        if statuses.is_empty() {
+            println!("migrate:status: no migrations defined");
+            return;
+        }
+        for s in statuses {
+            let mark = if s.orphan {
+                "?"
+            } else if s.applied {
+                "✓"
+            } else {
+                " "
+            };
+            let batch = s.batch.map(|b| format!("batch {b}")).unwrap_or_default();
+            let note = if s.orphan {
+                "  (orphan: not in code)"
+            } else {
+                ""
+            };
+            println!("  [{mark}] {}  {}  {batch}{note}", s.version, s.name);
+        }
+    }
+}
+
 /// A fluent, owned collection type ([`collection::Collection`]) plus the
 /// [`collect`] constructor — chainable `map`/`filter`/`group_by`/`chunk`/… over
 /// any iterable, with zero third-party deps.
@@ -108,27 +216,27 @@ pub mod prelude {
     pub use sutegi_json::Json;
     pub use sutegi_web::{
         basic, bearer, cors, cors_preflight, form_body, html, json, json_body, logger, mw,
-        no_content, not_found, query_params, rate_limit, redirect, secure_headers, sse, status,
-        stream, text, App, Group, Limits, Method, Mw, Params, Request, Response, SseSink,
-        StreamSink,
+        no_content, not_found, query_params, rate_limit, redirect, schema, secure_headers, sse,
+        status, stream, text, App, Ctx, Error, Group, IntoResponse, Limits, Method, Mw, Params,
+        Request, Response, SseSink, StreamSink, ToolCtx,
     };
 
-    #[cfg(feature = "ai")]
-    pub use sutegi_ai::{schema, StreamTool, Tool, ToolRegistry};
+    #[cfg(feature = "orm")]
+    pub use sutegi_orm::migrate::{Migration, Migrator};
     #[cfg(feature = "orm")]
     pub use sutegi_orm::row::FromRow;
     #[cfg(feature = "orm")]
     pub use sutegi_orm::{
-        Backend, ColType, Column, DeleteBuilder, Model, Page, QueryBuilder, TableSchema,
-        UpdateBuilder, Value,
+        Backend, ColType, Column, DeleteBuilder, FromInput, Metric, Model, Page, QueryBuilder,
+        TableSchema, UpdateBuilder, Value, Vector,
     };
     #[cfg(feature = "queue")]
     pub use sutegi_queue::{Queue, Workers};
     #[cfg(feature = "validate")]
-    pub use sutegi_validate::{validate_schema, Rule, Ruleset, ValidationErrors};
+    pub use sutegi_validate::{validate_schema, Rule, Ruleset, Validate, ValidationErrors};
 
     #[cfg(feature = "derive")]
-    pub use sutegi_macros::Model;
+    pub use sutegi_macros::{Model, Validate};
 
     #[cfg(feature = "sqlite")]
     pub use sutegi_orm::db::Db;

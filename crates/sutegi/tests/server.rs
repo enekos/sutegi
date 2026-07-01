@@ -83,18 +83,21 @@ const AI: &str = "127.0.0.1:18152";
 fn routing_ops_and_middleware_end_to_end() {
     boot(MAIN, || {
         App::new("itest")
-            .get("/", "root", |_r, _p| text(200, "hello"))
-            .get("/users/:id", "fetch a user", |_r, p| {
+            .state(String::from("app-state"))
+            .get("/", "root", |_c| "hello")
+            .get("/users/:id", "fetch a user", |c| {
                 json(
                     200,
-                    &Json::obj(vec![(
-                        "id",
-                        Json::str(p.get("id").cloned().unwrap_or_default()),
-                    )]),
+                    &Json::obj(vec![("id", Json::str(c.param("id").unwrap_or("")))]),
                 )
             })
-            .post("/echo", "echo json back", |r, _p| {
-                json(200, &json_body(r).unwrap_or(Json::Null))
+            .get("/state", "read shared state", |c| {
+                c.state::<String>().clone()
+            })
+            .post("/echo", "echo json back", |c| {
+                // Handlers can use `?`: a bad body becomes a 400 automatically.
+                let body = c.json()?;
+                Ok::<_, Error>(json(200, &body))
             })
             .middleware(|r: &Request| {
                 if r.path == "/blocked" {
@@ -103,7 +106,7 @@ fn routing_ops_and_middleware_end_to_end() {
                     None
                 }
             })
-            .get("/blocked", "should never run", |_r, _p| {
+            .get("/blocked", "should never run", |_c| {
                 text(200, "unreachable")
             })
             .after(cors("*"))
@@ -155,32 +158,38 @@ fn routing_ops_and_middleware_end_to_end() {
     assert!(intro.body.contains("\"name\":\"itest\""));
     assert!(intro.body.contains("/users/:id"));
     assert!(intro.body.contains("\"framework\":\"sutegi\""));
-}
 
-struct Echo;
-impl Tool for Echo {
-    fn name(&self) -> &str {
-        "echo"
-    }
-    fn description(&self) -> &str {
-        "Echo a message back."
-    }
-    fn parameters(&self) -> Json {
-        schema::object(vec![("msg", schema::string("text to echo"))], &["msg"])
-    }
-    fn call(&self, args: Json) -> Result<Json, String> {
-        Ok(Json::obj(vec![(
-            "echo",
-            Json::str(args.get("msg").and_then(Json::as_str).unwrap_or("")),
-        )]))
-    }
+    // Shared state is reachable from a handler.
+    let state = get(MAIN, "/state");
+    assert_eq!(state.status, 200);
+    assert_eq!(state.body, "app-state");
+
+    // A malformed JSON body → 400 via `?` on `Ctx::json`.
+    let bad = send(
+        MAIN,
+        "POST",
+        "/echo",
+        &[("content-type", "application/json")],
+        "{not json",
+    );
+    assert_eq!(bad.status, 400);
+    assert!(bad.body.contains("error"));
 }
 
 #[test]
 fn ai_tool_surface_over_http() {
     boot(AI, || {
-        let app = App::new("ai-itest");
-        sutegi::ai::mount(app, ToolRegistry::new().add(Echo))
+        App::new("ai-itest").tool(
+            "echo",
+            "Echo a message back.",
+            schema::object(vec![("msg", schema::string("text to echo"))], &["msg"]),
+            |_c, args| {
+                Ok(Json::obj(vec![(
+                    "echo",
+                    Json::str(args.get("msg").and_then(Json::as_str).unwrap_or("")),
+                )]))
+            },
+        )
     });
 
     // Manifest lists the tool with an input schema.

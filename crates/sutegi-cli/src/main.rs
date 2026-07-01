@@ -100,11 +100,11 @@ sutegi = {{ git = "https://github.com/enekos/sutegi" }}
 const NEW_MAIN_RS: &str = r#"use sutegi::prelude::*;
 
 fn main() -> std::io::Result<()> {
-    let app = App::new("my-app")
-        .get("/", "Health check", |_req, _params| text(200, "sutegi up"));
-
-    println!("listening on http://127.0.0.1:8080  (try /__introspect)");
-    app.run("127.0.0.1:8080")
+    // Handlers take one `Ctx` and return anything `IntoResponse`.
+    // `serve()` reads HOST/PORT/WORKERS (or argv[1]) and drains on SIGTERM.
+    App::new("my-app")
+        .get("/", "Health check", |_| "sutegi up")
+        .serve()
 }
 "#;
 
@@ -128,20 +128,16 @@ fn model_template(pascal: &str, table: &str) -> String {
     format!(
         r#"use sutegi::prelude::*;
 
-/// The `{table}` table.
-pub struct {pascal};
-
-impl Model for {pascal} {{
-    fn schema() -> TableSchema {{
-        TableSchema {{
-            table: "{table}",
-            columns: vec![
-                Column {{ name: "id", ty: ColType::Integer, nullable: false, primary: true }},
-                // sutegi convention: add fields below, then `register_model({pascal}::schema())`
-                // in main() so the model shows up in /__introspect.
-            ],
-        }}
-    }}
+/// The `{table}` table. `#[derive(Model)]` generates the schema, `FromRow`
+/// hydration, `save()`, `to_json()`, and `from_input()`. Add `#[derive(Validate)]`
+/// with `#[validate(...)]` field attributes for `Ctx::validated::<{pascal}>()`.
+#[derive(Model)]
+#[model(table = "{table}")]
+pub struct {pascal} {{
+    #[model(primary)]
+    pub id: i64,
+    // sutegi convention: add fields below, then `.register_model({pascal}::schema())`
+    // in main() so the model shows up in /__introspect.
 }}
 "#
     )
@@ -168,9 +164,7 @@ fn route_template(snake: &str) -> String {
 /// sutegi convention: every route module exposes `register`, called from main()
 /// as `let app = {snake}::register(app);`. Keeps wiring uniform and agent-legible.
 pub fn register(app: App) -> App {{
-    app.get("/{snake}", "Describe what /{snake} does", |_req, _params| {{
-        text(200, "{snake} ok")
-    }})
+    app.get("/{snake}", "Describe what /{snake} does", |_c| "{snake} ok")
 }}
 "#
     )
@@ -315,9 +309,9 @@ mod tests {
     #[test]
     fn model_template_wires_struct_and_table() {
         let tpl = model_template("Category", "categories");
-        assert!(tpl.contains("pub struct Category;"));
-        assert!(tpl.contains("impl Model for Category"));
-        assert!(tpl.contains(r#"table: "categories""#));
+        assert!(tpl.contains("#[derive(Model)]"));
+        assert!(tpl.contains("pub struct Category"));
+        assert!(tpl.contains(r#"#[model(table = "categories")]"#));
         assert!(tpl.contains("use sutegi::prelude::*;"));
     }
 

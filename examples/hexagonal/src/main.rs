@@ -17,11 +17,11 @@ mod application;
 mod domain;
 mod ports;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use sutegi::prelude::*;
 
-use adapters::inbound_ai::CreateTodoTool;
+use adapters::inbound_ai;
 use adapters::inbound_http;
 use adapters::outbound_memory::InMemoryTodoRepo;
 use adapters::outbound_sqlite::SqliteTodoRepo;
@@ -34,8 +34,7 @@ fn main() -> std::io::Result<()> {
     let repo: Arc<dyn TodoRepository> = match sutegi::env_or("REPO", "sqlite").as_str() {
         "memory" => Arc::new(InMemoryTodoRepo::new()),
         _ => {
-            let db = Arc::new(Mutex::new(Db::memory().expect("open db")));
-            Arc::new(SqliteTodoRepo::new(db).expect("init sqlite repo"))
+            Arc::new(SqliteTodoRepo::new(Db::memory().expect("open db")).expect("init sqlite repo"))
         }
     };
 
@@ -51,26 +50,9 @@ fn main() -> std::io::Result<()> {
     });
 
     // 3. Mount the inbound adapters — HTTP and AI both over the same use cases.
-    let app =
-        App::new("hexagonal-todo")
-            .readiness(|| true)
-            .get("/", "Health check.", |_req, _p| text(200, "sutegi up"));
+    let app = App::new("hexagonal-todo")
+        .readiness(|| true)
+        .get("/", "Health check.", |_| "sutegi up");
     let app = inbound_http::register(app, Arc::clone(&create), list, complete);
-    let app = sutegi::ai::mount(
-        app,
-        ToolRegistry::new().add(CreateTodoTool { use_case: create }),
-    );
-
-    let addr = std::env::args().nth(1).unwrap_or_else(|| {
-        format!(
-            "{}:{}",
-            sutegi::env_or("HOST", "0.0.0.0"),
-            sutegi::env_or("PORT", "8080")
-        )
-    });
-    println!(
-        "hexagonal-todo on http://{addr}  (REPO={})",
-        sutegi::env_or("REPO", "sqlite")
-    );
-    app.run_graceful(&addr)
+    inbound_ai::register(app, create).serve()
 }

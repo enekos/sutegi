@@ -214,9 +214,23 @@ pub trait Model {
 }
 
 /// Hydration from a JSON row (as produced by any [`Backend`]) into a typed
-/// struct. Implemented by `#[derive(Model)]`.
+/// struct. Implemented by `#[derive(Model)]`. Strict: every non-nullable column
+/// must be present, because a real database row always has them.
 pub trait FromRow: Sized {
     fn from_row(row: &Json) -> Result<Self, String>;
+}
+
+/// Hydration from a **partial** JSON object — e.g. a request body or an AI
+/// tool's arguments — where columns the caller doesn't supply (a
+/// database-assigned `id`, a `done` flag with a natural default) are filled with
+/// their type's default instead of erroring. Implemented by `#[derive(Model)]`.
+///
+/// This is the lenient counterpart to [`FromRow`]: use `from_row` for rows that
+/// came out of a `Backend`, and `from_input` for data coming in from a client.
+/// It backs [`Ctx::validated`](../../sutegi_web/struct.Ctx.html) and is handy in
+/// tool closures: `let todo = Todo::from_input(&args)?;`.
+pub trait FromInput: Sized {
+    fn from_input(row: &Json) -> Result<Self, String>;
 }
 
 /// Column extractors used by generated `FromRow` impls. They tolerate the
@@ -276,6 +290,36 @@ pub mod row {
         }
     }
 
+    /// A JSON column. Postgres returns structured JSON directly; SQLite returns
+    /// the serialized text, which is parsed here — so either way you get a real
+    /// [`Json`] value back.
+    pub fn get_json(row: &Json, name: &str) -> Result<Json, String> {
+        match col(row, name)? {
+            Json::Str(s) => {
+                Json::parse(s).map_err(|e| format!("column '{}' is not valid JSON: {}", name, e))
+            }
+            other => Ok(other.clone()),
+        }
+    }
+
+    /// An embedding vector column, in either backend's representation
+    /// (pgvector's `[1,2,3]` text, a SQLite text array, or a JSON array of
+    /// numbers) → `Vec<f32>`.
+    pub fn get_vector(row: &Json, name: &str) -> Result<Vec<f32>, String> {
+        match col(row, name)? {
+            Json::Str(s) => crate::value::vector_from_text(s),
+            Json::Arr(items) => items
+                .iter()
+                .map(|v| {
+                    v.as_f64().map(|f| f as f32).ok_or_else(|| {
+                        format!("column '{}' has a non-numeric vector element", name)
+                    })
+                })
+                .collect(),
+            _ => Err(format!("column '{}' is not a vector", name)),
+        }
+    }
+
     pub fn opt_i64(row: &Json, name: &str) -> Result<Option<i64>, String> {
         if is_absent(row, name) {
             Ok(None)
@@ -302,6 +346,20 @@ pub mod row {
             Ok(None)
         } else {
             get_bool(row, name).map(Some)
+        }
+    }
+    pub fn opt_json(row: &Json, name: &str) -> Result<Option<Json>, String> {
+        if is_absent(row, name) {
+            Ok(None)
+        } else {
+            get_json(row, name).map(Some)
+        }
+    }
+    pub fn opt_vector(row: &Json, name: &str) -> Result<Option<Vec<f32>>, String> {
+        if is_absent(row, name) {
+            Ok(None)
+        } else {
+            get_vector(row, name).map(Some)
         }
     }
 }
