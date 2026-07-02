@@ -118,10 +118,12 @@ impl Request {
 
 /// A response body: either fully buffered, or streamed incrementally.
 ///
-/// Streaming leans on the connection-per-request, `Connection: close` model:
-/// we omit `Content-Length`, write the headers, then hand the raw socket to a
-/// producer closure that flushes bytes over time. The client reads until the
-/// connection closes (a valid HTTP/1.1 framing). No chunked encoding, no async.
+/// Fully-buffered bodies are framed by `Content-Length` and may keep the
+/// connection alive. Streaming responses opt out of keep-alive: we omit
+/// `Content-Length`, announce `Connection: close`, write the headers, then
+/// hand the raw socket to a producer closure that flushes bytes over time.
+/// The client reads until the connection closes (a valid HTTP/1.1 framing).
+/// No chunked encoding, no async.
 /// Producer closure for a streaming [`Body`]: hands the raw socket to the
 /// caller, which flushes bytes over time until it returns (and the connection
 /// closes).
@@ -249,6 +251,14 @@ pub struct Limits {
     pub max_header_bytes: usize,
     /// Per-socket read/write timeout (slowloris protection). Default 30s.
     pub timeout: Option<Duration>,
+    /// How long a kept-alive connection may sit idle between requests before
+    /// the worker hangs up. Deliberately much shorter than `timeout`: in the
+    /// blocking thread-per-connection model an idle keep-alive connection
+    /// pins a worker thread. Default 5s.
+    pub keep_alive_idle: Duration,
+    /// Maximum number of requests served over one connection before the
+    /// server closes it (resource-pinning bound). Default 100.
+    pub keep_alive_max: usize,
 }
 
 impl Default for Limits {
@@ -257,6 +267,8 @@ impl Default for Limits {
             max_body: 2 * 1024 * 1024,
             max_header_bytes: 64 * 1024,
             timeout: Some(Duration::from_secs(30)),
+            keep_alive_idle: Duration::from_secs(5),
+            keep_alive_max: 100,
         }
     }
 }
@@ -333,10 +345,12 @@ pub fn parse_request<R: BufRead>(reader: &mut R, limits: &Limits) -> io::Result<
     })))
 }
 
-/// Write a response to the stream. Always closes the connection (no keep-alive)
-/// to keep the server stateless and simple. Takes the response by value so a
-/// streaming body's `FnOnce` producer can be invoked.
-pub fn write_response<W: Write>(w: &mut W, resp: Response) -> io::Result<()> {
+/// Write a response to the stream. `keep_alive` controls the `Connection`
+/// header on fully-buffered bodies (framed by `Content-Length`); streaming
+/// bodies always announce `Connection: close`, because their framing IS the
+/// close. Takes the response by value so a streaming body's `FnOnce` producer
+/// can be invoked.
+pub fn write_response<W: Write>(w: &mut W, resp: Response, keep_alive: bool) -> io::Result<()> {
     let reason = status_reason(resp.status);
     let mut head = format!("HTTP/1.1 {} {}\r\n", resp.status, reason);
     let mut has_content_type = false;
@@ -353,7 +367,11 @@ pub fn write_response<W: Write>(w: &mut W, resp: Response) -> io::Result<()> {
     match resp.body {
         Body::Full(bytes) => {
             head.push_str(&format!("content-length: {}\r\n", bytes.len()));
-            head.push_str("connection: close\r\n\r\n");
+            head.push_str(if keep_alive {
+                "connection: keep-alive\r\n\r\n"
+            } else {
+                "connection: close\r\n\r\n"
+            });
             w.write_all(head.as_bytes())?;
             w.write_all(&bytes)?;
             w.flush()
@@ -365,6 +383,18 @@ pub fn write_response<W: Write>(w: &mut W, resp: Response) -> io::Result<()> {
             w.flush()?;
             producer(w)
         }
+    }
+}
+
+/// Whether the client asked to keep the connection open: HTTP/1.1 defaults to
+/// keep-alive unless `Connection: close`; HTTP/1.0 defaults to close unless
+/// `Connection: keep-alive`.
+fn wants_keep_alive(req: &Request) -> bool {
+    let conn = req.header("connection").map(str::to_ascii_lowercase);
+    if req.version.eq_ignore_ascii_case("HTTP/1.0") {
+        matches!(conn.as_deref(), Some(c) if c.contains("keep-alive"))
+    } else {
+        !matches!(conn.as_deref(), Some(c) if c.contains("close"))
     }
 }
 
@@ -479,27 +509,54 @@ where
     }
     let peer = stream.peer_addr().ok().map(|a| a.to_string());
     let mut reader = BufReader::new(stream.try_clone()?);
+    let mut writer = stream;
 
-    match parse_request(&mut reader, limits)? {
-        Some(Incoming::Request(mut req)) => {
-            req.peer = peer;
-            // Panic isolation: a panicking handler returns 500 instead of
-            // silently killing this worker thread.
-            let resp = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(req)))
-                .unwrap_or_else(|_| {
-                    Response::new(500).with_body(&b"500 Internal Server Error"[..])
-                });
-            let mut writer = stream;
-            write_response(&mut writer, resp)?;
+    // HTTP/1.1 keep-alive: serve requests off this connection until the
+    // client hangs up, asks to close, streams (close-framed), idles past
+    // `keep_alive_idle`, or hits the per-connection request cap.
+    for served in 0..limits.keep_alive_max.max(1) {
+        if served == 1 {
+            // Between requests an open connection pins this worker thread, so
+            // wait for the next request under the (much shorter) idle timeout.
+            let _ = writer.set_read_timeout(Some(limits.keep_alive_idle));
         }
-        Some(Incoming::TooLarge) => {
-            let mut writer = stream;
-            write_response(
-                &mut writer,
-                Response::new(413).with_body(&b"413 Payload Too Large"[..]),
-            )?;
+        match parse_request(&mut reader, limits) {
+            Ok(Some(Incoming::Request(mut req))) => {
+                req.peer = peer.clone();
+                let keep = wants_keep_alive(&req);
+                // Panic isolation: a panicking handler returns 500 instead of
+                // silently killing this worker thread.
+                let resp = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(req)))
+                    .unwrap_or_else(|_| {
+                        Response::new(500).with_body(&b"500 Internal Server Error"[..])
+                    });
+                let persist = keep && !resp.is_stream() && served + 1 < limits.keep_alive_max;
+                write_response(&mut writer, resp, persist)?;
+                if !persist {
+                    return Ok(());
+                }
+            }
+            Ok(Some(Incoming::TooLarge)) => {
+                return write_response(
+                    &mut writer,
+                    Response::new(413).with_body(&b"413 Payload Too Large"[..]),
+                    false,
+                );
+            }
+            // Peer closed between requests: a normal keep-alive hang-up.
+            Ok(None) => return Ok(()),
+            // Idle timeout while waiting for the next request: hang up quietly.
+            Err(e)
+                if served > 0
+                    && matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+            {
+                return Ok(());
+            }
+            Err(e) => return Err(e),
         }
-        None => {}
     }
     Ok(())
 }
@@ -581,7 +638,7 @@ mod tests {
     fn writes_response_with_default_content_type() {
         let resp = Response::new(200).with_body("hi");
         let mut buf = Vec::new();
-        write_response(&mut buf, resp).unwrap();
+        write_response(&mut buf, resp, false).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(s.contains("content-length: 2\r\n"));
@@ -630,7 +687,7 @@ mod tests {
                 Ok(())
             });
         let mut buf = Vec::new();
-        write_response(&mut buf, resp).unwrap();
+        write_response(&mut buf, resp, false).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("content-type: text/event-stream\r\n"));
         assert!(!s.to_lowercase().contains("content-length"));
@@ -715,7 +772,7 @@ mod tests {
             .with_header("content-type", "application/json")
             .with_body("{}");
         let mut buf = Vec::new();
-        write_response(&mut buf, resp).unwrap();
+        write_response(&mut buf, resp, false).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("content-type: application/json\r\n"));
         // The default text/plain header must not also be appended.
@@ -747,6 +804,108 @@ mod tests {
         assert!(s.contains("data: 1\ndata: 2\n\n"));
         assert!(s.contains(": keep-alive\n\n"));
         assert!(s.contains("retry: 3000\n\n"));
+    }
+
+    #[test]
+    fn keep_alive_negotiation() {
+        let mk = |version: &str, conn: Option<&str>| Request {
+            method: Method::Get,
+            path: "/".into(),
+            query: String::new(),
+            version: version.into(),
+            headers: conn
+                .map(|c| vec![("connection".to_string(), c.to_string())])
+                .unwrap_or_default(),
+            body: vec![],
+            peer: None,
+        };
+        // HTTP/1.1: keep-alive unless the client says close.
+        assert!(wants_keep_alive(&mk("HTTP/1.1", None)));
+        assert!(wants_keep_alive(&mk("HTTP/1.1", Some("keep-alive"))));
+        assert!(!wants_keep_alive(&mk("HTTP/1.1", Some("close"))));
+        assert!(!wants_keep_alive(&mk("HTTP/1.1", Some("Close"))));
+        // HTTP/1.0: close unless the client asks to keep alive.
+        assert!(!wants_keep_alive(&mk("HTTP/1.0", None)));
+        assert!(wants_keep_alive(&mk("HTTP/1.0", Some("Keep-Alive"))));
+    }
+
+    #[test]
+    fn keep_alive_response_header() {
+        let mut buf = Vec::new();
+        write_response(&mut buf, Response::new(200).with_body("hi"), true).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("connection: keep-alive\r\n"));
+        assert!(s.contains("content-length: 2\r\n"));
+    }
+
+    #[test]
+    fn streaming_response_always_closes() {
+        let resp = Response::new(200).with_stream(|w| w.write_all(b"x"));
+        let mut buf = Vec::new();
+        // Even when the caller asks for keep-alive: framing is the close.
+        write_response(&mut buf, resp, true).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("connection: close\r\n"));
+    }
+
+    #[test]
+    fn serves_multiple_requests_on_one_connection() {
+        use std::io::Read;
+        let addr = "127.0.0.1:18461";
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&shutdown);
+        let server = thread::spawn(move || {
+            serve_until(
+                addr,
+                2,
+                Limits::default(),
+                |_req| Response::new(200).with_body("ok"),
+                flag,
+            )
+        });
+        // Wait for the listener.
+        for _ in 0..100 {
+            if TcpStream::connect(addr).is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // Read one full response: headers, then the 2-byte "ok" body.
+        let read_response = |stream: &mut TcpStream| {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 512];
+            loop {
+                let n = stream.read(&mut chunk).unwrap();
+                assert!(n > 0, "connection closed mid-response");
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    if buf.len() >= head_end + 4 + 2 {
+                        return String::from_utf8_lossy(&buf).into_owned();
+                    }
+                }
+            }
+        };
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        for i in 0..3 {
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+                .unwrap();
+            let s = read_response(&mut stream);
+            assert!(s.starts_with("HTTP/1.1 200"), "request {i} failed: {s}");
+            assert!(s.contains("connection: keep-alive"));
+        }
+        // A Connection: close request ends the session.
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut rest = Vec::new();
+        stream.read_to_end(&mut rest).unwrap();
+        assert!(String::from_utf8_lossy(&rest).contains("connection: close"));
+
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap().unwrap();
     }
 
     #[test]
