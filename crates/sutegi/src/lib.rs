@@ -13,6 +13,8 @@
 //! | `validate` | sutegi-validate | request / tool validation |
 //! | `ai`       | sutegi-ai       | `Tool`/`StreamTool` + `/__tools` |
 //! | `queue`    | sutegi-queue (+ sutegi-pg) | durable, cross-pod job queue (Postgres) |
+//! | `session`  | sutegi-session  | signed-cookie sessions (HMAC-SHA256) |
+//! | `auth`     | sutegi-auth (+ session/orm) | the user system: passwords, Users, guards, API tokens |
 //! | `storage`  | sutegi-storage (pure std) | file storage: local fs + S3 presigned URLs |
 //! | `storage-db` | + sutegi-orm  | blobs in SQLite/Postgres over the `Backend` seam |
 //! | `graceful` | libc            | SIGTERM/SIGINT draining for pods |
@@ -32,13 +34,15 @@ pub use sutegi_web as web;
 // --- optional pillars ---
 #[cfg(feature = "ai")]
 pub use sutegi_ai as ai;
+#[cfg(feature = "auth")]
+pub use sutegi_auth as auth;
 #[cfg(feature = "hex")]
 pub use sutegi_hex as hex;
 #[cfg(feature = "orm")]
 pub use sutegi_orm as orm;
 #[cfg(feature = "queue")]
 pub use sutegi_queue as queue;
-#[cfg(feature = "auth")]
+#[cfg(feature = "session")]
 pub use sutegi_session as session;
 #[cfg(feature = "storage")]
 pub use sutegi_storage as storage;
@@ -242,8 +246,17 @@ pub mod prelude {
     #[cfg(feature = "derive")]
     pub use sutegi_macros::{Model, Validate};
 
+    #[cfg(feature = "session")]
+    pub use sutegi_session::{Session, Sessions};
     #[cfg(feature = "storage-db")]
     pub use sutegi_storage::DbStorage;
+
+    #[cfg(feature = "auth")]
+    pub use sutegi_auth::{
+        hash_password, require_auth, require_role, require_token, token_user, verify_password,
+        ApiToken, Auth, Tokens, User, Users,
+    };
+
     #[cfg(feature = "storage")]
     pub use sutegi_storage::{FsStorage, ObjectMeta, S3Store, Storage};
 
@@ -262,7 +275,4 @@ pub mod prelude {
         respond, respond_created, AppError, AppResult, Command, Event, EventBus, IntoJson, Query,
         UseCase,
     };
-
-    #[cfg(feature = "auth")]
-    pub use sutegi_session::{Session, Sessions};
 }

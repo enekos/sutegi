@@ -118,7 +118,8 @@ what you use:
 | `queue`    |   | durable, cross-pod job queue (Postgres-backed) |
 | `graceful` |   | SIGTERM/SIGINT draining (libc) |
 | `hex`      |   | hexagonal/clean-architecture primitives |
-| `auth`     |   | signed-cookie sessions (HMAC-SHA256) |
+| `session`  |   | signed-cookie sessions (HMAC-SHA256) |
+| `auth`     |   | the user system: passwords, `Users`, login sessions, guards, API tokens |
 | `storage`  |   | file storage: local fs backend + S3 presigned URLs (pure std) |
 | `storage-db` |  | blobs in SQLite/Postgres over the same `Backend` seam |
 
@@ -403,6 +404,60 @@ queue.dispatch("notify", Json::obj(vec![("to", Json::str("a@b.com"))]))?;
 let workers = Arc::new(queue).start(4);           // 4 worker threads
 // … later: workers.stop();
 ```
+
+## Auth: the user system
+
+`--features auth,sqlite` (or `auth,postgres`) gives you the Laravel `auth`
+scaffolding with zero third-party dependencies:
+
+- **Passwords** — PBKDF2-HMAC-SHA256 as PHC strings (`$pbkdf2-sha256$i=600000$…`),
+  per-password random salts, OWASP default work factor, constant-time verify,
+  `needs_rehash` for upgrading old hashes at login.
+- **`Users<B>`** — register / authenticate / find / roles over any `Backend`.
+  Hashes never leave the store; unknown emails burn the same PBKDF2 time as
+  wrong passwords.
+- **Sessions** — signed cookies (`sutegi-session`) with the expiry stamped
+  *inside the signed payload*, so a stolen cookie dies on schedule no matter
+  what the client claims.
+- **Guards** — `require_auth` / `require_role` / `require_token`, plugged into
+  route groups.
+- **API tokens** — the agent door: `Tokens::issue` mints `stg_…` bearer tokens
+  (plaintext shown once, only its SHA-256 stored), agents authenticate with
+  `Authorization: Bearer` and never touch cookies.
+
+```rust
+use sutegi::prelude::*;
+use std::sync::Arc;
+
+let db = Db::open("app.db").unwrap();
+let users = Users::new(db.clone());
+users.migrate().unwrap();
+let auth = Arc::new(Auth::new(users, Sessions::new(secret.as_bytes())));
+
+App::new("app")
+    .post("/login", "Log in.", {
+        let auth = auth.clone();
+        move |c| {
+            let body = c.json()?;
+            let (email, pw) = (body.get("email").and_then(Json::as_str).unwrap_or(""),
+                               body.get("password").and_then(Json::as_str).unwrap_or(""));
+            match auth.users.authenticate(email, pw)? {
+                Some(u) => Ok::<_, Error>(auth.login(c.req, &u, json(200, &u.to_json()))),
+                None => Err(Error::unauthorized("bad credentials")),
+            }
+        }
+    })
+    .group("/admin", vec![mw(require_role(auth.clone(), "admin"))], |g| {
+        g.get("/users", "All users.", |c| {
+            let auth = c.state::<Arc<Auth<Db>>>();
+            Ok::<_, Error>(json(200, &Json::arr(
+                auth.users.list()?.iter().map(User::to_json).collect())))
+        })
+    })
+```
+
+See `examples/auth` for the full working app (registration, admin bootstrap,
+token minting, an agent-guarded `/api` group).
 
 ## File storage
 

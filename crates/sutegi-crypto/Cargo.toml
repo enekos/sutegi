@@ -1,0 +1,13 @@
+[package]
+name = "sutegi-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "sutegi's shared pure-std crypto primitives: SHA-256, HMAC, PBKDF2, MD5, hex, Base64, constant-time compare, OS randomness. Zero third-party dependencies, known-answer tested."
+keywords = ["sha256", "hmac", "pbkdf2", "zero-dependency"]
+categories = ["cryptography"]
+
+[dependencies]

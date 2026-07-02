@@ -12,9 +12,9 @@
 //! real object storage ([`crate::S3Store`]).
 
 use crate::{now_secs, validate_key, ObjectMeta, Storage};
+use sutegi_crypto::{base64_decode, base64_encode};
 use sutegi_json::Json;
 use sutegi_orm::{Backend, Value};
-use sutegi_pg::crypto::{base64_decode, base64_encode};
 
 /// Database-backed [`Storage`] over any ORM [`Backend`]. One table, portable
 /// SQL, works inside the same database (and transactions) as your models.

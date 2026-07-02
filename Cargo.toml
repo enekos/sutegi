@@ -5,6 +5,7 @@ members = [
     "crates/sutegi-http",
     "crates/sutegi-web",
     "crates/sutegi-orm",
+    "crates/sutegi-crypto",
     "crates/sutegi-pg",
     "crates/sutegi-storage",
     "crates/sutegi-validate",
@@ -12,6 +13,7 @@ members = [
     "crates/sutegi-macros",
     "crates/sutegi-hex",
     "crates/sutegi-session",
+    "crates/sutegi-auth",
     "crates/sutegi-ai",
     "crates/sutegi",
     "crates/sutegi-cli",
@@ -19,6 +21,7 @@ members = [
     "examples/hello",
     "examples/hexagonal",
     "examples/kv",
+    "examples/auth",
     "examples/storage",
 ]
 # The bench runner is its own workspace (depends on the external aatxe SDK by

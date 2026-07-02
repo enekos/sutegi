@@ -191,12 +191,18 @@ mod tests {
     use super::*;
 
     fn temp_store() -> FsStorage {
+        // Parallel test threads can share a clock tick — an atomic counter
+        // keeps every test in its own directory.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir =
-            std::env::temp_dir().join(format!("sutegi-storage-{}-{nanos}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "sutegi-storage-{}-{seq}-{nanos}",
+            std::process::id()
+        ));
         FsStorage::new(dir).unwrap()
     }
 

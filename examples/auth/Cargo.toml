@@ -1,0 +1,18 @@
+[package]
+name = "auth-example"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "sutegi auth demo: register/login/logout with signed-cookie sessions, an admin group, and API tokens guarding an agent-facing group."
+publish = false
+
+[[bin]]
+name = "auth"
+path = "src/main.rs"
+
+[dependencies]
+# `auth` (users/sessions/guards/tokens) + `sqlite` for the single-node store.
+sutegi = { path = "../../crates/sutegi", default-features = false, features = ["auth", "sqlite"] }

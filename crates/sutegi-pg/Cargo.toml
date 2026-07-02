@@ -10,3 +10,4 @@ description = "Zero-dependency, pure-std PostgreSQL wire-protocol (v3) client fo
 
 [dependencies]
 sutegi-json = { path = "../sutegi-json", version = "0.5.0" }
+sutegi-crypto = { path = "../sutegi-crypto", version = "0.5.0" }

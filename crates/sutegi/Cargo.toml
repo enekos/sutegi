@@ -23,6 +23,7 @@ sutegi-queue = { path = "../sutegi-queue", version = "0.5.0", optional = true }
 sutegi-ai = { path = "../sutegi-ai", version = "0.5.0", optional = true }
 sutegi-hex = { path = "../sutegi-hex", version = "0.5.0", optional = true }
 sutegi-session = { path = "../sutegi-session", version = "0.5.0", optional = true }
+sutegi-auth = { path = "../sutegi-auth", version = "0.5.0", optional = true }
 sutegi-macros = { path = "../sutegi-macros", version = "0.5.0", optional = true }
 sutegi-storage = { path = "../sutegi-storage", version = "0.5.0", optional = true }
 
@@ -43,7 +44,8 @@ sqlite = ["orm", "sutegi-orm/sqlite"]                     # runnable bundled SQL
 postgres = ["orm", "sutegi-orm/postgres"]                 # pure-std Postgres driver (cross-pod)
 graceful = ["sutegi-web/graceful"]                        # SIGTERM/SIGINT draining
 hex = ["dep:sutegi-hex"]                                  # hexagonal-architecture primitives
-auth = ["dep:sutegi-session"]                             # signed-cookie sessions (HMAC-SHA256)
+session = ["dep:sutegi-session"]                          # signed-cookie sessions (HMAC-SHA256)
+auth = ["session", "orm", "dep:sutegi-auth"]              # the user system: passwords, Users, guards, API tokens
 storage = ["dep:sutegi-storage"]                          # file storage: local fs + S3 presigned URLs
 storage-db = ["storage", "orm", "sutegi-storage/db"]      # blobs in SQLite/Postgres over the Backend seam
 

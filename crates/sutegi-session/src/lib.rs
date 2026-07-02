@@ -2,8 +2,9 @@
 //!
 //! State lives in an HMAC-SHA256-signed cookie — stateless on the server, and
 //! tamper-evident (a modified payload fails verification and is discarded).
-//! The signing primitives are the audited RustCrypto `hmac`/`sha2` crates,
-//! pulled in only when you enable sutegi's `auth` feature.
+//! Signing uses [`sutegi_crypto`]'s known-answer-tested HMAC-SHA256 (the same
+//! implementation the Postgres driver's SCRAM auth rides), so this crate has
+//! **zero third-party dependencies**.
 //!
 //! ```ignore
 //! let sessions = Sessions::new(b"a-32+ byte secret from your config");
@@ -16,12 +17,9 @@
 
 use std::collections::BTreeMap;
 
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sutegi_crypto::{constant_time_eq, from_hex, hex as to_hex, hmac_sha256};
 use sutegi_json::Json;
 use sutegi_web::{Request, Response};
-
-type HmacSha256 = Hmac<Sha256>;
 
 /// Session manager: holds the signing secret and cookie policy.
 pub struct Sessions {
@@ -59,10 +57,7 @@ impl Sessions {
     }
 
     fn sign(&self, msg: &[u8]) -> String {
-        let mut mac =
-            HmacSha256::new_from_slice(&self.secret).expect("HMAC accepts any key length");
-        mac.update(msg);
-        to_hex(&mac.finalize().into_bytes())
+        to_hex(&hmac_sha256(&self.secret, msg))
     }
 
     /// Sign an arbitrary value into a `<value-hex>.<sig>` token (CSRF tokens,
@@ -167,35 +162,6 @@ impl Session {
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
-}
-
-fn to_hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{:02x}", b));
-    }
-    s
-}
-
-fn from_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
-        return None;
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-        .collect()
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for i in 0..a.len() {
-        diff |= a[i] ^ b[i];
-    }
-    diff == 0
 }
 
 #[cfg(test)]

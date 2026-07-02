@@ -12,10 +12,7 @@ categories = ["web-programming", "filesystem"]
 
 [dependencies]
 sutegi-json = { path = "../sutegi-json", version = "0.5.0" }
-# Pure-std, zero third-party deps itself; pulled in for its audited crypto /
-# encoding primitives (SHA-256, HMAC, hex, Base64) — no protocol code is
-# activated unless you also use the driver.
-sutegi-pg = { path = "../sutegi-pg", version = "0.5.0" }
+sutegi-crypto = { path = "../sutegi-crypto", version = "0.5.0" }
 sutegi-orm = { path = "../sutegi-orm", version = "0.5.0", optional = true }
 
 [features]

@@ -1,10 +1,13 @@
-//! Pure-`std` cryptographic primitives needed to authenticate against
-//! PostgreSQL: SHA-256, HMAC-SHA-256, PBKDF2-HMAC-SHA-256 (for SCRAM), MD5
-//! (for the legacy `md5` auth method), and Base64.
+//! sutegi's shared pure-`std` cryptographic primitives: SHA-256, HMAC-SHA-256,
+//! PBKDF2-HMAC-SHA-256, MD5 (legacy Postgres auth only), hex, Base64,
+//! constant-time comparison, and OS randomness.
 //!
-//! These exist so the Postgres driver pulls in **zero third-party crates** —
-//! the same bet the rest of sutegi makes. They are small, self-contained, and
-//! covered by published known-answer test vectors at the bottom of the file.
+//! Born inside the Postgres driver (SCRAM-SHA-256 needs the full HMAC/PBKDF2
+//! chain) and extracted once it grew more consumers: `sutegi-pg` (SCRAM),
+//! `sutegi-storage` (S3 SigV4 presigning), `sutegi-session` (signed cookies),
+//! and `sutegi-auth` (password hashing, API tokens). One audited copy, **zero
+//! third-party crates** — small, self-contained, and covered by published
+//! known-answer test vectors at the bottom of the file.
 
 // ---------------------------------------------------------------------------
 // SHA-256 (FIPS 180-4)
@@ -211,6 +214,46 @@ pub fn hex(bytes: &[u8]) -> String {
     s
 }
 
+/// Lowercase hex decoding (the inverse of [`hex`]). `None` on odd length or a
+/// non-hex character.
+pub fn from_hex(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
+/// Constant-time byte-slice equality, for comparing MACs, signatures, and
+/// token hashes without leaking a mismatch position through timing. Lengths
+/// are compared first (length is not secret in those uses).
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+/// `n` bytes of OS randomness from `/dev/urandom`, **secret-grade** (password
+/// salts, API tokens, signing keys). Errors instead of degrading — callers
+/// that can live with a weaker uniqueness-only fallback (e.g. a SCRAM nonce)
+/// should implement it themselves.
+pub fn random_bytes(n: usize) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut f =
+        std::fs::File::open("/dev/urandom").map_err(|e| format!("open /dev/urandom: {e}"))?;
+    let mut buf = vec![0u8; n];
+    f.read_exact(&mut buf)
+        .map_err(|e| format!("read /dev/urandom: {e}"))?;
+    Ok(buf)
+}
+
 // ---------------------------------------------------------------------------
 // Base64 (standard alphabet, with padding) — for SCRAM salt/proof transport.
 // ---------------------------------------------------------------------------
@@ -325,6 +368,31 @@ mod tests {
             hex(&md5(b"The quick brown fox jumps over the lazy dog")),
             "9e107d9d372bb6826bd81d3542a419d6"
         );
+    }
+
+    #[test]
+    fn hex_roundtrip_and_rejects() {
+        assert_eq!(from_hex(&hex(b"sutegi")).unwrap(), b"sutegi");
+        assert_eq!(from_hex("00ff"), Some(vec![0, 255]));
+        assert!(from_hex("abc").is_none()); // odd length
+        assert!(from_hex("zz").is_none()); // non-hex
+    }
+
+    #[test]
+    fn constant_time_eq_basics() {
+        assert!(constant_time_eq(b"same", b"same"));
+        assert!(!constant_time_eq(b"same", b"sam0"));
+        assert!(!constant_time_eq(b"short", b"longer"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn random_bytes_sized_and_varied() {
+        let a = random_bytes(32).unwrap();
+        let b = random_bytes(32).unwrap();
+        assert_eq!(a.len(), 32);
+        assert_ne!(a, b); // astronomically unlikely to collide
+        assert!(a.iter().any(|&x| x != 0));
     }
 
     #[test]

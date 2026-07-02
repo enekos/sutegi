@@ -6,12 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Signed-cookie sessions for sutegi (HMAC-SHA256). Opt-in via the `auth` feature."
+description = "Signed-cookie sessions for sutegi (HMAC-SHA256). Opt-in via the `session`/`auth` features."
 
-# HMAC/SHA256 from the audited RustCrypto crates — don't roll your own crypto.
-# Only pulled in when you enable sutegi's `auth` feature.
 [dependencies]
 sutegi-json = { path = "../sutegi-json", version = "0.5.0" }
 sutegi-web = { path = "../sutegi-web", version = "0.5.0" }
-hmac = "0.12"
-sha2 = "0.10"
+# The shared hand-rolled, known-answer-tested primitives (same HMAC-SHA256 the
+# Postgres driver's SCRAM uses) — this crate is now zero-third-party-dep.
+sutegi-crypto = { path = "../sutegi-crypto", version = "0.5.0" }

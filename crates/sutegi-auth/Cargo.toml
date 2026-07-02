@@ -1,0 +1,24 @@
+[package]
+name = "sutegi-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The sutegi user system: PBKDF2 password hashing (PHC strings), a Users store over any ORM backend, signed-cookie login sessions with server-side expiry, route guards, and hashed API tokens for agents. Zero third-party dependencies."
+keywords = ["auth", "users", "sessions", "tokens", "zero-dependency"]
+categories = ["authentication", "web-programming"]
+
+[dependencies]
+sutegi-json = { path = "../sutegi-json", version = "0.5.0" }
+sutegi-crypto = { path = "../sutegi-crypto", version = "0.5.0" }
+sutegi-orm = { path = "../sutegi-orm", version = "0.5.0" }
+sutegi-session = { path = "../sutegi-session", version = "0.5.0" }
+sutegi-web = { path = "../sutegi-web", version = "0.5.0" }
+
+[dev-dependencies]
+sutegi-orm = { path = "../sutegi-orm", version = "0.5.0", features = ["sqlite", "postgres"] }
+
+[package.metadata.docs.rs]
+all-features = true

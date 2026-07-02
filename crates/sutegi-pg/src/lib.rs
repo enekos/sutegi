@@ -16,10 +16,11 @@
 //! What it does not (yet): TLS (terminate at the LB / mesh, or run inside the
 //! cluster network), binary result format, `COPY`, and `LISTEN/NOTIFY`.
 
-// Public: these hand-rolled, KAT-tested primitives (SHA-256, HMAC, PBKDF2,
-// MD5, hex, Base64) are reused by other zero-dep sutegi crates —
-// `sutegi-storage` builds S3 SigV4 presigning on `sha256`/`hmac_sha256`/`hex`.
-pub mod crypto;
+/// The shared hand-rolled, known-answer-tested primitives (SHA-256, HMAC,
+/// PBKDF2, MD5, hex, Base64) — extracted to `sutegi-crypto` once storage,
+/// sessions, and auth started reusing them; re-exported here so
+/// `sutegi_pg::crypto::…` paths keep working.
+pub use sutegi_crypto as crypto;
 mod pool;
 mod protocol;
 

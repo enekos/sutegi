@@ -6,7 +6,7 @@
 //! That split is why this needs no HTTP client and no TLS stack: presigning
 //! is pure computation — a canonical request, three SHA-256 hashes, and an
 //! HMAC chain — all reused from the Postgres driver's SCRAM crypto
-//! ([`sutegi_pg::crypto`]). It works against AWS S3, Cloudflare R2, MinIO,
+//! ([`sutegi_crypto`]). It works against AWS S3, Cloudflare R2, MinIO,
 //! Garage, Ceph RGW, and anything else speaking SigV4.
 //!
 //! The agent-native shape: expose an `App::tool` that calls
@@ -24,7 +24,7 @@
 
 use crate::validate_key;
 use std::time::{SystemTime, UNIX_EPOCH};
-use sutegi_pg::crypto::{hex, hmac_sha256, sha256};
+use sutegi_crypto::{hex, hmac_sha256, sha256};
 
 /// The longest expiry SigV4 allows (7 days).
 pub const MAX_EXPIRES: u64 = 604_800;
