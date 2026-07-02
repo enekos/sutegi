@@ -1,0 +1,21 @@
+[package]
+name = "sutegi-events"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Event sourcing for sutegi: an append-only event store with optimistic concurrency, aggregates folded from streams, and transactional projections — over SQLite or Postgres via the Backend seam. Zero third-party dependencies."
+keywords = ["event-sourcing", "cqrs", "events", "projections", "zero-dependency"]
+categories = ["database", "web-programming"]
+
+[dependencies]
+sutegi-json = { path = "../sutegi-json", version = "0.5.1" }
+sutegi-orm = { path = "../sutegi-orm", version = "0.5.1" }
+
+[dev-dependencies]
+sutegi-orm = { path = "../sutegi-orm", version = "0.5.1", features = ["sqlite", "postgres"] }
+
+[package.metadata.docs.rs]
+all-features = true

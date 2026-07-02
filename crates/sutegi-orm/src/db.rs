@@ -308,6 +308,15 @@ impl Backend for Db {
     }
 }
 
+impl crate::backend::Transactional for Db {
+    fn run_in_tx(
+        &self,
+        f: &mut dyn FnMut(&dyn Backend) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.transaction(|tx| f(tx))
+    }
+}
+
 /// A transaction handle: a [`Backend`] pinned to a single connection for the
 /// duration of a [`Db::transaction`] closure. Uses interior mutability because
 /// the trait takes `&self` while `rusqlite` wants `&mut` for `execute`.

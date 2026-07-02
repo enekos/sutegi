@@ -83,12 +83,18 @@ pub trait Backend {
     }
 
     /// Run a query builder and hydrate each row into a typed [`FromRow`].
-    fn fetch<T: FromRow>(&self, qb: &QueryBuilder) -> Result<Vec<T>, String> {
+    fn fetch<T: FromRow>(&self, qb: &QueryBuilder) -> Result<Vec<T>, String>
+    where
+        Self: Sized,
+    {
         self.select(qb)?.iter().map(T::from_row).collect()
     }
 
     /// Fetch and hydrate the first matching row, if any.
-    fn fetch_one<T: FromRow>(&self, qb: &QueryBuilder) -> Result<Option<T>, String> {
+    fn fetch_one<T: FromRow>(&self, qb: &QueryBuilder) -> Result<Option<T>, String>
+    where
+        Self: Sized,
+    {
         Ok(self.fetch::<T>(qb)?.into_iter().next())
     }
 
@@ -111,7 +117,10 @@ pub trait Backend {
         qb: &QueryBuilder,
         page: i64,
         per_page: i64,
-    ) -> Result<Page<T>, String> {
+    ) -> Result<Page<T>, String>
+    where
+        Self: Sized,
+    {
         let (page, per_page) = (page.max(1), per_page.max(1));
         let total = self.count(qb)?;
         let items = self.fetch::<T>(&qb.clone().limit(per_page).offset((page - 1) * per_page))?;
@@ -121,6 +130,40 @@ pub trait Backend {
             page,
             per_page,
         })
+    }
+}
+
+/// A [`Backend`] that can run a closure inside a transaction — the seam that
+/// lets *generic* code (the event store, a repository, a service) be atomic
+/// without naming a concrete store. Both [`crate::db::Db`] and [`crate::pg::Pg`]
+/// implement it by delegating to their inherent `transaction` methods.
+///
+/// The closure receives `&dyn Backend` (the trait's generic helpers are
+/// `Self: Sized`-gated precisely so it stays object-safe): the full
+/// query/execute/builder surface works, typed `fetch` does not — use the
+/// concrete `transaction` method when you need typed hydration inside a
+/// transaction.
+pub trait Transactional: Backend {
+    /// Object-safe core: run `f` inside `BEGIN … COMMIT`, rolling back if `f`
+    /// returns `Err`. Prefer the [`transact`](Transactional::transact) wrapper,
+    /// which carries a return value.
+    fn run_in_tx(
+        &self,
+        f: &mut dyn FnMut(&dyn Backend) -> Result<(), String>,
+    ) -> Result<(), String>;
+
+    /// Run `f` inside a transaction and return its value: commit on `Ok`, roll
+    /// back on `Err`.
+    fn transact<T>(&self, mut f: impl FnMut(&dyn Backend) -> Result<T, String>) -> Result<T, String>
+    where
+        Self: Sized,
+    {
+        let mut out: Option<T> = None;
+        self.run_in_tx(&mut |tx| {
+            out = Some(f(tx)?);
+            Ok(())
+        })?;
+        out.ok_or_else(|| "transaction closure did not run".to_string())
     }
 }
 

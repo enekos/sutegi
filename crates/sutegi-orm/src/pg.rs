@@ -235,6 +235,15 @@ impl Backend for Pg {
     }
 }
 
+impl crate::backend::Transactional for Pg {
+    fn run_in_tx(
+        &self,
+        f: &mut dyn FnMut(&dyn Backend) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.transaction(|tx| f(tx))
+    }
+}
+
 /// A transaction handle: a [`Backend`] pinned to a single pooled connection for
 /// the duration of a [`Pg::transaction`] closure. Uses interior mutability
 /// because the trait takes `&self` while the underlying [`Client`] needs
