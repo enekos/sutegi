@@ -15,7 +15,8 @@
 //! | `queue`    | sutegi-queue (+ sutegi-pg) | durable, cross-pod job queue (Postgres) |
 //! | `session`  | sutegi-session  | signed-cookie sessions (HMAC-SHA256) |
 //! | `auth`     | sutegi-auth (+ session/orm) | the user system: passwords, Users, guards, API tokens |
-//! | `mail`     | sutegi-mail     | Email builder, Transport seam, smtp/sendmail/log drivers |
+//! | `template` | sutegi-template | Blade-style template engine (`{{ }}`, `@if`, `@foreach`, `@include`) |
+//! | `mail`     | sutegi-mail (+ template) | Email builder, themed messages, Transport seam, smtp/sendmail/log drivers |
 //! | `auth-mail` | + sutegi-auth/mail | email-verification + password-reset flows |
 //! | `storage`  | sutegi-storage (pure std) | file storage: local fs + S3 presigned URLs |
 //! | `storage-db` | + sutegi-orm  | blobs in SQLite/Postgres over the `Backend` seam |
@@ -50,6 +51,8 @@ pub use sutegi_queue as queue;
 pub use sutegi_session as session;
 #[cfg(feature = "storage")]
 pub use sutegi_storage as storage;
+#[cfg(feature = "template")]
+pub use sutegi_template as template;
 #[cfg(feature = "validate")]
 pub use sutegi_validate as validate;
 
@@ -261,8 +264,11 @@ pub mod prelude {
         ApiToken, Auth, Tokens, User, Users,
     };
 
+    #[cfg(feature = "template")]
+    pub use sutegi_template::{Template, Templates};
+
     #[cfg(feature = "mail")]
-    pub use sutegi_mail::{Email, Mailer, Transport};
+    pub use sutegi_mail::{Email, MailMessage, Mailer, Theme, Transport};
 
     #[cfg(feature = "auth-mail")]
     pub use sutegi_auth::AuthMail;

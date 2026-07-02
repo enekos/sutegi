@@ -15,6 +15,7 @@ members = [
     "crates/sutegi-session",
     "crates/sutegi-auth",
     "crates/sutegi-mail",
+    "crates/sutegi-template",
     "crates/sutegi-ai",
     "crates/sutegi",
     "crates/sutegi-cli",

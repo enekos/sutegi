@@ -21,7 +21,7 @@ use crate::links::Links;
 use crate::users::{now_secs, User, Users};
 use std::sync::Arc;
 use sutegi_crypto::{hex, sha256};
-use sutegi_mail::{Email, Mailer};
+use sutegi_mail::{Mailer, Theme};
 use sutegi_orm::Backend;
 
 const VERIFY_PURPOSE: &str = "verify-email";
@@ -32,7 +32,7 @@ pub struct AuthMail {
     mailer: Arc<Mailer>,
     links: Links,
     base_url: String,
-    app_name: String,
+    theme: Theme,
     verify_ttl: i64,
     reset_ttl: i64,
     verify_path: String,
@@ -48,12 +48,19 @@ impl AuthMail {
             mailer,
             links: Links::new(secret),
             base_url: base_url.trim_end_matches('/').to_string(),
-            app_name: app_name.to_string(),
+            theme: Theme::new(app_name),
             verify_ttl: 86_400,
             reset_ttl: 3_600,
             verify_path: "/verify-email".to_string(),
             reset_path: "/reset-password".to_string(),
         }
+    }
+
+    /// Restyle the emails (colors, logo, footer, layout — see
+    /// [`sutegi_mail::Theme`]). The default theme carries the app name.
+    pub fn theme(mut self, theme: Theme) -> AuthMail {
+        self.theme = theme;
+        self
     }
 
     /// Verification link lifetime (default 24 h).
@@ -85,20 +92,21 @@ impl AuthMail {
             .mint(VERIFY_PURPOSE, user.id, now_secs() + self.verify_ttl, "");
         let url = format!("{}{}?token={token}", self.base_url, self.verify_path);
         let hours = self.verify_ttl / 3_600;
+        let app = self.theme.app_name.clone();
         self.mailer.send(
-            Email::new()
-                .to(&user.email)
-                .subject(&format!("Verify your email — {}", self.app_name))
-                .text(&format!(
-                    "Hi{},\n\nConfirm your email address for {} by opening this link:\n\n{url}\n\nThe link is valid for {hours} hour(s). If you didn't create this account, ignore this email.\n",
-                    greeting(user),
-                    self.app_name,
+            self.theme
+                .message()
+                .subject(&format!("Verify your email — {app}"))
+                .greeting(&format!("Hi{},", greeting(user)))
+                .line(&format!(
+                    "Confirm your email address for {app} by clicking the button below."
                 ))
-                .html(&format!(
-                    "<p>Hi{},</p><p>Confirm your email address for <b>{}</b>:</p><p><a href=\"{url}\">Verify email address</a></p><p>The link is valid for {hours} hour(s). If you didn't create this account, ignore this email.</p>",
-                    greeting(user),
-                    html_escape(&self.app_name),
-                )),
+                .action("Verify email address", &url)
+                .note(&format!(
+                    "The link is valid for {hours} hour(s). If you didn't create this account, ignore this email."
+                ))
+                .email()?
+                .to(&user.email),
         )?;
         Ok(url)
     }
@@ -143,20 +151,21 @@ impl AuthMail {
             .mint(RESET_PURPOSE, user.id, now_secs() + self.reset_ttl, &bind);
         let url = format!("{}{}?token={token}", self.base_url, self.reset_path);
         let minutes = self.reset_ttl / 60;
+        let app = self.theme.app_name.clone();
         self.mailer.send(
-            Email::new()
-                .to(&user.email)
-                .subject(&format!("Reset your password — {}", self.app_name))
-                .text(&format!(
-                    "Hi{},\n\nReset your {} password by opening this link:\n\n{url}\n\nThe link is valid for {minutes} minute(s) and stops working once your password changes. If you didn't ask for this, ignore this email.\n",
-                    greeting(&user),
-                    self.app_name,
+            self.theme
+                .message()
+                .subject(&format!("Reset your password — {app}"))
+                .greeting(&format!("Hi{},", greeting(&user)))
+                .line(&format!(
+                    "We received a request to reset your {app} password."
                 ))
-                .html(&format!(
-                    "<p>Hi{},</p><p>Reset your <b>{}</b> password:</p><p><a href=\"{url}\">Reset password</a></p><p>The link is valid for {minutes} minute(s) and stops working once your password changes. If you didn't ask for this, ignore this email.</p>",
-                    greeting(&user),
-                    html_escape(&self.app_name),
-                )),
+                .action("Reset password", &url)
+                .note(&format!(
+                    "The link is valid for {minutes} minute(s) and stops working once your password changes. If you didn't ask for this, ignore this email."
+                ))
+                .email()?
+                .to(&user.email),
         )?;
         Ok(Some(url))
     }
@@ -194,12 +203,6 @@ fn greeting(user: &User) -> String {
     } else {
         format!(" {}", user.name)
     }
-}
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 #[cfg(test)]

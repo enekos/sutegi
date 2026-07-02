@@ -37,10 +37,12 @@
 
 pub mod message;
 pub mod smtp;
+pub mod theme;
 pub mod transports;
 
 pub use message::{Address, Email};
 pub use smtp::Smtp;
+pub use theme::{MailMessage, Theme};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

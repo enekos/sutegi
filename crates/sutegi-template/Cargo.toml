@@ -1,0 +1,14 @@
+[package]
+name = "sutegi-template"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "A small Blade-style template engine for sutegi: {{ escaped }} / {!! raw !!} interpolation, @if/@else, @foreach with loop metadata, @include partials — compiled once, rendered over JSON contexts. Zero third-party dependencies."
+keywords = ["template", "blade", "html", "zero-dependency"]
+categories = ["template-engine", "web-programming"]
+
+[dependencies]
+sutegi-json = { path = "../sutegi-json", version = "0.5.0" }

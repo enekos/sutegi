@@ -120,7 +120,8 @@ what you use:
 | `hex`      |   | hexagonal/clean-architecture primitives |
 | `session`  |   | signed-cookie sessions (HMAC-SHA256) |
 | `auth`     |   | the user system: passwords, `Users`, login sessions, guards, API tokens |
-| `mail`     |   | `Email` builder + `Transport` seam + smtp/sendmail/log drivers |
+| `template` |   | Blade-style template engine (`{{ }}`, `@if`, `@foreach`, `@include`) |
+| `mail`     |   | `Email` builder + themed messages + `Transport` seam + drivers |
 | `auth-mail` |  | email-verification + password-reset flows on top of both |
 | `storage`  |   | file storage: local fs backend + S3 presigned URLs (pure std) |
 | `storage-db` |  | blobs in SQLite/Postgres over the same `Backend` seam |
@@ -461,6 +462,17 @@ App::new("app")
 See `examples/auth` for the full working app (registration, admin bootstrap,
 token minting, an agent-guarded `/api` group).
 
+## Templates
+
+`--features template` is a small Blade: compile once, render over `Json`.
+
+```rust
+let mut t = Templates::new();
+t.add("row", "<li>{{ item.name }}@if(item.admin) ★@endif</li>")?;
+t.add("list", "<ul>@foreach(users as item)@include(row)@endforeach</ul>")?;
+t.render("list", &ctx)?;   // {{ }} escapes; {!! !!} doesn't; loop.index/first/last
+```
+
 ## Mail
 
 `--features mail` is the Laravel `Mail` shape: build an `Email`, hand it to a
@@ -495,6 +507,33 @@ impl Transport for Resend {
     }
 }
 ```
+
+### Nice by default: themed messages
+
+`Theme` + the fluent `MailMessage` builder (Laravel's notification mail shape)
+produce a clean, email-client-safe HTML card **and** a matching plain-text
+part from the same blocks — every message is `multipart/alternative` for free:
+
+```rust
+let theme = Theme::new("MyApp")            // defaults: 600px card, ember accent
+    .brand_color("#7c3aed")                // …every piece is configurable
+    .logo_url("https://cdn.example.com/logo.png")
+    .footer("MyApp Inc · Bilbao");
+
+mailer.send(theme.message()
+    .subject("Welcome!")
+    .greeting("Hi Vera,")
+    .line("Thanks for signing up — one more step:")
+    .action("Confirm your email", &url)    // brand-colored button + fallback link
+    .note("This link is valid for 24 hours.")
+    .email()?
+    .to("vera@example.com"))?;
+```
+
+The outer chrome is a `sutegi-template` source — swap it wholesale with
+`Theme::layout(...)` while the block rendering keeps working. `AuthMail`'s
+verification/reset emails render through this (pass your `Theme` via
+`AuthMail::theme`).
 
 ### Auth defaults: verification + reset (`auth-mail`)
 
