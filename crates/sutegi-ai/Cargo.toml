@@ -10,4 +10,4 @@ description = "First-class LLM primitives for sutegi: tool-calling, structured o
 
 [dependencies]
 # Tools + the schema helpers now live in web core; this crate re-exports them.
-sutegi-web = { path = "../sutegi-web", version = "0.5.0" }
+sutegi-web = { path = "../sutegi-web", version = "0.5.1" }
