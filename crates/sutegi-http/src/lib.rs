@@ -372,8 +372,18 @@ pub fn write_response<W: Write>(w: &mut W, resp: Response, keep_alive: bool) -> 
             } else {
                 "connection: close\r\n\r\n"
             });
-            w.write_all(head.as_bytes())?;
-            w.write_all(&bytes)?;
+            // One write per response when the body is small (the common API
+            // case): a single TCP segment instead of a head segment + a body
+            // segment, which interacts badly with Nagle + delayed ACK. Large
+            // bodies aren't worth the extra copy.
+            if bytes.len() <= 16 * 1024 {
+                let mut out = head.into_bytes();
+                out.extend_from_slice(&bytes);
+                w.write_all(&out)?;
+            } else {
+                w.write_all(head.as_bytes())?;
+                w.write_all(&bytes)?;
+            }
             w.flush()
         }
         Body::Stream(producer) => {
@@ -447,6 +457,8 @@ where
             Ok(s) => s,
             Err(_) => continue,
         };
+        // HTTP responses are written whole; never wait for a delayed ACK.
+        let _ = stream.set_nodelay(true);
         let handler = Arc::clone(&handler);
         pool.execute(move || {
             let _ = handle_connection(stream, &*handler, &limits);
@@ -475,18 +487,29 @@ where
     let handler = Arc::new(handler);
     let pool = ThreadPool::new(workers.max(1));
 
+    // Non-blocking accept so the shutdown flag is honored, with an adaptive
+    // backoff: hot accepts poll at 250µs (sub-ms accept latency under load),
+    // an idle listener decays to 10ms sleeps (~100 wakeups/s, negligible CPU).
+    // std has no accept-with-timeout, and poll(2) would cost a libc dep.
+    const IDLE_MIN: Duration = Duration::from_micros(250);
+    const IDLE_MAX: Duration = Duration::from_millis(10);
+    let mut idle = IDLE_MIN;
     while !shutdown.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _addr)) => {
+                idle = IDLE_MIN;
                 // Hand the connection back to blocking mode for the worker.
                 let _ = stream.set_nonblocking(false);
+                // HTTP responses are written whole; never wait for a delayed ACK.
+                let _ = stream.set_nodelay(true);
                 let handler = Arc::clone(&handler);
                 pool.execute(move || {
                     let _ = handle_connection(stream, &*handler, &limits);
                 });
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(idle);
+                idle = (idle * 2).min(IDLE_MAX);
             }
             Err(_) => {}
         }
