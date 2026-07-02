@@ -9,4 +9,4 @@ authors.workspace = true
 description = "Zero-dependency, pure-std PostgreSQL wire-protocol (v3) client for sutegi: blocking TCP, SCRAM-SHA-256/MD5/cleartext auth, a small connection pool. No async runtime, no C library."
 
 [dependencies]
-sutegi-json = { path = "../sutegi-json", version = "0.4.0" }
+sutegi-json = { path = "../sutegi-json", version = "0.5.0" }

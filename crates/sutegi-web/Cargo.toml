@@ -9,13 +9,13 @@ authors.workspace = true
 description = "Router, App builder, middleware, extractors, and runtime introspection for sutegi."
 
 [dependencies]
-sutegi-http = { path = "../sutegi-http", version = "0.4.0" }
-sutegi-json = { path = "../sutegi-json", version = "0.4.0" }
+sutegi-http = { path = "../sutegi-http", version = "0.5.0" }
+sutegi-json = { path = "../sutegi-json", version = "0.5.0" }
 # Optional pillars — pulled in only by their feature, so the zero-dep core
 # (json + http + web, no features) is unaffected. They power the ergonomic
 # `Ctx` helpers (`db`/`model`/`validate`/`validated`) and tool-arg validation.
-sutegi-orm = { path = "../sutegi-orm", version = "0.4.0", optional = true }
-sutegi-validate = { path = "../sutegi-validate", version = "0.4.0", optional = true }
+sutegi-orm = { path = "../sutegi-orm", version = "0.5.0", optional = true }
+sutegi-validate = { path = "../sutegi-validate", version = "0.5.0", optional = true }
 # Only pulled in by the `graceful` feature, for SIGTERM/SIGINT handling.
 libc = { version = "0.2", optional = true }
 

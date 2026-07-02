@@ -13,4 +13,4 @@ name = "sutegi"
 path = "src/main.rs"
 
 [dependencies]
-sutegi-json = { path = "../sutegi-json", version = "0.4.0" }
+sutegi-json = { path = "../sutegi-json", version = "0.5.0" }
