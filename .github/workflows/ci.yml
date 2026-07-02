@@ -90,7 +90,10 @@ jobs:
           workspaces: sutegi/benches
 
       - name: Install aatxe CLI
-        run: curl -fsSL https://raw.githubusercontent.com/enekos/aatxe/master/scripts/install.sh | sh
+        # The installer is a bash script (pipefail); dash chokes on it.
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/enekos/aatxe/master/scripts/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Bench HEAD
         run: cd sutegi && make -s bench > /tmp/head.json
