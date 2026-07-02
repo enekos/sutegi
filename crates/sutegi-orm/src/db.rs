@@ -63,17 +63,22 @@ impl SqlitePool {
     }
 
     fn connect(&self) -> Result<Connection, String> {
-        match &self.source {
-            Source::Memory => Connection::open_in_memory().map_err(|e| e.to_string()),
+        let conn = match &self.source {
+            Source::Memory => Connection::open_in_memory().map_err(|e| e.to_string())?,
             Source::File(path) => {
                 let conn = Connection::open(path).map_err(|e| e.to_string())?;
                 // WAL lets pooled readers proceed alongside a writer; the busy
                 // timeout absorbs brief write contention instead of erroring.
                 conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
                     .map_err(|e| e.to_string())?;
-                Ok(conn)
+                conn
             }
-        }
+        };
+        // Room for an app's worth of distinct statement shapes (rusqlite's
+        // default LRU holds 16). Schema changes are safe: prepare_v2
+        // re-prepares stale statements transparently.
+        conn.set_prepared_statement_cache_capacity(64);
+        Ok(conn)
     }
 
     /// Check a connection out, run `f`, and return it to the pool. A connection
@@ -196,8 +201,10 @@ impl Db {
 }
 
 /// Run one query on a checked-out connection and collect rows as JSON objects.
+/// Statements are prepared through the per-connection cache: repeated shapes
+/// (the query builder emits stable SQL) skip the SQLite parse/plan step.
 fn query_conn(conn: &Connection, sql: &str, params: &[Value]) -> Result<Vec<Json>, String> {
-    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare_cached(sql).map_err(|e| e.to_string())?;
     let col_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
     let bound: Vec<SqlValue> = params.iter().map(to_sql).collect();
     let rows = stmt
@@ -216,7 +223,8 @@ fn query_conn(conn: &Connection, sql: &str, params: &[Value]) -> Result<Vec<Json
 
 fn execute_conn(conn: &Connection, sql: &str, params: &[Value]) -> Result<usize, String> {
     let bound: Vec<SqlValue> = params.iter().map(to_sql).collect();
-    conn.execute(sql, params_from_iter(bound))
+    let mut stmt = conn.prepare_cached(sql).map_err(|e| e.to_string())?;
+    stmt.execute(params_from_iter(bound))
         .map_err(|e| e.to_string())
 }
 
@@ -231,7 +239,8 @@ fn insert_conn(conn: &Connection, table: &str, cols: &[(&str, Value)]) -> Result
         placeholders
     );
     let bound: Vec<SqlValue> = cols.iter().map(|(_, v)| to_sql(v)).collect();
-    conn.execute(&sql, params_from_iter(bound))
+    let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
+    stmt.execute(params_from_iter(bound))
         .map_err(|e| e.to_string())?;
     Ok(conn.last_insert_rowid())
 }
@@ -259,7 +268,8 @@ fn upsert_conn(
         updates.join(", ")
     );
     let bound: Vec<SqlValue> = cols.iter().map(|(_, v)| to_sql(v)).collect();
-    conn.execute(&sql, params_from_iter(bound))
+    let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
+    stmt.execute(params_from_iter(bound))
         .map_err(|e| e.to_string())?;
     Ok(conn.last_insert_rowid())
 }
