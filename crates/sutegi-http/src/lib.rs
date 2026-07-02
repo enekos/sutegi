@@ -284,25 +284,27 @@ pub enum Incoming {
 /// `Ok(Some(Incoming::TooLarge))` if headers/body exceed the limits (so the
 /// server can reply 413 without allocating an attacker-chosen buffer).
 pub fn parse_request<R: BufRead>(reader: &mut R, limits: &Limits) -> io::Result<Option<Incoming>> {
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line)? == 0 {
+    // One line buffer, reused for the request line and every header line —
+    // this function runs per request, so allocation churn is latency.
+    let mut line = String::with_capacity(128);
+    if reader.read_line(&mut line)? == 0 {
         return Ok(None);
     }
-    let mut parts = request_line.split_whitespace();
-    let method = Method::parse(parts.next().unwrap_or(""));
-    let target = parts.next().unwrap_or("/").to_string();
-    let version = parts.next().unwrap_or("HTTP/1.1").to_string();
+    let mut header_bytes = line.len();
 
+    let mut parts = line.split_whitespace();
+    let method = Method::parse(parts.next().unwrap_or(""));
+    let target = parts.next().unwrap_or("/");
+    let version = parts.next().unwrap_or("HTTP/1.1").to_string();
     let (path, query) = match target.split_once('?') {
         Some((p, q)) => (p.to_string(), q.to_string()),
-        None => (target, String::new()),
+        None => (target.to_string(), String::new()),
     };
 
-    let mut headers = Vec::new();
+    let mut headers = Vec::with_capacity(8);
     let mut content_length = 0usize;
-    let mut header_bytes = request_line.len();
     loop {
-        let mut line = String::new();
+        line.clear();
         let n = reader.read_line(&mut line)?;
         if n == 0 {
             break;
@@ -311,11 +313,11 @@ pub fn parse_request<R: BufRead>(reader: &mut R, limits: &Limits) -> io::Result<
         if header_bytes > limits.max_header_bytes {
             return Ok(Some(Incoming::TooLarge));
         }
-        let line = line.trim_end_matches(['\r', '\n']);
-        if line.is_empty() {
+        let l = line.trim_end_matches(['\r', '\n']);
+        if l.is_empty() {
             break;
         }
-        if let Some((k, v)) = line.split_once(':') {
+        if let Some((k, v)) = l.split_once(':') {
             let k = k.trim().to_string();
             let v = v.trim().to_string();
             if k.eq_ignore_ascii_case("content-length") {
