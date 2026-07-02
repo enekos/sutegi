@@ -1,0 +1,30 @@
+[package]
+name = "sutegi-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "File/object storage for sutegi: one Storage trait, local-fs and database-blob backends, plus a pure-std S3 SigV4 presigner. Zero third-party dependencies."
+keywords = ["storage", "s3", "presign", "zero-dependency"]
+categories = ["web-programming", "filesystem"]
+
+[dependencies]
+sutegi-json = { path = "../sutegi-json", version = "0.5.0" }
+# Pure-std, zero third-party deps itself; pulled in for its audited crypto /
+# encoding primitives (SHA-256, HMAC, hex, Base64) — no protocol code is
+# activated unless you also use the driver.
+sutegi-pg = { path = "../sutegi-pg", version = "0.5.0" }
+sutegi-orm = { path = "../sutegi-orm", version = "0.5.0", optional = true }
+
+[features]
+# `DbStorage<B: Backend>`: blobs in a database table over the ORM's Backend
+# seam (SQLite or Postgres). Off by default so fs/S3-only users skip the ORM.
+db = ["dep:sutegi-orm"]
+
+[dev-dependencies]
+sutegi-orm = { path = "../sutegi-orm", version = "0.5.0", features = ["sqlite", "postgres"] }
+
+[package.metadata.docs.rs]
+all-features = true

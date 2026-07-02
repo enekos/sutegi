@@ -13,6 +13,8 @@
 //! | `validate` | sutegi-validate | request / tool validation |
 //! | `ai`       | sutegi-ai       | `Tool`/`StreamTool` + `/__tools` |
 //! | `queue`    | sutegi-queue (+ sutegi-pg) | durable, cross-pod job queue (Postgres) |
+//! | `storage`  | sutegi-storage (pure std) | file storage: local fs + S3 presigned URLs |
+//! | `storage-db` | + sutegi-orm  | blobs in SQLite/Postgres over the `Backend` seam |
 //! | `graceful` | libc            | SIGTERM/SIGINT draining for pods |
 //!
 //! `default = ["derive", "orm", "validate", "ai"]`. For a minimal
@@ -38,6 +40,8 @@ pub use sutegi_orm as orm;
 pub use sutegi_queue as queue;
 #[cfg(feature = "auth")]
 pub use sutegi_session as session;
+#[cfg(feature = "storage")]
+pub use sutegi_storage as storage;
 #[cfg(feature = "validate")]
 pub use sutegi_validate as validate;
 
@@ -237,6 +241,11 @@ pub mod prelude {
 
     #[cfg(feature = "derive")]
     pub use sutegi_macros::{Model, Validate};
+
+    #[cfg(feature = "storage-db")]
+    pub use sutegi_storage::DbStorage;
+    #[cfg(feature = "storage")]
+    pub use sutegi_storage::{FsStorage, ObjectMeta, S3Store, Storage};
 
     #[cfg(feature = "sqlite")]
     pub use sutegi_orm::db::Db;

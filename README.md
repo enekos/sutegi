@@ -92,6 +92,7 @@ fn main() -> std::io::Result<()> {
 | `sutegi-web`  | Router, `App` builder, middleware, groups, extractors, streaming (`sse`/`stream`), `/__introspect`. |
 | `sutegi-orm`  | Typed schema, fluent parameterized query builder, one `Backend` trait, a JSON key/value store, and two runnable backends: **SQLite** (`sqlite`, single-node) and **Postgres** (`postgres`, multi-pod). |
 | `sutegi-pg`   | Pure-`std` PostgreSQL driver: wire protocol v3 over blocking TCP, SCRAM-SHA-256 auth, connection pool. No async runtime, no C library. |
+| `sutegi-storage` | File/object storage behind one `Storage` trait: local fs, database blobs (over `Backend`), and a pure-`std` S3 SigV4 presigner. |
 | `sutegi-macros` | `#[derive(Model)]` (schema, hydration, `save`, `from_input`) and `#[derive(Validate)]` (field-attr rulesets). Compile-time only (syn/quote never reach your binary). |
 | `sutegi-validate` | Fluent `Validator`-style rule sets **and** a JSON Schema subset validator, with structured errors. |
 | `sutegi-queue` | Durable, cross-pod job queue backed by Postgres (`FOR UPDATE SKIP LOCKED` claim, visibility-timeout retries, dead-letter). |
@@ -118,6 +119,8 @@ what you use:
 | `graceful` |   | SIGTERM/SIGINT draining (libc) |
 | `hex`      |   | hexagonal/clean-architecture primitives |
 | `auth`     |   | signed-cookie sessions (HMAC-SHA256) |
+| `storage`  |   | file storage: local fs backend + S3 presigned URLs (pure std) |
+| `storage-db` |  | blobs in SQLite/Postgres over the same `Backend` seam |
 
 ```toml
 # Minimal HTTP service — core only:
@@ -400,6 +403,45 @@ queue.dispatch("notify", Json::obj(vec![("to", Json::str("a@b.com"))]))?;
 let workers = Arc::new(queue).start(4);           // 4 worker threads
 // … later: workers.stop();
 ```
+
+## File storage
+
+The same swap-the-backend idea, for bytes (`--features storage`). One
+[`Storage`] trait — `put`/`get`/`stat`/`delete`/`list`/`get_reader` — with an
+opinion per backend:
+
+- **`FsStorage`** — local filesystem: the **single-node** default. Zero-ops,
+  atomic writes (temp file + rename), real streaming reads.
+- **`DbStorage<B>`** (`storage-db`) — blobs in a database table over any ORM
+  `Backend`. On Postgres that is **multi-pod file storage with zero new
+  infrastructure**; honest ceiling ~a few MB per object.
+- **`S3Store`** — a pure-`std` **S3 SigV4 presigner** (AWS, R2, MinIO, …). It
+  mints time-limited GET/PUT/DELETE URLs and the bytes flow **directly between
+  the client and the object store** — no HTTP client, no TLS stack, no bytes
+  proxied. Signing reuses the Postgres driver's SCRAM crypto and is verified
+  against AWS's published known-answer vector.
+
+```rust
+use sutegi::prelude::*;
+
+let store = FsStorage::new("data/files")?;        // or DbStorage::new(pg)
+store.put("reports/q2.pdf", &bytes, "application/pdf")?;
+
+// The agent-native shape: a tool mints an upload URL, the agent PUTs the
+// bytes itself — your app only ever handles metadata.
+let s3 = S3Store::new("bucket", "eu-central-1", &ak, &sk);
+app.tool("presign_upload", "Mint a time-limited S3 upload URL.",
+    schema::object(vec![("key", schema::string("object key"))], &["key"]),
+    move |_c, args| {
+        let key = args.get("key").and_then(Json::as_str).unwrap_or("");
+        Ok(Json::str(s3.presign_put(key, 900)?))
+    })
+```
+
+`S3Store` deliberately does not implement `Storage`: minting a URL is a
+different contract than moving bytes. A full proxying S3 client joins the
+trait once TLS lands. See `examples/storage` for the working file server +
+presign tools.
 
 ## Collections
 

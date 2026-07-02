@@ -1,0 +1,20 @@
+[package]
+name = "storage-example"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "sutegi storage demo: a filesystem-backed file server plus S3 presigned-URL agent tools."
+publish = false
+
+[[bin]]
+name = "storage"
+path = "src/main.rs"
+
+[dependencies]
+# `storage` alone: local-fs objects + the pure-std S3 presigner. No database —
+# this is deliberately the smallest storage shape. Add `storage-db` to put
+# blobs in SQLite/Postgres instead.
+sutegi = { path = "../../crates/sutegi", default-features = false, features = ["storage"] }

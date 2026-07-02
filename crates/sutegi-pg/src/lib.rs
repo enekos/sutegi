@@ -16,7 +16,10 @@
 //! What it does not (yet): TLS (terminate at the LB / mesh, or run inside the
 //! cluster network), binary result format, `COPY`, and `LISTEN/NOTIFY`.
 
-mod crypto;
+// Public: these hand-rolled, KAT-tested primitives (SHA-256, HMAC, PBKDF2,
+// MD5, hex, Base64) are reused by other zero-dep sutegi crates —
+// `sutegi-storage` builds S3 SigV4 presigning on `sha256`/`hmac_sha256`/`hex`.
+pub mod crypto;
 mod pool;
 mod protocol;
 
