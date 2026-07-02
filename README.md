@@ -120,6 +120,8 @@ what you use:
 | `hex`      |   | hexagonal/clean-architecture primitives |
 | `session`  |   | signed-cookie sessions (HMAC-SHA256) |
 | `auth`     |   | the user system: passwords, `Users`, login sessions, guards, API tokens |
+| `mail`     |   | `Email` builder + `Transport` seam + smtp/sendmail/log drivers |
+| `auth-mail` |  | email-verification + password-reset flows on top of both |
 | `storage`  |   | file storage: local fs backend + S3 presigned URLs (pure std) |
 | `storage-db` |  | blobs in SQLite/Postgres over the same `Backend` seam |
 
@@ -458,6 +460,58 @@ App::new("app")
 
 See `examples/auth` for the full working app (registration, admin bootstrap,
 token minting, an agent-guarded `/api` group).
+
+## Mail
+
+`--features mail` is the Laravel `Mail` shape: build an `Email`, hand it to a
+`Mailer`, the configured transport moves it.
+
+```rust
+let mailer = Mailer::from_env()?;   // MAIL_DRIVER=log|smtp|sendmail, MAIL_FROM=…
+mailer.send(Email::new()
+    .to("you@example.com")
+    .subject("Hello")
+    .text("plain body")
+    .html("<b>rich body</b>"))?;    // both set → multipart/alternative
+```
+
+Built-in transports: **log** (dev default — messages print, nothing escapes),
+**memory** (test assertions), **smtp** (pure-std blocking client: EHLO, AUTH
+PLAIN/LOGIN, dot-stuffing — point it at an in-cluster relay or Mailpit on
+`localhost:1025`; no TLS, same stance as the Postgres driver), and
+**sendmail** (pipe to the local Postfix — the VPS shape).
+
+**Third-party providers plug in with one method.** `Transport` hands you the
+structured `Email` *and* its rendered RFC 2822 form; an adapter for
+Resend/SendGrid/Postmark/SES is your HTTP client of choice posting either
+shape:
+
+```rust
+struct Resend { key: String }
+impl Transport for Resend {
+    fn send(&self, email: &Email, _raw: &str, id: &str) -> Result<String, String> {
+        my_http_post("https://api.resend.com/emails", &self.key, &to_json(email))?;
+        Ok(id.to_string())
+    }
+}
+```
+
+### Auth defaults: verification + reset (`auth-mail`)
+
+`AuthMail` wires the user system to the mailer with Laravel-style defaults —
+built-in text+HTML templates, signed expiring links, no state tables:
+
+```rust
+let mail = AuthMail::new(mailer, secret.as_bytes(), "https://app.example.com", "MyApp");
+mail.send_verification(&user)?;                     // on register; 24h link
+mail.confirm_email(&auth.users, &token)?;           // flips users.verified_at
+mail.send_password_reset(&auth.users, &email)?;     // 1h link; unknown emails: silent Ok
+mail.reset_password(&auth.users, &token, &new_pw)?; // single-use in effect
+```
+
+Reset links are **bound to the current password hash**: the moment the
+password changes, every outstanding reset link dies — stateless single-use.
+See `examples/auth` for the full flow wired into routes.
 
 ## File storage
 

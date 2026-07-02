@@ -33,10 +33,17 @@
 //!     .group("/admin", vec![mw(require_role(auth.clone(), "admin"))], |g| …)
 //! ```
 
+pub mod links;
 pub mod password;
 pub mod tokens;
 pub mod users;
 
+#[cfg(feature = "mail")]
+pub mod flows;
+#[cfg(feature = "mail")]
+pub use flows::AuthMail;
+
+pub use links::Links;
 pub use password::{hash_password, verify_password, DEFAULT_ITERATIONS};
 pub use tokens::{ApiToken, Tokens, TOKEN_PREFIX};
 pub use users::{User, Users, MIN_PASSWORD_LEN};

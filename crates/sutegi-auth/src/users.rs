@@ -20,6 +20,8 @@ pub struct User {
     pub name: String,
     pub role: String,
     pub created_at: i64,
+    /// Unix seconds of email verification; `0` = unverified.
+    pub verified_at: i64,
 }
 
 impl User {
@@ -31,12 +33,19 @@ impl User {
             ("name", Json::str(self.name.clone())),
             ("role", Json::str(self.role.clone())),
             ("created_at", Json::int(self.created_at)),
+            ("verified_at", Json::int(self.verified_at)),
         ])
     }
 
     /// Whether the user carries `role`.
     pub fn is(&self, role: &str) -> bool {
         self.role == role
+    }
+
+    /// Whether the email address has been verified (see `sutegi-auth`'s
+    /// `mail` feature for the verification flow).
+    pub fn is_verified(&self) -> bool {
+        self.verified_at > 0
     }
 }
 
@@ -95,6 +104,7 @@ impl<B: Backend> Users<B> {
                 col("name", ColType::Text),
                 col("role", ColType::Text),
                 col("created_at", ColType::Integer),
+                col("verified_at", ColType::Integer),
             ],
         }
     }
@@ -103,6 +113,12 @@ impl<B: Backend> Users<B> {
     /// Portable across SQLite and Postgres.
     pub fn migrate(&self) -> Result<(), String> {
         self.backend.migrate(&Self::schema())?;
+        // Upgrade path for tables created before `verified_at` existed; the
+        // "duplicate column" error on an already-current table is expected.
+        let _ = self.backend.execute(
+            "ALTER TABLE users ADD COLUMN verified_at BIGINT NOT NULL DEFAULT 0",
+            &[],
+        );
         self.backend
             .execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique ON users (email)",
@@ -146,6 +162,7 @@ impl<B: Backend> Users<B> {
                 ("name", Value::Text(name.to_string())),
                 ("role", Value::Text(role.to_string())),
                 ("created_at", Value::Int(created_at)),
+                ("verified_at", Value::Int(0)),
             ],
             "id",
         )?;
@@ -155,6 +172,7 @@ impl<B: Backend> Users<B> {
             name: name.to_string(),
             role: role.to_string(),
             created_at,
+            verified_at: 0,
         })
     }
 
@@ -167,7 +185,7 @@ impl<B: Backend> Users<B> {
             Err(_) => return Ok(None),
         };
         let row = self.backend.query_one(
-            "SELECT id, email, password_hash, name, role, created_at FROM users WHERE email = ?",
+            "SELECT id, email, password_hash, name, role, created_at, verified_at FROM users WHERE email = ?",
             &[Value::Text(email)],
         )?;
         match row {
@@ -207,7 +225,7 @@ impl<B: Backend> Users<B> {
     pub fn list(&self) -> Result<Vec<User>, String> {
         self.backend
             .query(
-                "SELECT id, email, name, role, created_at FROM users ORDER BY id ASC",
+                "SELECT id, email, name, role, created_at, verified_at FROM users ORDER BY id ASC",
                 &[],
             )?
             .iter()
@@ -243,6 +261,32 @@ impl<B: Backend> Users<B> {
         }
     }
 
+    /// Record the email as verified now. Idempotent.
+    pub fn mark_verified(&self, id: i64) -> Result<(), String> {
+        match self.backend.execute(
+            "UPDATE users SET verified_at = ? WHERE id = ?",
+            &[Value::Int(now_secs()), Value::Int(id)],
+        )? {
+            0 => Err(format!("no user with id {id}")),
+            _ => Ok(()),
+        }
+    }
+
+    /// The stored PHC hash for `id` — crate-internal; used to bind
+    /// password-reset links to the current credential.
+    pub(crate) fn password_hash_of(&self, id: i64) -> Result<Option<String>, String> {
+        Ok(self
+            .backend
+            .query_one(
+                "SELECT password_hash FROM users WHERE id = ?",
+                &[Value::Int(id)],
+            )?
+            .as_ref()
+            .and_then(|r| r.get("password_hash"))
+            .and_then(Json::as_str)
+            .map(String::from))
+    }
+
     /// Delete a user. Returns `true` if one was removed.
     pub fn delete(&self, id: i64) -> Result<bool, String> {
         Ok(self
@@ -262,7 +306,9 @@ impl<B: Backend> Users<B> {
     }
 
     fn fetch_where(&self, cond: &str, param: Value) -> Result<Option<User>, String> {
-        let sql = format!("SELECT id, email, name, role, created_at FROM users WHERE {cond}");
+        let sql = format!(
+            "SELECT id, email, name, role, created_at, verified_at FROM users WHERE {cond}"
+        );
         match self.backend.query_one(&sql, &[param])? {
             Some(row) => Ok(Some(user_of(&row)?)),
             None => Ok(None),
@@ -289,6 +335,7 @@ fn user_of(row: &Json) -> Result<User, String> {
         name: str_of("name")?,
         role: str_of("role")?,
         created_at: int_of("created_at")?,
+        verified_at: int_of("verified_at").unwrap_or(0),
     })
 }
 

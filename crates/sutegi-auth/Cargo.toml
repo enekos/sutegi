@@ -16,6 +16,11 @@ sutegi-crypto = { path = "../sutegi-crypto", version = "0.5.0" }
 sutegi-orm = { path = "../sutegi-orm", version = "0.5.0" }
 sutegi-session = { path = "../sutegi-session", version = "0.5.0" }
 sutegi-web = { path = "../sutegi-web", version = "0.5.0" }
+sutegi-mail = { path = "../sutegi-mail", version = "0.5.0", optional = true }
+
+[features]
+# Email verification + password reset flows over sutegi-mail.
+mail = ["dep:sutegi-mail"]
 
 [dev-dependencies]
 sutegi-orm = { path = "../sutegi-orm", version = "0.5.0", features = ["sqlite", "postgres"] }

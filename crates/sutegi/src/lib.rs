@@ -15,6 +15,8 @@
 //! | `queue`    | sutegi-queue (+ sutegi-pg) | durable, cross-pod job queue (Postgres) |
 //! | `session`  | sutegi-session  | signed-cookie sessions (HMAC-SHA256) |
 //! | `auth`     | sutegi-auth (+ session/orm) | the user system: passwords, Users, guards, API tokens |
+//! | `mail`     | sutegi-mail     | Email builder, Transport seam, smtp/sendmail/log drivers |
+//! | `auth-mail` | + sutegi-auth/mail | email-verification + password-reset flows |
 //! | `storage`  | sutegi-storage (pure std) | file storage: local fs + S3 presigned URLs |
 //! | `storage-db` | + sutegi-orm  | blobs in SQLite/Postgres over the `Backend` seam |
 //! | `graceful` | libc            | SIGTERM/SIGINT draining for pods |
@@ -38,6 +40,8 @@ pub use sutegi_ai as ai;
 pub use sutegi_auth as auth;
 #[cfg(feature = "hex")]
 pub use sutegi_hex as hex;
+#[cfg(feature = "mail")]
+pub use sutegi_mail as mail;
 #[cfg(feature = "orm")]
 pub use sutegi_orm as orm;
 #[cfg(feature = "queue")]
@@ -256,6 +260,12 @@ pub mod prelude {
         hash_password, require_auth, require_role, require_token, token_user, verify_password,
         ApiToken, Auth, Tokens, User, Users,
     };
+
+    #[cfg(feature = "mail")]
+    pub use sutegi_mail::{Email, Mailer, Transport};
+
+    #[cfg(feature = "auth-mail")]
+    pub use sutegi_auth::AuthMail;
 
     #[cfg(feature = "storage")]
     pub use sutegi_storage::{FsStorage, ObjectMeta, S3Store, Storage};

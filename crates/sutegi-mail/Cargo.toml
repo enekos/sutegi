@@ -1,0 +1,15 @@
+[package]
+name = "sutegi-mail"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Mail for sutegi: an Email builder with RFC 2822/MIME rendering, a one-method Transport seam for third-party providers, and built-in SMTP (blocking, zero-dep), sendmail, log, and in-memory transports."
+keywords = ["email", "smtp", "mail", "zero-dependency"]
+categories = ["email", "web-programming"]
+
+[dependencies]
+sutegi-crypto = { path = "../sutegi-crypto", version = "0.5.0" }
+sutegi-json = { path = "../sutegi-json", version = "0.5.0" }

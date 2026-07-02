@@ -9,6 +9,9 @@
 //! curl -b /tmp/cj -X POST localhost:8080/tokens -d '{"name":"my-agent"}'
 //! curl -H "Authorization: Bearer stg_…" localhost:8080/api/whoami
 //! curl -b /tmp/cj -X POST localhost:8080/logout
+//! curl "localhost:8080/verify-email?token=…"        # from the emailed link
+//! curl -X POST localhost:8080/forgot-password -d '{"email":"root@example.com"}'
+//! curl -X POST localhost:8080/reset-password -d '{"token":"…","password":"newpass99"}'
 //! ```
 //!
 //! The **first registered user becomes `admin`** (bootstrap convention);
@@ -50,6 +53,21 @@ fn main() -> std::io::Result<()> {
     );
     let (tok_issue, tok_who, who_auth) = (tokens.clone(), tokens.clone(), auth.clone());
 
+    // Mail: MAIL_* env if set, else the log driver (links print to stderr).
+    if std::env::var("MAIL_FROM").is_err() {
+        std::env::set_var("MAIL_FROM", "Auth Demo <auth@example.com>");
+    }
+    let mailer = Arc::new(Mailer::from_env().expect("configure mailer"));
+    let base_url = std::env::var("APP_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
+    let mail = Arc::new(AuthMail::new(
+        mailer,
+        secret.as_bytes(),
+        &base_url,
+        "Auth Demo",
+    ));
+    let (m_reg, m_confirm, m_forgot, m_reset) = (mail.clone(), mail.clone(), mail.clone(), mail);
+    let (a_confirm, a_forgot, a_reset) = (auth.clone(), auth.clone(), auth.clone());
+
     App::new("auth-demo")
         .state(auth.clone())
         .readiness(move || ready.query("SELECT 1", &[]).is_ok())
@@ -69,6 +87,7 @@ fn main() -> std::io::Result<()> {
                     .users
                     .register_with(email, password, name, role)
                     .map_err(Error::unprocessable)?;
+                m_reg.send_verification(&user)?; // log driver prints the link
                 Ok::<_, Error>(a_reg.login(c.req, &user, json(201, &user.to_json())))
             },
         )
@@ -118,6 +137,48 @@ fn main() -> std::io::Result<()> {
                         ("meta", rec.to_json()),
                     ]),
                 ))
+            },
+        )
+        .get(
+            "/verify-email",
+            "Confirm an email-verification link (?token=…).",
+            move |c| {
+                let token = query_params(c.req)
+                    .get("token")
+                    .cloned()
+                    .unwrap_or_default();
+                match m_confirm.confirm_email(&a_confirm.users, &token)? {
+                    Some(user) => Ok::<_, Error>(json(200, &user.to_json())),
+                    None => Err(Error::unprocessable("invalid or expired link")),
+                }
+            },
+        )
+        .post(
+            "/forgot-password",
+            "Send a password-reset link if the account exists.",
+            move |c| {
+                let email = c
+                    .json()?
+                    .get("email")
+                    .and_then(Json::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                m_forgot.send_password_reset(&a_forgot.users, &email)?;
+                // Always 200: no account enumeration.
+                Ok::<_, Error>(json(200, &Json::obj(vec![("ok", Json::Bool(true))])))
+            },
+        )
+        .post(
+            "/reset-password",
+            "Set a new password with a reset token.",
+            move |c| {
+                let body = c.json()?;
+                let token = body.get("token").and_then(Json::as_str).unwrap_or("");
+                let password = body.get("password").and_then(Json::as_str).unwrap_or("");
+                match m_reset.reset_password(&a_reset.users, token, password)? {
+                    Some(user) => Ok::<_, Error>(json(200, &user.to_json())),
+                    None => Err(Error::unprocessable("invalid or expired link")),
+                }
             },
         )
         .group("/admin", vec![mw(admin_guard)], |g| {
