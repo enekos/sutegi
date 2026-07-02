@@ -632,6 +632,15 @@ impl App {
         (workers, limits, service)
     }
 
+    /// The app as its bare request-service closure — the same function every
+    /// `run*` variant serves over TCP, minus the socket. Feed it a [`Request`]
+    /// and get the [`Response`] back: in-process tests and benchmarks without
+    /// binding a port.
+    pub fn service(self) -> impl Fn(Request) -> Response + Send + Sync + 'static {
+        let (_, _, service) = self.into_service();
+        service
+    }
+
     /// Bind to `addr` and serve forever.
     pub fn run(self, addr: &str) -> std::io::Result<()> {
         let (workers, limits, service) = self.into_service();

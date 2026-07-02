@@ -1,24 +1,29 @@
 //! sutegi performance benchmarks, driven by the aatxe statistical microbench
 //! SDK (adaptive sampling, CV-gated, emits an aatxe RunReport on stdout).
 //!
-//! Covers the real hot paths — JSON codec, HTTP/1.1 request parsing,
-//! routing-adjacent ORM query building, validation, real SQLite ops — plus a
-//! **full end-to-end request** over a live TCP socket (connect → GET →
-//! response → close), which is the closest thing to real-world latency.
+//! Covers the real hot paths — JSON codec, HTTP/1.1 request parsing, routing,
+//! ORM query building, validation, real SQLite ops — plus **full end-to-end
+//! requests** over a live TCP socket, both connection-per-request and
+//! keep-alive (10 requests over one connection, reconnecting whenever the
+//! server closes — so the same bench name measures honestly before and after
+//! keep-alive support lands).
+//!
+//! Postgres benches run only when `SUTEGI_PG_TEST_URL` is set (same contract
+//! as the integration tests), so the suite stays runnable without a database.
 //!
 //! ```text
 //! cargo run --release --bin sutegi-bench            # emits RunReport JSON
 //! cargo run --release --bin sutegi-bench | jq .     # pretty
 //! ```
 
-use std::io::{BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::thread;
 use std::time::Duration;
 
 use aatxe_bench::{bench, keep, Suite};
 
-use sutegi::http::{parse_request, Limits};
+use sutegi::http::{parse_request, Limits, Method};
 use sutegi::json::Json;
 use sutegi::orm::db::Db;
 use sutegi::orm::{QueryBuilder, UpdateBuilder, Value};
@@ -28,7 +33,7 @@ use sutegi::validate::{validate_schema, Rule, Ruleset};
 const ADDR: &str = "127.0.0.1:18099";
 
 fn main() {
-    // Spin up a real sutegi server for the end-to-end bench.
+    // Spin up a real sutegi server for the end-to-end benches.
     spawn_server();
     wait_ready();
 
@@ -53,6 +58,12 @@ fn main() {
     bench(&mut suite, "http_parse_request", || {
         let mut reader = BufReader::new(&raw[..]);
         keep(parse_request(&mut reader, &limits).unwrap());
+    });
+
+    // --- Router: match the last of 100 registered routes, in-process ---
+    let svc = routing_app(100).service();
+    bench(&mut suite, "route_match_100", || {
+        keep(svc(bench_request(Method::Get, "/bench99/12345")));
     });
 
     // --- ORM query builder (parameterized SQL emission) ---
@@ -88,7 +99,15 @@ fn main() {
 
     // --- Validation (Ruleset) ---
     let rules = Ruleset::new()
-        .field("title", &[Rule::Required, Rule::Str, Rule::MinLen(1), Rule::MaxLen(200)])
+        .field(
+            "title",
+            &[
+                Rule::Required,
+                Rule::Str,
+                Rule::MinLen(1),
+                Rule::MaxLen(200),
+            ],
+        )
         .field("email", &[Rule::Required, Rule::Email]);
     let body = Json::parse(r#"{"title":"ship sutegi","email":"a@b.com"}"#).unwrap();
     bench(&mut suite, "validate_ruleset", || {
@@ -115,23 +134,114 @@ fn main() {
         .unwrap();
         bench(&mut suite, "sqlite_insert", || {
             keep(
-                db.insert("todos", &[("title", Value::Text("x".into())), ("done", Value::Bool(false))])
-                    .unwrap(),
+                db.insert(
+                    "todos",
+                    &[
+                        ("title", Value::Text("x".into())),
+                        ("done", Value::Bool(false)),
+                    ],
+                    "id",
+                )
+                .unwrap(),
             );
         });
-        let select = QueryBuilder::table("todos").select(&["id", "title", "done"]).limit(20);
+        let select = QueryBuilder::table("todos")
+            .select(&["id", "title", "done"])
+            .limit(20);
         bench(&mut suite, "sqlite_select_20", || {
             keep(db.select(&select).unwrap());
         });
-        let count_q = QueryBuilder::table("todos").filter("done", "=", Value::Bool(false));
+        // Count a fixed-size table: counting `todos` would scan however many
+        // rows the adaptive insert bench happened to leave behind.
+        db.execute(
+            "CREATE TABLE todos_fixed (id INTEGER PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)",
+            &[],
+        )
+        .unwrap();
+        for i in 0..100 {
+            db.insert(
+                "todos_fixed",
+                &[
+                    ("title", Value::Text(format!("t{i}"))),
+                    ("done", Value::Bool(i % 2 == 0)),
+                ],
+                "id",
+            )
+            .unwrap();
+        }
+        let count_q = QueryBuilder::table("todos_fixed").filter("done", "=", Value::Bool(false));
         bench(&mut suite, "sqlite_count", || {
             keep(db.count(&count_q).unwrap());
         });
     }
 
-    // --- End-to-end over a live TCP socket (connection-per-request) ---
+    // --- Real Postgres operations (opt-in: SUTEGI_PG_TEST_URL) ---
+    #[cfg(feature = "postgres")]
+    if let Ok(url) = std::env::var("SUTEGI_PG_TEST_URL") {
+        use sutegi::orm::pg::Pg;
+        let pg = Pg::connect(&url, 2).expect("pg connect");
+        pg.execute("DROP TABLE IF EXISTS bench_todos", &[]).unwrap();
+        pg.execute(
+            "CREATE TABLE bench_todos (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)",
+            &[],
+        )
+        .unwrap();
+        bench(&mut suite, "pg_insert", || {
+            keep(
+                pg.insert(
+                    "bench_todos",
+                    &[
+                        ("title", Value::Text("x".into())),
+                        ("done", Value::Bool(false)),
+                    ],
+                    "id",
+                )
+                .unwrap(),
+            );
+        });
+        let select = QueryBuilder::table("bench_todos")
+            .select(&["id", "title", "done"])
+            .limit(20);
+        bench(&mut suite, "pg_select_20", || {
+            keep(pg.select(&select).unwrap());
+        });
+        // Fixed-size table for count, for the same reason as sqlite_count.
+        pg.execute("DROP TABLE IF EXISTS bench_todos_fixed", &[])
+            .unwrap();
+        pg.execute(
+            "CREATE TABLE bench_todos_fixed (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)",
+            &[],
+        )
+        .unwrap();
+        for i in 0..100 {
+            pg.insert(
+                "bench_todos_fixed",
+                &[
+                    ("title", Value::Text(format!("t{i}"))),
+                    ("done", Value::Bool(i % 2 == 0)),
+                ],
+                "id",
+            )
+            .unwrap();
+        }
+        let count_q =
+            QueryBuilder::table("bench_todos_fixed").filter("done", "=", Value::Bool(false));
+        bench(&mut suite, "pg_count", || {
+            keep(pg.count(&count_q).unwrap());
+        });
+        pg.execute("DROP TABLE IF EXISTS bench_todos", &[]).unwrap();
+        pg.execute("DROP TABLE IF EXISTS bench_todos_fixed", &[])
+            .unwrap();
+    } else {
+        eprintln!("skipping pg_* benches: SUTEGI_PG_TEST_URL not set");
+    }
+
+    // --- End-to-end over a live TCP socket ---
     bench(&mut suite, "e2e_request", || {
         keep(http_get("/bench"));
+    });
+    bench(&mut suite, "e2e_keepalive_10", || {
+        keep(http_get_10_reusing_connection("/bench"));
     });
     bench(&mut suite, "e2e_introspect", || {
         keep(http_get("/__introspect"));
@@ -146,20 +256,29 @@ fn main() {
     suite.emit_stdout();
 }
 
-/// An echo tool so the e2e bench can exercise the AI invoke + validate path.
-struct BenchEcho;
-impl Tool for BenchEcho {
-    fn name(&self) -> &str {
-        "echo"
+/// An app with `n` distinct parameterized routes, for router benches.
+fn routing_app(n: usize) -> App {
+    let mut app = App::new("route-bench");
+    for i in 0..n {
+        app = app.get(
+            &format!("/bench{i}/:id"),
+            "route-match bench endpoint",
+            |c| text(200, c.param("id").unwrap_or("")),
+        );
     }
-    fn description(&self) -> &str {
-        "Echo a message back."
-    }
-    fn parameters(&self) -> Json {
-        schema::object(vec![("msg", schema::string("text to echo"))], &["msg"])
-    }
-    fn call(&self, args: Json) -> Result<Json, String> {
-        Ok(Json::obj(vec![("echo", Json::str(args.get("msg").and_then(Json::as_str).unwrap_or("")))]))
+    app
+}
+
+/// A synthetic in-process request for service-closure benches.
+fn bench_request(method: Method, path: &str) -> Request {
+    Request {
+        method,
+        path: path.to_string(),
+        query: String::new(),
+        version: "HTTP/1.1".to_string(),
+        headers: vec![("host".to_string(), "localhost".to_string())],
+        body: Vec::new(),
+        peer: None,
     }
 }
 
@@ -167,12 +286,23 @@ impl Tool for BenchEcho {
 fn spawn_server() {
     thread::spawn(|| {
         let app = App::new("bench-server")
-            .get("/bench", "Bench endpoint", |_req, _p| text(200, "ok"))
-            .post("/echo", "Echo a JSON body back", |req, _p| {
-                json(200, &json_body(req).unwrap_or(Json::Null))
-            });
-        // Mount the AI tool surface so e2e_tool_call has a real endpoint.
-        let app = sutegi::ai::mount(app, ToolRegistry::new().add(BenchEcho));
+            .get("/bench", "Bench endpoint", |_c| text(200, "ok"))
+            .post("/echo", "Echo a JSON body back", |c| {
+                let body = c.json()?;
+                Ok::<_, Error>(json(200, &body))
+            })
+            // An echo tool so e2e_tool_call exercises the AI invoke + validate path.
+            .tool(
+                "echo",
+                "Echo a message back.",
+                schema::object(vec![("msg", schema::string("text to echo"))], &["msg"]),
+                |_ctx, args| {
+                    Ok(Json::obj(vec![(
+                        "echo",
+                        Json::str(args.get("msg").and_then(Json::as_str).unwrap_or("")),
+                    )]))
+                },
+            );
         let _ = app.run(ADDR);
     });
 }
@@ -188,14 +318,67 @@ fn wait_ready() {
     eprintln!("warning: bench server did not become ready");
 }
 
-/// One full HTTP/1.1 round-trip (connection-per-request, matching sutegi's model).
+/// One full HTTP/1.1 round-trip (connection-per-request).
 fn http_get(path: &str) -> usize {
     let mut stream = TcpStream::connect(ADDR).expect("connect");
-    let req = format!("GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", path);
+    let req = format!(
+        "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        path
+    );
     stream.write_all(req.as_bytes()).expect("write");
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).expect("read");
     buf.len()
+}
+
+/// Ten GETs that *try* to reuse one connection: each response is framed by
+/// content-length, and the client reconnects whenever the server signals (or
+/// enforces) connection-close. Before keep-alive support this degenerates to
+/// ten connects; after, it's one — the same bench measures both worlds.
+fn http_get_10_reusing_connection(path: &str) -> usize {
+    let mut total = 0;
+    let mut conn: Option<BufReader<TcpStream>> = None;
+    for _ in 0..10 {
+        let mut reader = match conn.take() {
+            Some(r) => r,
+            None => BufReader::new(TcpStream::connect(ADDR).expect("connect")),
+        };
+        let req = format!("GET {} HTTP/1.1\r\nHost: localhost\r\n\r\n", path);
+        reader.get_mut().write_all(req.as_bytes()).expect("write");
+
+        // Read the status line + headers.
+        let mut content_length = 0usize;
+        let mut close = false;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).expect("read headers") == 0 {
+                panic!("connection closed mid-response");
+            }
+            let l = line.trim_end();
+            if l.is_empty() {
+                break;
+            }
+            let lower = l.to_ascii_lowercase();
+            if let Some(v) = lower.strip_prefix("content-length:") {
+                content_length = v.trim().parse().unwrap_or(0);
+            }
+            if lower.starts_with("connection:") && lower.contains("close") {
+                close = true;
+            }
+            total += l.len();
+        }
+
+        // Read the body by content-length.
+        let mut body = vec![0u8; content_length];
+        reader.read_exact(&mut body).expect("read body");
+        total += body.len();
+
+        if !close {
+            conn = Some(reader);
+        }
+    }
+    total
 }
 
 /// One full HTTP/1.1 POST round-trip with a JSON body.

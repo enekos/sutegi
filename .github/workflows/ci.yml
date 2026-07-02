@@ -61,3 +61,61 @@ jobs:
 
       - name: Build (zero-dep core, no default features)
         run: cargo build --no-default-features
+
+  # Statistical perf gate: run the aatxe bench suite on HEAD and on the base
+  # ref, on the same runner, and fail (exit 2) when any bench regresses past
+  # the noise gate. PRs only — a single-sided run on a shared runner has no
+  # trustworthy baseline to compare against, so pushes just publish the report.
+  bench:
+    name: aatxe perf gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # benches/Cargo.toml path-depends on the sibling ../aatxe checkout, so
+      # both repos land side by side under the workspace.
+      - uses: actions/checkout@v4
+        with:
+          path: sutegi
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: enekos/aatxe
+          path: aatxe
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sutegi/benches
+
+      - name: Install aatxe CLI
+        run: curl -fsSL https://raw.githubusercontent.com/enekos/aatxe/master/scripts/install.sh | sh
+
+      - name: Bench HEAD
+        run: cd sutegi && make -s bench > /tmp/head.json
+
+      - name: Bench base
+        if: github.event_name == 'pull_request'
+        run: |
+          cd sutegi
+          git checkout "origin/${{ github.base_ref }}"
+          make -s bench > /tmp/base.json
+
+      - name: Compare (fail on regression)
+        if: github.event_name == 'pull_request'
+        run: |
+          set +e
+          aatxe compare --base /tmp/base.json --head /tmp/head.json \
+            --out /tmp/compare.json --markdown /tmp/compare.md \
+            --threshold 0.10 --fail-on-regression
+          status=$?
+          cat /tmp/compare.md >> "$GITHUB_STEP_SUMMARY"
+          exit $status
+
+      - name: Publish report (push)
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: aatxe-runreport
+          path: /tmp/head.json
