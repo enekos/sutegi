@@ -238,9 +238,31 @@ impl ToolDef {
     }
 }
 
+/// One compiled segment of a route pattern: a literal to compare, or a
+/// `:name` parameter to capture.
+enum Seg {
+    Lit(String),
+    Param(String),
+}
+
+/// Compile a `/users/:id`-style pattern once, at registration time, so
+/// matching never re-splits (or re-allocates) the pattern per request.
+fn compile_pattern(pattern: &str) -> Vec<Seg> {
+    pattern
+        .trim_matches('/')
+        .split('/')
+        .map(|s| match s.strip_prefix(':') {
+            Some(name) => Seg::Param(name.to_string()),
+            None => Seg::Lit(s.to_string()),
+        })
+        .collect()
+}
+
 struct Route {
     method: Method,
     pattern: String,
+    /// `pattern`, compiled by [`compile_pattern`].
+    segs: Vec<Seg>,
     doc: String,
     handler: Handler,
     /// Group-scoped middleware run before this route's handler.
@@ -394,6 +416,7 @@ impl App {
         self.routes.push(Route {
             method,
             pattern: pattern.to_string(),
+            segs: compile_pattern(pattern),
             doc: doc.to_string(),
             handler: Box::new(move |c: &Ctx| handler(c).into_response()),
             middleware: Vec::new(),
@@ -612,10 +635,8 @@ impl App {
                 }
 
                 // Distinguish "no such path" from "wrong method".
-                if routes
-                    .iter()
-                    .any(|r| match_pattern(&r.pattern, &req.path).is_some())
-                {
+                let segs = split_segments(&req.path);
+                if routes.iter().any(|r| match_segs(&r.segs, &segs).is_some()) {
                     return text(405, "405 Method Not Allowed");
                 }
                 not_found()
@@ -850,9 +871,11 @@ impl Group {
         doc: &str,
         handler: impl Fn(&Ctx) -> R + Send + Sync + 'static,
     ) -> Group {
+        let pattern = join_prefix(&self.prefix, pattern);
         self.routes.push(Route {
             method,
-            pattern: join_prefix(&self.prefix, pattern),
+            segs: compile_pattern(&pattern),
+            pattern,
             doc: doc.to_string(),
             handler: Box::new(move |c: &Ctx| handler(c).into_response()),
             middleware: self.middleware.clone(),
@@ -907,31 +930,42 @@ fn join_prefix(prefix: &str, pattern: &str) -> String {
     }
 }
 
+/// Split a request path into segments — done once per request, where the old
+/// matcher re-split (and re-allocated) both pattern and path per candidate
+/// route.
+fn split_segments(path: &str) -> Vec<&str> {
+    path.trim_matches('/').split('/').collect()
+}
+
 fn match_route<'a>(routes: &'a [Route], method: Method, path: &str) -> Option<(&'a Route, Params)> {
+    let segs = split_segments(path);
     for r in routes {
         if r.method != method {
             continue;
         }
-        if let Some(params) = match_pattern(&r.pattern, path) {
+        if let Some(params) = match_segs(&r.segs, &segs) {
             return Some((r, params));
         }
     }
     None
 }
 
-/// Match a path against a pattern with `:name` segments, capturing params.
-fn match_pattern(pattern: &str, path: &str) -> Option<Params> {
-    let p: Vec<&str> = pattern.trim_matches('/').split('/').collect();
-    let q: Vec<&str> = path.trim_matches('/').split('/').collect();
-    if p.len() != q.len() {
+/// Match pre-split path segments against a compiled pattern, capturing params.
+fn match_segs(pattern: &[Seg], path: &[&str]) -> Option<Params> {
+    if pattern.len() != path.len() {
         return None;
     }
     let mut params = Params::new();
-    for (seg, val) in p.iter().zip(q.iter()) {
-        if let Some(name) = seg.strip_prefix(':') {
-            params.insert(name.to_string(), val.to_string());
-        } else if seg != val {
-            return None;
+    for (seg, val) in pattern.iter().zip(path.iter()) {
+        match seg {
+            Seg::Lit(lit) => {
+                if lit != val {
+                    return None;
+                }
+            }
+            Seg::Param(name) => {
+                params.insert(name.clone(), val.to_string());
+            }
         }
     }
     Some(params)
@@ -1228,6 +1262,11 @@ fn hex_val(b: u8) -> Option<u8> {
 mod tests {
     use super::*;
 
+    /// Compile-then-match, the way the service closure does it.
+    fn match_pattern(pattern: &str, path: &str) -> Option<Params> {
+        match_segs(&compile_pattern(pattern), &split_segments(path))
+    }
+
     #[test]
     fn pattern_matches_and_captures() {
         let params = match_pattern("/users/:id/posts/:slug", "/users/42/posts/hello").unwrap();
@@ -1243,6 +1282,12 @@ mod tests {
     #[test]
     fn root_matches() {
         assert!(match_pattern("/", "/").is_some());
+    }
+
+    #[test]
+    fn literal_segments_must_match_exactly() {
+        assert!(match_pattern("/users/:id", "/teams/42").is_none());
+        assert!(match_pattern("/a/b", "/a/b").is_some());
     }
 
     #[test]
