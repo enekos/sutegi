@@ -165,7 +165,7 @@ impl Json {
                 let len = m.len();
                 for (i, (k, v)) in m.iter().enumerate() {
                     out.push_str(&pad(depth + 1));
-                    let _ = write_escaped(out, k);
+                    escape_into(out, k);
                     out.push_str(": ");
                     v.write_pretty(out, depth + 1);
                     if i + 1 < len {
@@ -177,22 +177,59 @@ impl Json {
                 out.push('}');
             }
             // Scalars and empty containers fall through to the compact form.
-            other => {
-                let _ = write!(out, "{}", other);
+            other => other.write_to(out),
+        }
+    }
+
+    /// Serialize compactly into an existing buffer — the allocation-free core
+    /// that `Display`/`to_string` and `to_pretty` are built on.
+    pub fn write_to(&self, out: &mut String) {
+        match self {
+            Json::Null => out.push_str("null"),
+            Json::Bool(true) => out.push_str("true"),
+            Json::Bool(false) => out.push_str("false"),
+            Json::Num(n) => {
+                if n.is_finite() && n.fract() == 0.0 && n.abs() < 1e15 {
+                    let _ = write!(out, "{}", *n as i64);
+                } else if n.is_finite() {
+                    let _ = write!(out, "{}", n);
+                } else {
+                    out.push_str("null") // JSON has no Inf/NaN
+                }
+            }
+            Json::Str(s) => escape_into(out, s),
+            Json::Arr(a) => {
+                out.push('[');
+                for (i, v) in a.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    v.write_to(out);
+                }
+                out.push(']');
+            }
+            Json::Obj(m) => {
+                out.push('{');
+                for (i, (k, v)) in m.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    escape_into(out, k);
+                    out.push(':');
+                    v.write_to(out);
+                }
+                out.push('}');
             }
         }
     }
 
     /// Parse a JSON document. Returns an error string on malformed input.
     pub fn parse(input: &str) -> Result<Json, String> {
-        let mut p = Parser {
-            chars: input.chars().collect(),
-            pos: 0,
-        };
+        let mut p = Parser { src: input, pos: 0 };
         p.skip_ws();
         let v = p.value()?;
         p.skip_ws();
-        if p.pos != p.chars.len() {
+        if p.pos != p.src.len() {
             return Err(format!("trailing characters at position {}", p.pos));
         }
         Ok(v)
@@ -274,88 +311,75 @@ impl Index<usize> for Json {
 }
 
 /// Compact serialization via `Display` — so `value.to_string()` just works.
+/// Serializes into one buffer with [`Json::write_to`] and hands it to the
+/// formatter whole: one `fmt` call instead of one per token.
 impl fmt::Display for Json {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Json::Null => f.write_str("null"),
-            Json::Bool(b) => write!(f, "{}", b),
-            Json::Num(n) => {
-                if n.is_finite() && n.fract() == 0.0 && n.abs() < 1e15 {
-                    write!(f, "{}", *n as i64)
-                } else if n.is_finite() {
-                    write!(f, "{}", n)
-                } else {
-                    f.write_str("null") // JSON has no Inf/NaN
-                }
-            }
-            Json::Str(s) => write_escaped(f, s),
-            Json::Arr(a) => {
-                f.write_char('[')?;
-                for (i, v) in a.iter().enumerate() {
-                    if i > 0 {
-                        f.write_char(',')?;
-                    }
-                    write!(f, "{}", v)?;
-                }
-                f.write_char(']')
-            }
-            Json::Obj(m) => {
-                f.write_char('{')?;
-                for (i, (k, v)) in m.iter().enumerate() {
-                    if i > 0 {
-                        f.write_char(',')?;
-                    }
-                    write_escaped(f, k)?;
-                    f.write_char(':')?;
-                    write!(f, "{}", v)?;
-                }
-                f.write_char('}')
-            }
-        }
+        let mut out = String::with_capacity(128);
+        self.write_to(&mut out);
+        f.write_str(&out)
     }
 }
 
-/// Write a JSON-escaped, quoted string into any `fmt::Write`.
-fn write_escaped<W: fmt::Write>(w: &mut W, s: &str) -> fmt::Result {
-    w.write_char('"')?;
-    for c in s.chars() {
-        match c {
-            '"' => w.write_str("\\\"")?,
-            '\\' => w.write_str("\\\\")?,
-            '\n' => w.write_str("\\n")?,
-            '\r' => w.write_str("\\r")?,
-            '\t' => w.write_str("\\t")?,
-            '\u{0008}' => w.write_str("\\b")?,
-            '\u{000C}' => w.write_str("\\f")?,
-            c if (c as u32) < 0x20 => write!(w, "\\u{:04x}", c as u32)?,
-            c => w.write_char(c)?,
+/// Append a JSON-escaped, quoted string. Contiguous runs needing no escape
+/// are appended as whole slices (a memcpy), not char by char.
+fn escape_into(out: &mut String, s: &str) {
+    out.push('"');
+    let bytes = s.as_bytes();
+    let mut run = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let esc: Option<&str> = match b {
+            b'"' => Some("\\\""),
+            b'\\' => Some("\\\\"),
+            b'\n' => Some("\\n"),
+            b'\r' => Some("\\r"),
+            b'\t' => Some("\\t"),
+            0x08 => Some("\\b"),
+            0x0C => Some("\\f"),
+            b if b < 0x20 => Some(""), // \u escape, formatted below
+            _ => None,
+        };
+        if let Some(esc) = esc {
+            // The run boundary is an ASCII byte, so it is a char boundary.
+            out.push_str(&s[run..i]);
+            if esc.is_empty() {
+                let _ = write!(out, "\\u{:04x}", b);
+            } else {
+                out.push_str(esc);
+            }
+            run = i + 1;
         }
     }
-    w.write_char('"')
+    out.push_str(&s[run..]);
+    out.push('"');
 }
 
 // ---- parser ---------------------------------------------------------------
 
-struct Parser {
-    chars: Vec<char>,
+/// A byte-cursor parser over the input `&str`. Structural JSON characters are
+/// all ASCII, so scanning bytes is safe; multi-byte UTF-8 sequences only occur
+/// inside strings, where whole unescaped runs are copied as slices. Positions
+/// in errors are byte offsets.
+struct Parser<'a> {
+    src: &'a str,
     pos: usize,
 }
 
-impl Parser {
-    fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
+impl Parser<'_> {
+    fn peek(&self) -> Option<u8> {
+        self.src.as_bytes().get(self.pos).copied()
     }
 
-    fn next(&mut self) -> Option<char> {
-        let c = self.peek();
-        if c.is_some() {
+    fn next(&mut self) -> Option<u8> {
+        let b = self.peek();
+        if b.is_some() {
             self.pos += 1;
         }
-        c
+        b
     }
 
     fn skip_ws(&mut self) {
-        while matches!(self.peek(), Some(' ' | '\t' | '\n' | '\r')) {
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
             self.pos += 1;
         }
     }
@@ -363,13 +387,16 @@ impl Parser {
     fn value(&mut self) -> Result<Json, String> {
         self.skip_ws();
         match self.peek() {
-            Some('{') => self.object(),
-            Some('[') => self.array(),
-            Some('"') => Ok(Json::Str(self.string()?)),
-            Some('t') | Some('f') => self.boolean(),
-            Some('n') => self.null(),
-            Some(c) if c == '-' || c.is_ascii_digit() => self.number(),
-            Some(c) => Err(format!("unexpected character '{}' at {}", c, self.pos)),
+            Some(b'{') => self.object(),
+            Some(b'[') => self.array(),
+            Some(b'"') => Ok(Json::Str(self.string()?)),
+            Some(b't') | Some(b'f') => self.boolean(),
+            Some(b'n') => self.null(),
+            Some(c) if c == b'-' || c.is_ascii_digit() => self.number(),
+            Some(c) => Err(format!(
+                "unexpected character '{}' at {}",
+                c as char, self.pos
+            )),
             None => Err("unexpected end of input".to_string()),
         }
     }
@@ -378,26 +405,26 @@ impl Parser {
         self.next(); // consume '{'
         let mut m = BTreeMap::new();
         self.skip_ws();
-        if self.peek() == Some('}') {
+        if self.peek() == Some(b'}') {
             self.next();
             return Ok(Json::Obj(m));
         }
         loop {
             self.skip_ws();
-            if self.peek() != Some('"') {
+            if self.peek() != Some(b'"') {
                 return Err(format!("expected object key at {}", self.pos));
             }
             let key = self.string()?;
             self.skip_ws();
-            if self.next() != Some(':') {
+            if self.next() != Some(b':') {
                 return Err(format!("expected ':' at {}", self.pos));
             }
             let val = self.value()?;
             m.insert(key, val);
             self.skip_ws();
             match self.next() {
-                Some(',') => continue,
-                Some('}') => break,
+                Some(b',') => continue,
+                Some(b'}') => break,
                 _ => return Err(format!("expected ',' or '}}' at {}", self.pos)),
             }
         }
@@ -408,7 +435,7 @@ impl Parser {
         self.next(); // consume '['
         let mut a = Vec::new();
         self.skip_ws();
-        if self.peek() == Some(']') {
+        if self.peek() == Some(b']') {
             self.next();
             return Ok(Json::Arr(a));
         }
@@ -417,8 +444,8 @@ impl Parser {
             a.push(val);
             self.skip_ws();
             match self.next() {
-                Some(',') => continue,
-                Some(']') => break,
+                Some(b',') => continue,
+                Some(b']') => break,
                 _ => return Err(format!("expected ',' or ']' at {}", self.pos)),
             }
         }
@@ -428,45 +455,60 @@ impl Parser {
     fn string(&mut self) -> Result<String, String> {
         self.next(); // consume opening quote
         let mut s = String::new();
+        let mut run = self.pos; // start of the current escape-free run
         loop {
-            match self.next() {
-                Some('"') => break,
-                Some('\\') => match self.next() {
-                    Some('"') => s.push('"'),
-                    Some('\\') => s.push('\\'),
-                    Some('/') => s.push('/'),
-                    Some('n') => s.push('\n'),
-                    Some('t') => s.push('\t'),
-                    Some('r') => s.push('\r'),
-                    Some('b') => s.push('\u{0008}'),
-                    Some('f') => s.push('\u{000C}'),
-                    Some('u') => {
-                        let mut code: u32 = 0;
-                        for _ in 0..4 {
-                            let c = self.next().ok_or("unterminated \\u escape")?;
-                            code = code * 16 + c.to_digit(16).ok_or("invalid hex in \\u escape")?;
+            match self.peek() {
+                Some(b'"') => {
+                    // `"` is ASCII, so the run boundary is a char boundary.
+                    s.push_str(&self.src[run..self.pos]);
+                    self.pos += 1;
+                    return Ok(s);
+                }
+                Some(b'\\') => {
+                    s.push_str(&self.src[run..self.pos]);
+                    self.pos += 1;
+                    match self.next() {
+                        Some(b'"') => s.push('"'),
+                        Some(b'\\') => s.push('\\'),
+                        Some(b'/') => s.push('/'),
+                        Some(b'n') => s.push('\n'),
+                        Some(b't') => s.push('\t'),
+                        Some(b'r') => s.push('\r'),
+                        Some(b'b') => s.push('\u{0008}'),
+                        Some(b'f') => s.push('\u{000C}'),
+                        Some(b'u') => {
+                            let mut code: u32 = 0;
+                            for _ in 0..4 {
+                                let c = self.next().ok_or("unterminated \\u escape")?;
+                                code = code * 16
+                                    + (c as char)
+                                        .to_digit(16)
+                                        .ok_or("invalid hex in \\u escape")?;
+                            }
+                            s.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
                         }
-                        s.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+                        _ => return Err("invalid escape sequence".to_string()),
                     }
-                    _ => return Err("invalid escape sequence".to_string()),
-                },
-                Some(c) => s.push(c),
+                    run = self.pos;
+                }
+                // Any other byte — including UTF-8 continuation bytes — just
+                // extends the run; it is copied wholesale at the next boundary.
+                Some(_) => self.pos += 1,
                 None => return Err("unterminated string".to_string()),
             }
         }
-        Ok(s)
     }
 
     fn number(&mut self) -> Result<Json, String> {
         let start = self.pos;
         while let Some(c) = self.peek() {
-            if c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E' || c.is_ascii_digit() {
+            if c == b'-' || c == b'+' || c == b'.' || c == b'e' || c == b'E' || c.is_ascii_digit() {
                 self.pos += 1;
             } else {
                 break;
             }
         }
-        let raw: String = self.chars[start..self.pos].iter().collect();
+        let raw = &self.src[start..self.pos];
         raw.parse::<f64>()
             .map(Json::Num)
             .map_err(|_| format!("invalid number '{}'", raw))
@@ -492,7 +534,7 @@ impl Parser {
 
     fn literal(&mut self, lit: &str) -> bool {
         let end = self.pos + lit.len();
-        if end <= self.chars.len() && self.chars[self.pos..end].iter().collect::<String>() == lit {
+        if end <= self.src.len() && &self.src.as_bytes()[self.pos..end] == lit.as_bytes() {
             self.pos = end;
             true
         } else {
