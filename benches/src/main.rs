@@ -75,7 +75,8 @@ fn main() {
             .order_by("id", true)
             .limit(20)
             .offset(40)
-            .build();
+            .build()
+            .unwrap();
         keep(built);
     });
 
@@ -85,7 +86,8 @@ fn main() {
             .set("title", Value::Text("new".into()))
             .set("done", Value::Bool(true))
             .filter("id", "=", Value::Int(5))
-            .build();
+            .build()
+            .unwrap();
         keep(built);
     });
 
@@ -94,7 +96,7 @@ fn main() {
         .join("users", "users.id", "todos.user_id")
         .filter("done", "=", Value::Bool(false));
     bench(&mut suite, "count_builder", || {
-        keep(count_qb.build_count());
+        keep(count_qb.build_count().unwrap());
     });
 
     // --- ORM wide builder: stresses the per-setter identifier/operator
@@ -120,7 +122,8 @@ fn main() {
             .order_by("created_at", true)
             .order_by("id", true)
             .limit(50)
-            .build();
+            .build()
+            .unwrap();
         keep(built);
     });
 
