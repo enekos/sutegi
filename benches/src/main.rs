@@ -75,7 +75,8 @@ fn main() {
             .order_by("id", true)
             .limit(20)
             .offset(40)
-            .build();
+            .build()
+            .unwrap();
         keep(built);
     });
 
@@ -85,7 +86,8 @@ fn main() {
             .set("title", Value::Text("new".into()))
             .set("done", Value::Bool(true))
             .filter("id", "=", Value::Int(5))
-            .build();
+            .build()
+            .unwrap();
         keep(built);
     });
 
@@ -94,7 +96,35 @@ fn main() {
         .join("users", "users.id", "todos.user_id")
         .filter("done", "=", Value::Bool(false));
     bench(&mut suite, "count_builder", || {
-        keep(count_qb.build_count());
+        keep(count_qb.build_count().unwrap());
+    });
+
+    // --- ORM wide builder: stresses the per-setter identifier/operator
+    // validation added by the injection guard (~16 identifier + 3 operator
+    // checks per build), so the guard's cost is visible under load. ---
+    bench(&mut suite, "query_builder_wide", || {
+        let built = QueryBuilder::table("events")
+            .select(&[
+                "id",
+                "user_id",
+                "kind",
+                "payload",
+                "created_at",
+                "updated_at",
+                "status",
+                "source",
+                "ip",
+                "note",
+            ])
+            .filter("status", "=", Value::Text("active".into()))
+            .filter("kind", "!=", Value::Text("noise".into()))
+            .filter_in("source", vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+            .order_by("created_at", true)
+            .order_by("id", true)
+            .limit(50)
+            .build()
+            .unwrap();
+        keep(built);
     });
 
     // --- Validation (Ruleset) ---

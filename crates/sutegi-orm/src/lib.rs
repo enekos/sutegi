@@ -25,7 +25,7 @@ mod backend;
 mod builder;
 mod value;
 
-pub use backend::{row, Backend, FromInput, FromRow, Model};
+pub use backend::{row, Backend, FromInput, FromRow, Model, Transactional};
 pub use builder::{DeleteBuilder, Page, QueryBuilder, UpdateBuilder};
 pub use value::{create_table_sql, schema_json, ColType, Column, TableSchema, Value};
 

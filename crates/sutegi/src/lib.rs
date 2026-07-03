@@ -13,6 +13,7 @@
 //! | `validate` | sutegi-validate | request / tool validation |
 //! | `ai`       | sutegi-ai       | `Tool`/`StreamTool` + `/__tools` |
 //! | `queue`    | sutegi-queue (+ sutegi-pg) | durable, cross-pod job queue (Postgres) |
+//! | `events`   | sutegi-events (+ orm) | event sourcing: append-only event store, aggregates, projections |
 //! | `session`  | sutegi-session  | signed-cookie sessions (HMAC-SHA256) |
 //! | `auth`     | sutegi-auth (+ session/orm) | the user system: passwords, Users, guards, API tokens |
 //! | `template` | sutegi-template | Blade-style template engine (`{{ }}`, `@if`, `@foreach`, `@include`) |
@@ -39,6 +40,8 @@ pub use sutegi_web as web;
 pub use sutegi_ai as ai;
 #[cfg(feature = "auth")]
 pub use sutegi_auth as auth;
+#[cfg(feature = "events")]
+pub use sutegi_events as events;
 #[cfg(feature = "hex")]
 pub use sutegi_hex as hex;
 #[cfg(feature = "mail")]
@@ -236,6 +239,11 @@ pub mod prelude {
         Request, Response, SseSink, StreamSink, ToolCtx,
     };
 
+    #[cfg(feature = "events")]
+    pub use sutegi_events::{
+        event, Aggregate, EventError, EventStore, Expected, NewEvent, ProjectionWorkers,
+        Projections, StoredEvent,
+    };
     #[cfg(feature = "orm")]
     pub use sutegi_orm::migrate::{Migration, Migrator};
     #[cfg(feature = "orm")]
@@ -243,7 +251,7 @@ pub mod prelude {
     #[cfg(feature = "orm")]
     pub use sutegi_orm::{
         Backend, ColType, Column, DeleteBuilder, FromInput, Metric, Model, Page, QueryBuilder,
-        TableSchema, UpdateBuilder, Value, Vector,
+        TableSchema, Transactional, UpdateBuilder, Value, Vector,
     };
     #[cfg(feature = "queue")]
     pub use sutegi_queue::{Queue, Workers};

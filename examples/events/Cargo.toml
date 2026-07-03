@@ -1,0 +1,19 @@
+[package]
+name = "events-example"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "sutegi event-sourcing demo: an account ledger — append-only events, an aggregate for decisions, a projected balances read model."
+publish = false
+
+[[bin]]
+name = "events"
+path = "src/main.rs"
+
+[dependencies]
+# The single-node shape: SQLite under both the event log and the read model.
+# Swap `Db` for `Pg` (feature `postgres`) and the same code runs multi-pod.
+sutegi = { path = "../../crates/sutegi", default-features = false, features = ["orm", "sqlite", "events"] }

@@ -1,0 +1,60 @@
+# Coverage-guided (libFuzzer) fuzz targets for sutegi's hand-rolled parsers.
+#
+# Its own workspace so libfuzzer-sys never enters sutegi's shipped tree — the
+# framework stays zero-dep; this exists only to *attack* it. Requires nightly
+# and the cargo-fuzz subcommand:
+#
+#   cargo install cargo-fuzz
+#   cargo +nightly fuzz run json_parse
+#   cargo +nightly fuzz run http_parse
+#   cargo +nightly fuzz run template_compile
+#   cargo +nightly fuzz run crypto_decode
+#
+# The deterministic in-tree `tests/fuzz.rs` suites are the CI gate; these
+# targets are for deeper, longer, corpus-guided exploration (run locally / in a
+# dedicated fuzzing job). A crash writes a reproducer under fuzz/artifacts/.
+[workspace]
+
+[package]
+name = "sutegi-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+sutegi-json = { path = "../crates/sutegi-json" }
+sutegi-http = { path = "../crates/sutegi-http" }
+sutegi-template = { path = "../crates/sutegi-template" }
+sutegi-crypto = { path = "../crates/sutegi-crypto" }
+
+[[bin]]
+name = "json_parse"
+path = "fuzz_targets/json_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_parse"
+path = "fuzz_targets/http_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "template_compile"
+path = "fuzz_targets/template_compile.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "crypto_decode"
+path = "fuzz_targets/crypto_decode.rs"
+test = false
+doc = false
+bench = false
