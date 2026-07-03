@@ -29,6 +29,12 @@ use sutegi_json::Json;
 
 const MAX_INCLUDE_DEPTH: usize = 32;
 
+/// Maximum nesting of `@if`/`@foreach` blocks. Guards the recursive-descent
+/// parser (and the matching recursive render) against a stack-overflow abort
+/// from pathologically nested input — defense-in-depth for the day templates
+/// come from somewhere less trusted than the app binary.
+const MAX_PARSE_DEPTH: usize = 128;
+
 /// A compiled template. Compile with [`Template::compile`]; render with
 /// [`Template::render`] (no `@include`) or through a [`Templates`] registry.
 pub struct Template {
@@ -64,7 +70,7 @@ impl Template {
     pub fn compile(src: &str) -> Result<Template, String> {
         let tokens = lex(src)?;
         let mut pos = 0;
-        let nodes = parse(&tokens, &mut pos, None, src)?;
+        let nodes = parse(&tokens, &mut pos, None, src, 0)?;
         Ok(Template { nodes })
     }
 
@@ -167,32 +173,35 @@ fn lex(src: &str) -> Result<Vec<(Tok, usize)>, String> {
         } else if rest.starts_with("@{{") {
             text.push_str("{{");
             i += 3;
-        } else if rest.starts_with("{!!") {
-            let end = rest
+        } else if let Some(body) = rest.strip_prefix("{!!") {
+            // Search for the closer *after* the opener: otherwise input like
+            // `{!!}` finds `!!}` overlapping the `{!!`, giving a reverse-range
+            // slice that panics.
+            let end = body
                 .find("!!}")
                 .ok_or_else(|| format!("line {}: unclosed {{!! … !!}}", line_of(src, i)))?;
             flush(&mut text, &mut toks, i);
             toks.push((
                 Tok::Interp {
-                    expr: rest[3..end].trim().to_string(),
+                    expr: body[..end].trim().to_string(),
                     raw: true,
                 },
                 i,
             ));
-            i += end + 3;
-        } else if rest.starts_with("{{") {
-            let end = rest
+            i += 3 + end + 3;
+        } else if let Some(body) = rest.strip_prefix("{{") {
+            let end = body
                 .find("}}")
                 .ok_or_else(|| format!("line {}: unclosed {{{{ … }}}}", line_of(src, i)))?;
             flush(&mut text, &mut toks, i);
             toks.push((
                 Tok::Interp {
-                    expr: rest[2..end].trim().to_string(),
+                    expr: body[..end].trim().to_string(),
                     raw: false,
                 },
                 i,
             ));
-            i += end + 2;
+            i += 2 + end + 2;
         } else if let Some(tok_len) = directive(rest) {
             flush(&mut text, &mut toks, i);
             let (tok, len) = tok_len;
@@ -267,7 +276,13 @@ fn parse(
     pos: &mut usize,
     until: Option<&[Stop]>,
     src: &str,
+    depth: usize,
 ) -> Result<Vec<Node>, String> {
+    if depth > MAX_PARSE_DEPTH {
+        return Err(format!(
+            "template nesting exceeds the limit of {MAX_PARSE_DEPTH}"
+        ));
+    }
     let mut nodes = Vec::new();
     while *pos < toks.len() {
         let (tok, at) = &toks[*pos];
@@ -328,12 +343,12 @@ fn parse(
                     negated,
                 };
                 *pos += 1;
-                let then = parse(toks, pos, Some(&[Stop::Else, Stop::EndIf]), src)?;
+                let then = parse(toks, pos, Some(&[Stop::Else, Stop::EndIf]), src, depth + 1)?;
                 let mut els = Vec::new();
                 match toks.get(*pos).map(|(t, _)| t) {
                     Some(Tok::Else) => {
                         *pos += 1;
-                        els = parse(toks, pos, Some(&[Stop::EndIf]), src)?;
+                        els = parse(toks, pos, Some(&[Stop::EndIf]), src, depth + 1)?;
                         match toks.get(*pos).map(|(t, _)| t) {
                             Some(Tok::EndIf) => *pos += 1,
                             _ => return Err(format!("line {line}: @if without @endif")),
@@ -353,7 +368,7 @@ fn parse(
                     return Err(format!("line {line}: @foreach expects `items as item`"));
                 }
                 *pos += 1;
-                let body = parse(toks, pos, Some(&[Stop::EndForeach]), src)?;
+                let body = parse(toks, pos, Some(&[Stop::EndForeach]), src, depth + 1)?;
                 match toks.get(*pos).map(|(t, _)| t) {
                     Some(Tok::EndForeach) => *pos += 1,
                     _ => return Err(format!("line {line}: @foreach without @endforeach")),

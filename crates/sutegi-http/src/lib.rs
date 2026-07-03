@@ -279,40 +279,106 @@ pub enum Incoming {
     TooLarge,
 }
 
+/// Outcome of a single capped line read.
+enum Line {
+    /// A line of `usize` bytes (terminator included) sits in the buffer.
+    Read(usize),
+    /// The peer closed with nothing buffered.
+    Eof,
+    /// The line would exceed the remaining header budget.
+    TooLarge,
+}
+
+/// Read one `\n`-terminated line into `buf` (cleared first) without ever
+/// buffering more than `max` bytes. A plain [`BufRead::read_line`] on a stream
+/// that never sends a newline allocates without bound — a memory DoS reachable
+/// before any post-read length check can fire — so the read itself is capped.
+fn read_line_capped<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>, max: usize) -> io::Result<Line> {
+    buf.clear();
+    loop {
+        let chunk = match reader.fill_buf() {
+            Ok(c) => c,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if chunk.is_empty() {
+            break; // EOF
+        }
+        let (take, done) = match chunk.iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (chunk.len(), false),
+        };
+        if buf.len() + take > max {
+            return Ok(Line::TooLarge);
+        }
+        buf.extend_from_slice(&chunk[..take]);
+        reader.consume(take);
+        if done {
+            break;
+        }
+    }
+    if buf.is_empty() {
+        Ok(Line::Eof)
+    } else {
+        Ok(Line::Read(buf.len()))
+    }
+}
+
+/// Decode a header/request line as UTF-8, mirroring `read_line`'s contract of
+/// rejecting invalid UTF-8 rather than lossily mangling it.
+fn decode_line(buf: &[u8]) -> io::Result<&str> {
+    std::str::from_utf8(buf).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request line was not valid UTF-8",
+        )
+    })
+}
+
 /// Parse a single request off a buffered stream, enforcing `limits`. Returns
 /// `Ok(None)` if the peer closed before sending anything, or
 /// `Ok(Some(Incoming::TooLarge))` if headers/body exceed the limits (so the
 /// server can reply 413 without allocating an attacker-chosen buffer).
 pub fn parse_request<R: BufRead>(reader: &mut R, limits: &Limits) -> io::Result<Option<Incoming>> {
-    // One line buffer, reused for the request line and every header line —
+    // One byte buffer, reused for the request line and every header line —
     // this function runs per request, so allocation churn is latency.
-    let mut line = String::with_capacity(128);
-    if reader.read_line(&mut line)? == 0 {
-        return Ok(None);
-    }
-    let mut header_bytes = line.len();
+    let mut buf: Vec<u8> = Vec::with_capacity(128);
 
-    let mut parts = line.split_whitespace();
-    let method = Method::parse(parts.next().unwrap_or(""));
-    let target = parts.next().unwrap_or("/");
-    let version = parts.next().unwrap_or("HTTP/1.1").to_string();
-    let (path, query) = match target.split_once('?') {
-        Some((p, q)) => (p.to_string(), q.to_string()),
-        None => (target.to_string(), String::new()),
+    // Request line. Bounded by the header budget: a plain `read_line` on a
+    // stream that never sends a newline would buffer without limit (a memory
+    // DoS), so the request line and each header line are read through a
+    // capped reader that stops at `max_header_bytes`.
+    match read_line_capped(reader, &mut buf, limits.max_header_bytes)? {
+        Line::Eof => return Ok(None),
+        Line::TooLarge => return Ok(Some(Incoming::TooLarge)),
+        Line::Read(_) => {}
+    }
+    // Parse the request line into owned pieces before `buf` is reused below.
+    let (method, path, query, version, mut header_bytes) = {
+        let req_line = decode_line(&buf)?;
+        let header_bytes = req_line.len();
+        let mut parts = req_line.split_whitespace();
+        let method = Method::parse(parts.next().unwrap_or(""));
+        let target = parts.next().unwrap_or("/");
+        let version = parts.next().unwrap_or("HTTP/1.1").to_string();
+        let (path, query) = match target.split_once('?') {
+            Some((p, q)) => (p.to_string(), q.to_string()),
+            None => (target.to_string(), String::new()),
+        };
+        (method, path, query, version, header_bytes)
     };
 
     let mut headers = Vec::with_capacity(8);
     let mut content_length = 0usize;
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            break;
-        }
+        let remaining = limits.max_header_bytes.saturating_sub(header_bytes);
+        let n = match read_line_capped(reader, &mut buf, remaining)? {
+            Line::Eof => break,
+            Line::TooLarge => return Ok(Some(Incoming::TooLarge)),
+            Line::Read(n) => n,
+        };
         header_bytes += n;
-        if header_bytes > limits.max_header_bytes {
-            return Ok(Some(Incoming::TooLarge));
-        }
+        let line = decode_line(&buf)?;
         let l = line.trim_end_matches(['\r', '\n']);
         if l.is_empty() {
             break;

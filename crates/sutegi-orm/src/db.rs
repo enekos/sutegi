@@ -230,6 +230,7 @@ fn execute_conn(conn: &Connection, sql: &str, params: &[Value]) -> Result<usize,
 
 /// `INSERT INTO … VALUES (…)` returning the new rowid — shared by [`Db`] / [`Tx`].
 fn insert_conn(conn: &Connection, table: &str, cols: &[(&str, Value)]) -> Result<i64, String> {
+    crate::builder::validate_write_idents(table, cols, &[])?;
     let names: Vec<&str> = cols.iter().map(|(n, _)| *n).collect();
     let placeholders = vec!["?"; cols.len()].join(", ");
     let sql = format!(
@@ -252,6 +253,7 @@ fn upsert_conn(
     cols: &[(&str, Value)],
     conflict: &str,
 ) -> Result<i64, String> {
+    crate::builder::validate_write_idents(table, cols, &[conflict])?;
     let names: Vec<&str> = cols.iter().map(|(n, _)| *n).collect();
     let placeholders = vec!["?"; cols.len()].join(", ");
     let updates: Vec<String> = names
@@ -456,7 +458,8 @@ mod tests {
         let (sql, params) = UpdateBuilder::table("todos")
             .set("done", Value::Bool(true))
             .filter("id", "=", Value::Int(1))
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(db.execute(&sql, &params).unwrap(), 1);
 
         // Rollback leaves state untouched. Note the closure uses the Backend
@@ -490,7 +493,8 @@ mod tests {
 
         let (dsql, dparams) = DeleteBuilder::table("todos")
             .filter("id", "=", Value::Int(1))
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(db.execute(&dsql, &dparams).unwrap(), 1);
     }
 

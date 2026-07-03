@@ -99,7 +99,12 @@ fn to_pg_value(v: &Value) -> PgValue {
 }
 
 /// `INSERT … RETURNING pk` with `$n` placeholders — shared by [`Pg`] and [`Tx`].
-fn insert_sql(table: &str, cols: &[(&str, Value)], pk: &str) -> (String, Vec<PgValue>) {
+fn insert_sql(
+    table: &str,
+    cols: &[(&str, Value)],
+    pk: &str,
+) -> Result<(String, Vec<PgValue>), String> {
+    crate::builder::validate_write_idents(table, cols, &[pk])?;
     let names: Vec<&str> = cols.iter().map(|(n, _)| *n).collect();
     let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("${i}")).collect();
     let sql = format!(
@@ -109,7 +114,7 @@ fn insert_sql(table: &str, cols: &[(&str, Value)], pk: &str) -> (String, Vec<PgV
         placeholders.join(", "),
         pk
     );
-    (sql, cols.iter().map(|(_, v)| to_pg_value(v)).collect())
+    Ok((sql, cols.iter().map(|(_, v)| to_pg_value(v)).collect()))
 }
 
 /// `INSERT … ON CONFLICT … DO UPDATE … RETURNING pk` — shared by [`Pg`] / [`Tx`].
@@ -118,7 +123,8 @@ fn upsert_sql(
     cols: &[(&str, Value)],
     conflict: &str,
     pk: &str,
-) -> (String, Vec<PgValue>) {
+) -> Result<(String, Vec<PgValue>), String> {
+    crate::builder::validate_write_idents(table, cols, &[conflict, pk])?;
     let names: Vec<&str> = cols.iter().map(|(n, _)| *n).collect();
     let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("${i}")).collect();
     let updates: Vec<String> = names
@@ -135,7 +141,7 @@ fn upsert_sql(
         updates.join(", "),
         pk
     );
-    (sql, cols.iter().map(|(_, v)| to_pg_value(v)).collect())
+    Ok((sql, cols.iter().map(|(_, v)| to_pg_value(v)).collect()))
 }
 
 /// Extract the `pk` column from a single-row `RETURNING` result.
@@ -215,7 +221,7 @@ impl Backend for Pg {
     }
 
     fn insert(&self, table: &str, cols: &[(&str, Value)], pk: &str) -> Result<i64, String> {
-        let (sql, bound) = insert_sql(table, cols, pk);
+        let (sql, bound) = insert_sql(table, cols, pk)?;
         Ok(pk_from_rows(&self.pool.query(&sql, &bound)?, pk))
     }
 
@@ -226,7 +232,7 @@ impl Backend for Pg {
         conflict: &str,
         pk: &str,
     ) -> Result<i64, String> {
-        let (sql, bound) = upsert_sql(table, cols, conflict, pk);
+        let (sql, bound) = upsert_sql(table, cols, conflict, pk)?;
         Ok(pk_from_rows(&self.pool.query(&sql, &bound)?, pk))
     }
 
@@ -269,7 +275,7 @@ impl Backend for Tx<'_> {
     }
 
     fn insert(&self, table: &str, cols: &[(&str, Value)], pk: &str) -> Result<i64, String> {
-        let (sql, bound) = insert_sql(table, cols, pk);
+        let (sql, bound) = insert_sql(table, cols, pk)?;
         Ok(pk_from_rows(
             &self.client.borrow_mut().query(&sql, &bound)?,
             pk,
@@ -283,7 +289,7 @@ impl Backend for Tx<'_> {
         conflict: &str,
         pk: &str,
     ) -> Result<i64, String> {
-        let (sql, bound) = upsert_sql(table, cols, conflict, pk);
+        let (sql, bound) = upsert_sql(table, cols, conflict, pk)?;
         Ok(pk_from_rows(
             &self.client.borrow_mut().query(&sql, &bound)?,
             pk,
@@ -383,7 +389,8 @@ mod tests {
             "t",
             &[("a", Value::Int(1)), ("b", Value::Text("x".into()))],
             "id",
-        );
+        )
+        .unwrap();
         assert_eq!(isql, "INSERT INTO t (a, b) VALUES ($1, $2) RETURNING id");
         assert_eq!(ib.len(), 2);
 
@@ -392,7 +399,8 @@ mod tests {
             &[("id", Value::Int(1)), ("b", Value::Text("x".into()))],
             "id",
             "id",
-        );
+        )
+        .unwrap();
         assert_eq!(
             usql,
             "INSERT INTO t (id, b) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET b = EXCLUDED.b RETURNING id"

@@ -97,6 +97,33 @@ fn main() {
         keep(count_qb.build_count());
     });
 
+    // --- ORM wide builder: stresses the per-setter identifier/operator
+    // validation added by the injection guard (~16 identifier + 3 operator
+    // checks per build), so the guard's cost is visible under load. ---
+    bench(&mut suite, "query_builder_wide", || {
+        let built = QueryBuilder::table("events")
+            .select(&[
+                "id",
+                "user_id",
+                "kind",
+                "payload",
+                "created_at",
+                "updated_at",
+                "status",
+                "source",
+                "ip",
+                "note",
+            ])
+            .filter("status", "=", Value::Text("active".into()))
+            .filter("kind", "!=", Value::Text("noise".into()))
+            .filter_in("source", vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+            .order_by("created_at", true)
+            .order_by("id", true)
+            .limit(50)
+            .build();
+        keep(built);
+    });
+
     // --- Validation (Ruleset) ---
     let rules = Ruleset::new()
         .field(

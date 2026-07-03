@@ -1,0 +1,19 @@
+# Differential-oracle test harness — its own workspace so the third-party
+# oracle deps (serde_json, etc.) never enter sutegi's shipped tree or Cargo.lock.
+# The framework stays zero-dep; these deps exist only to *check* it.
+#
+# Run with:  cd differential && cargo test
+[workspace]
+
+[package]
+name = "sutegi-differential"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+sutegi-json = { path = "../crates/sutegi-json" }
+
+[dev-dependencies]
+# The reference implementation we check sutegi's hand-rolled JSON against.
+serde_json = "1"

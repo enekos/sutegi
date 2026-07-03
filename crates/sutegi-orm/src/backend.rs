@@ -58,7 +58,7 @@ pub trait Backend {
 
     /// Run a query builder and return rows as JSON objects.
     fn select(&self, qb: &QueryBuilder) -> Result<Vec<Json>, String> {
-        let (sql, params) = qb.build();
+        let (sql, params) = qb.build()?;
         self.query(&sql, &params)
     }
 
@@ -69,7 +69,7 @@ pub trait Backend {
 
     /// Count rows matching a query builder (uses its `build_count`).
     fn count(&self, qb: &QueryBuilder) -> Result<i64, String> {
-        let (sql, params) = qb.build_count();
+        let (sql, params) = qb.build_count()?;
         Ok(self
             .query_one(&sql, &params)?
             .and_then(|r| r.get("count").and_then(|j| j.as_f64()))
@@ -243,7 +243,7 @@ pub trait Model {
         for (col, value) in sets {
             builder = builder.set(col, value.clone());
         }
-        let (sql, params) = builder.filter(Self::primary_key(), "=", id).build();
+        let (sql, params) = builder.filter(Self::primary_key(), "=", id).build()?;
         conn.execute(&sql, &params)
     }
 
@@ -251,7 +251,7 @@ pub trait Model {
     fn delete<B: Backend>(conn: &B, id: Value) -> Result<bool, String> {
         let (sql, params) = DeleteBuilder::table(Self::table())
             .filter(Self::primary_key(), "=", id)
-            .build();
+            .build()?;
         Ok(conn.execute(&sql, &params)? > 0)
     }
 }
@@ -448,7 +448,7 @@ mod tests {
         }
         assert_eq!(T::primary_key(), "id");
         assert_eq!(T::table(), "todos");
-        let (sql, _) = T::query().build();
+        let (sql, _) = T::query().build().unwrap();
         assert_eq!(sql, "SELECT * FROM todos");
     }
 

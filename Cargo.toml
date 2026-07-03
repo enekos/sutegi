@@ -27,10 +27,14 @@ members = [
     "examples/auth",
     "examples/storage",
     "examples/events",
+    "examples/redactor",
 ]
-# The bench runner is its own workspace (depends on the external aatxe SDK by
-# path); excluded so normal builds / tests / publish never touch it.
-exclude = ["benches"]
+# Standalone tooling workspaces, each excluded so normal builds / tests /
+# publish never touch them and no third-party dep enters the shipped tree:
+#   benches      — aatxe statistical microbench runner (path dep on ../aatxe)
+#   fuzz         — coverage-guided libFuzzer targets (nightly, cargo-fuzz)
+#   differential — sutegi-vs-serde_json JSON oracle (stable, `cargo test`)
+exclude = ["benches", "fuzz", "differential"]
 
 [workspace.package]
 version = "0.5.1"

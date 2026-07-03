@@ -225,7 +225,11 @@ impl Json {
 
     /// Parse a JSON document. Returns an error string on malformed input.
     pub fn parse(input: &str) -> Result<Json, String> {
-        let mut p = Parser { src: input, pos: 0 };
+        let mut p = Parser {
+            src: input,
+            pos: 0,
+            depth: 0,
+        };
         p.skip_ws();
         let v = p.value()?;
         p.skip_ws();
@@ -363,7 +367,17 @@ fn escape_into(out: &mut String, s: &str) {
 struct Parser<'a> {
     src: &'a str,
     pos: usize,
+    /// Current container-nesting depth, checked against [`MAX_DEPTH`] so that
+    /// adversarial input can't drive the recursive descent past the stack.
+    depth: usize,
 }
+
+/// Maximum container nesting the parser will descend into before erroring.
+/// This is the guard against a stack-overflow DoS: a body of just `[[[[…` is a
+/// few bytes per level, and a Rust stack overflow *aborts the whole process*,
+/// so an unbounded recursive parser would let any request body (or AI tool
+/// argument) kill the worker. RFC 8259 §9 explicitly permits such a limit.
+const MAX_DEPTH: usize = 128;
 
 impl Parser<'_> {
     fn peek(&self) -> Option<u8> {
@@ -387,8 +401,19 @@ impl Parser<'_> {
     fn value(&mut self) -> Result<Json, String> {
         self.skip_ws();
         match self.peek() {
-            Some(b'{') => self.object(),
-            Some(b'[') => self.array(),
+            Some(b'{') | Some(b'[') => {
+                self.depth += 1;
+                if self.depth > MAX_DEPTH {
+                    return Err(format!("maximum nesting depth {MAX_DEPTH} exceeded"));
+                }
+                let v = if self.peek() == Some(b'{') {
+                    self.object()
+                } else {
+                    self.array()
+                };
+                self.depth -= 1;
+                v
+            }
             Some(b'"') => Ok(Json::Str(self.string()?)),
             Some(b't') | Some(b'f') => self.boolean(),
             Some(b'n') => self.null(),
@@ -477,15 +502,37 @@ impl Parser<'_> {
                         Some(b'b') => s.push('\u{0008}'),
                         Some(b'f') => s.push('\u{000C}'),
                         Some(b'u') => {
-                            let mut code: u32 = 0;
-                            for _ in 0..4 {
-                                let c = self.next().ok_or("unterminated \\u escape")?;
-                                code = code * 16
-                                    + (c as char)
-                                        .to_digit(16)
-                                        .ok_or("invalid hex in \\u escape")?;
-                            }
-                            s.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+                            let hi = self.hex4()?;
+                            // UTF-16 surrogate pair: a high surrogate must be
+                            // followed by `\uXXXX` low surrogate, and the two
+                            // combine into one non-BMP scalar. Without this,
+                            // any escaped emoji/astral char decodes to U+FFFD.
+                            let ch = if (0xD800..=0xDBFF).contains(&hi) {
+                                // High surrogate: try to consume a following
+                                // `\uXXXX` low surrogate. If it isn't one, rewind
+                                // so those bytes are parsed normally and emit the
+                                // replacement char for the unpaired surrogate.
+                                let save = self.pos;
+                                let paired =
+                                    if self.next() == Some(b'\\') && self.next() == Some(b'u') {
+                                        let lo = self.hex4()?;
+                                        (0xDC00..=0xDFFF).contains(&lo).then(|| {
+                                            0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
+                                        })
+                                    } else {
+                                        None
+                                    };
+                                match paired {
+                                    Some(c) => char::from_u32(c).unwrap_or('\u{FFFD}'),
+                                    None => {
+                                        self.pos = save;
+                                        '\u{FFFD}'
+                                    }
+                                }
+                            } else {
+                                char::from_u32(hi).unwrap_or('\u{FFFD}')
+                            };
+                            s.push(ch);
                         }
                         _ => return Err("invalid escape sequence".to_string()),
                     }
@@ -509,9 +556,14 @@ impl Parser<'_> {
             }
         }
         let raw = &self.src[start..self.pos];
-        raw.parse::<f64>()
-            .map(Json::Num)
-            .map_err(|_| format!("invalid number '{}'", raw))
+        match raw.parse::<f64>() {
+            // A number that overflows f64 parses to ±inf, which the serializer
+            // renders as `null` — so accepting it would silently mutate the
+            // value across a round-trip. Reject non-finite instead.
+            Ok(n) if n.is_finite() => Ok(Json::Num(n)),
+            Ok(_) => Err(format!("number out of range '{raw}'")),
+            Err(_) => Err(format!("invalid number '{raw}'")),
+        }
     }
 
     fn boolean(&mut self) -> Result<Json, String> {
@@ -530,6 +582,19 @@ impl Parser<'_> {
         } else {
             Err(format!("invalid literal at {}", self.pos))
         }
+    }
+
+    /// Read exactly four hex digits (one UTF-16 code unit) after a `\u`.
+    fn hex4(&mut self) -> Result<u32, String> {
+        let mut code = 0u32;
+        for _ in 0..4 {
+            let c = self.next().ok_or("unterminated \\u escape")?;
+            code = code * 16
+                + (c as char)
+                    .to_digit(16)
+                    .ok_or("invalid hex in \\u escape")?;
+        }
+        Ok(code)
     }
 
     fn literal(&mut self, lit: &str) -> bool {

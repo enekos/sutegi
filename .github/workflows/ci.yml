@@ -59,6 +59,30 @@ jobs:
         env:
           SUTEGI_PG_TEST_URL: postgres://sutegi:secret@localhost:5432/sutegi_test
 
+      # Required adversarial/fuzz gate. These `tests/fuzz.rs` targets exercise
+      # the hand-rolled parsers, codecs, and crypto against garbage and
+      # injection input. Naming them explicitly means deleting one is a hard CI
+      # failure (`error: no test target named 'fuzz'`) rather than a silent drop
+      # in coverage — the harness can't rot away unnoticed.
+      - name: Adversarial / fuzz suite (must exist and pass)
+        run: >-
+          cargo test --all-features --test fuzz
+          -p sutegi-json
+          -p sutegi-http
+          -p sutegi-crypto
+          -p sutegi-template
+          -p sutegi-mail
+          -p sutegi-storage
+          -p sutegi-session
+
+      # Differential oracle: sutegi's hand-rolled JSON parser vs serde_json,
+      # in an excluded workspace so the reference dep never enters the shipped
+      # tree. Proves cross-parser agreement, not just no-panic. (The nightly
+      # cargo-fuzz targets under fuzz/ are for a dedicated long-running job, not
+      # this gate.)
+      - name: Differential oracle (vs serde_json)
+        run: cd differential && cargo test
+
       - name: Build (zero-dep core, no default features)
         run: cargo build --no-default-features
 

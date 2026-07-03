@@ -1,0 +1,19 @@
+[package]
+name = "redactor-example"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "First real consumer: a mairu-adjacent PII-redaction agent tool server on sutegi."
+publish = false
+
+[[bin]]
+name = "redactor"
+path = "src/main.rs"
+
+[dependencies]
+# A realistic agent service: SQLite audit log + graceful shutdown. The framework
+# core stays zero-dep (derive/orm/validate/ai come from default features).
+sutegi = { path = "../../crates/sutegi", features = ["sqlite", "graceful"] }

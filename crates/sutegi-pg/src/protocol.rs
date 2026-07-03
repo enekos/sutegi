@@ -444,12 +444,22 @@ fn encode_param(p: &PgValue) -> Option<Vec<u8>> {
     }
 }
 
+// The `be_*` readers saturate to 0 on a short buffer rather than panicking:
+// with no TLS on the wire (yet), a MITM or a buggy server could send a
+// truncated message, and an index panic there is a client-side DoS. The
+// message parsers below also bounds-check every slice for the same reason.
 fn be_i32(buf: &[u8], at: usize) -> i32 {
-    i32::from_be_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]])
+    match buf.get(at..at + 4) {
+        Some(b) => i32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+        None => 0,
+    }
 }
 
 fn be_i16(buf: &[u8], at: usize) -> i16 {
-    i16::from_be_bytes([buf[at], buf[at + 1]])
+    match buf.get(at..at + 2) {
+        Some(b) => i16::from_be_bytes([b[0], b[1]]),
+        None => 0,
+    }
 }
 
 /// Parse a NUL-separated, NUL-terminated list of strings.
@@ -464,8 +474,13 @@ fn parse_cstr_list(buf: &[u8]) -> Vec<String> {
 fn parse_row_description(body: &[u8]) -> Vec<(String, i32)> {
     let count = be_i16(body, 0) as usize;
     let mut pos = 2;
-    let mut fields = Vec::with_capacity(count);
+    // Cap the pre-allocation to what the buffer could actually hold (each field
+    // is at least 19 bytes) so a bogus count can't request a huge Vec.
+    let mut fields = Vec::with_capacity(count.min(body.len() / 19 + 1));
     for _ in 0..count {
+        if pos >= body.len() {
+            break;
+        }
         let end = body[pos..].iter().position(|&b| b == 0).unwrap_or(0);
         let name = String::from_utf8_lossy(&body[pos..pos + end]).into_owned();
         pos += end + 1;
@@ -493,8 +508,17 @@ fn parse_data_row(body: &[u8], fields: &[(String, i32)]) -> Json {
             obj.insert(name, Json::Null);
             continue;
         }
-        let raw = &body[pos..pos + len as usize];
-        pos += len as usize;
+        // A length that runs past the message end is malformed — stop rather
+        // than slice out of bounds.
+        let end = match pos.checked_add(len as usize) {
+            Some(e) if e <= body.len() => e,
+            _ => {
+                obj.insert(name, Json::Null);
+                break;
+            }
+        };
+        let raw = &body[pos..end];
+        pos = end;
         obj.insert(name, decode_value(oid, raw));
     }
     Json::Obj(obj)
@@ -595,6 +619,13 @@ impl Scram {
         let nonce = nonce.ok_or("SCRAM server-first missing nonce")?;
         let salt = crypto::base64_decode(&salt_b64.ok_or("SCRAM server-first missing salt")?)?;
         let iterations = iterations.ok_or("SCRAM server-first missing iteration count")?;
+        // The iteration count comes from the server, and PBKDF2 loops that many
+        // times. With no TLS on the wire yet, a malicious or MITM'd server could
+        // send a huge count to pin the client's CPU (a DoS). Bound it: real
+        // servers use a few thousand; 1,000,000 is a generous ceiling.
+        if !(1..=1_000_000).contains(&iterations) {
+            return Err(format!("SCRAM iteration count out of range: {iterations}"));
+        }
         if !nonce.starts_with(&self.client_nonce) {
             return Err("SCRAM server nonce does not extend client nonce".into());
         }
@@ -770,5 +801,76 @@ mod tests {
         let b = random_bytes(18).unwrap();
         assert_eq!(a.len(), 18);
         assert_ne!(a, b); // astronomically unlikely to collide
+    }
+
+    // -- adversarial: malformed wire messages must not panic the client -------
+    //
+    // These parsers consume server-controlled bytes, and with no TLS on the
+    // connection yet a MITM could inject truncated/overlong frames. A parser
+    // panic aborts the worker, so every message parser must degrade gracefully.
+
+    fn splitmix(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    #[test]
+    fn message_parsers_never_panic_on_garbage() {
+        let mut seed = 0x5047_5f46_555a_5a00u64; // "PG_FUZZ"
+        let fields = vec![
+            ("a".to_string(), 23),
+            ("b".to_string(), 16),
+            ("c".to_string(), 25),
+        ];
+        for _ in 0..50_000 {
+            let len = (splitmix(&mut seed) as usize) % 64;
+            let body: Vec<u8> = (0..len).map(|_| splitmix(&mut seed) as u8).collect();
+            // Each of these previously indexed unchecked into `body`.
+            let _ = parse_row_description(&body);
+            let _ = parse_data_row(&body, &fields);
+            let _ = parse_data_row(&body, &[]); // no field metadata at all
+            let _ = parse_error(&body);
+            let _ = parse_cstr_list(&body);
+            let _ = command_tag_count(&body);
+        }
+    }
+
+    #[test]
+    fn scram_handshake_survives_hostile_server_messages() {
+        // The server drives these strings; with no TLS a MITM can too. Parsing
+        // must never panic, and the iteration count must be bounded.
+        let cfg = Config::from_url("postgres://u:p@localhost/db").unwrap();
+        let mut seed = 0x5343_5241_4d00_0000u64; // "SCRAM"
+        for _ in 0..20_000 {
+            let len = (splitmix(&mut seed) as usize) % 80;
+            let alphabet = b"rsi=,0123456789abcdefghijklmnopABCDEF+/= ";
+            let msg: String = (0..len)
+                .map(|_| alphabet[(splitmix(&mut seed) as usize) % alphabet.len()] as char)
+                .collect();
+            let mut scram = Scram::new().unwrap();
+            let _ = scram.handle_server_first(&cfg, &msg); // Ok/Err, never panic/hang
+            let _ = scram.verify_server_final(&msg);
+        }
+        // A hostile, well-formed-looking huge iteration count is rejected, not run.
+        let mut scram = Scram::new().unwrap();
+        let nonce = &scram.client_nonce.clone();
+        let evil = format!("r={nonce}extra,s=YWJjZA==,i=4000000000");
+        let err = scram.handle_server_first(&cfg, &evil).unwrap_err();
+        assert!(err.contains("iteration count"), "got: {err}");
+    }
+
+    #[test]
+    fn data_row_survives_truncated_and_overlong_lengths() {
+        let fields = vec![("x".to_string(), 25)];
+        // Claims one column of length 1000 but the body is far shorter.
+        let mut body = vec![0, 1]; // column count = 1
+        body.extend_from_slice(&1000i32.to_be_bytes());
+        body.extend_from_slice(b"short");
+        let row = parse_data_row(&body, &fields);
+        // The overlong column degrades to null instead of panicking.
+        assert_eq!(row.get("x"), Some(&Json::Null));
     }
 }
