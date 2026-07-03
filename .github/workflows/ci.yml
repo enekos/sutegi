@@ -137,7 +137,9 @@ jobs:
             --out /tmp/compare.json --markdown /tmp/compare.md \
             --threshold 0.10 --fail-on-regression
           status=$?
-          cat /tmp/compare.md >> "$GITHUB_STEP_SUMMARY"
+          # Print to the job log *and* the step summary, so a regression is
+          # visible in the run output (not only the summary tab).
+          cat /tmp/compare.md | tee -a "$GITHUB_STEP_SUMMARY"
           exit $status
 
       - name: Publish report (push)
