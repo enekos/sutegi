@@ -17,30 +17,36 @@ use crate::value::Value;
 /// expressions the builder doesn't model (function calls, casts, aliases), use
 /// the `where_raw` escape hatch, which is explicitly the caller's responsibility.
 pub fn valid_identifier(s: &str) -> bool {
-    // Allocation-free: this runs on every builder setter, so it must not touch
-    // the heap. At most one `.` qualifier is allowed (`table.col` / `table.*`).
+    // Allocation-free and byte-level (all valid identifier characters are
+    // ASCII, so we never need UTF-8 decoding): this runs on every builder
+    // setter, so it must be cheap. At most one `.` qualifier is allowed
+    // (`table.col` / `table.*`).
     if s == "*" {
         return true;
     }
-    match s.split_once('.') {
-        // The tail may not contain a further `.` (that would be a third
-        // segment), and may be `*` for `table.*`.
-        Some((qual, name)) => {
-            is_plain_ident(qual) && !name.contains('.') && (name == "*" || is_plain_ident(name))
+    let b = s.as_bytes();
+    match b.iter().position(|&c| c == b'.') {
+        Some(dot) => {
+            let (qual, name) = (&b[..dot], &b[dot + 1..]);
+            // The tail may be `*` (for `table.*`) but must not contain a
+            // further `.` (that would be a third segment).
+            is_plain_ident(qual)
+                && (name == b"*" || (!name.contains(&b'.') && is_plain_ident(name)))
         }
-        None => is_plain_ident(s),
+        None => is_plain_ident(b),
     }
 }
 
 /// One unqualified identifier segment: a non-empty ASCII word starting with a
-/// letter or `_`.
-fn is_plain_ident(seg: &str) -> bool {
-    let mut chars = seg.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+/// letter or `_`. Byte-level; non-ASCII bytes fail the class checks.
+fn is_plain_ident(seg: &[u8]) -> bool {
+    match seg.first() {
+        Some(&c) if c.is_ascii_alphabetic() || c == b'_' => {}
         _ => return false,
     }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    seg[1..]
+        .iter()
+        .all(|&c| c.is_ascii_alphanumeric() || c == b'_')
 }
 
 /// Validate a comparison **operator** that is interpolated into a `WHERE`
