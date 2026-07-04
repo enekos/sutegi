@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- REPL (`sutegi-repl`, feature `repl`): a tinker-style interactive shell over the surfaces a sutegi app already exposes — routes, introspection, tool invocation (streaming tools print SSE frames live), raw HTTP through the app, and (with an attached `Backend`) raw SQL, a `where`-clause query DSL, KV, the event store, and the job queue. Works in-process (`Repl::new(app).db(db).run()`) or against a running server with no source access (`sutegi repl <addr>` via the CLI — the agent contract, driven by a human).
 - Event sourcing (`sutegi-events`, feature `events`): append-only event store with optimistic concurrency (`Expected`), gap-free global log positions, `Aggregate` folding, and checkpointed `Projections` whose read-model writes commit in the same transaction as the checkpoint. Runs on SQLite or Postgres via the `Backend` seam; `append_tx` composes with caller-owned transactions.
 - ORM: `Transactional` trait — run a closure inside a transaction on any capable backend (`Db`, `Pg`), receiving `&dyn Backend`. The `Backend` trait is now object-safe (typed `fetch`/`paginate_typed` are `Self: Sized`-gated).
 

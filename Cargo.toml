@@ -18,6 +18,7 @@ members = [
     "crates/sutegi-mail",
     "crates/sutegi-template",
     "crates/sutegi-ai",
+    "crates/sutegi-repl",
     "crates/sutegi",
     "crates/sutegi-cli",
     "examples/todo",

@@ -29,6 +29,7 @@ sutegi-macros = { path = "../sutegi-macros", version = "0.5.1", optional = true 
 sutegi-storage = { path = "../sutegi-storage", version = "0.5.1", optional = true }
 sutegi-mail = { path = "../sutegi-mail", version = "0.5.1", optional = true }
 sutegi-template = { path = "../sutegi-template", version = "0.5.1", optional = true }
+sutegi-repl = { path = "../sutegi-repl", version = "0.5.1", optional = true }
 
 [features]
 # Batteries-included by default; opt out with `default-features = false` and
@@ -38,7 +39,7 @@ sutegi-template = { path = "../sutegi-template", version = "0.5.1", optional = t
 default = ["derive", "orm", "validate", "ai"]
 
 # Each pillar is an independent compile-time feature.
-orm = ["dep:sutegi-orm", "sutegi-web/orm"]               # schema + query builder + Ctx::db/model
+orm = ["dep:sutegi-orm", "sutegi-web/orm", "sutegi-repl?/orm"] # schema + query builder + Ctx::db/model
 validate = ["dep:sutegi-validate", "sutegi-web/validate"] # request / tool validation + Ctx::validate(d)
 queue = ["dep:sutegi-queue"]                              # durable, cross-pod job queue (Postgres-backed)
 events = ["dep:sutegi-events", "orm"]                     # event sourcing: event store + aggregates + projections
@@ -55,6 +56,7 @@ mail = ["dep:sutegi-mail", "template"]                    # Email builder + Tran
 auth-mail = ["auth", "mail", "sutegi-auth/mail"]          # verification-link + password-reset flows
 storage = ["dep:sutegi-storage"]                          # file storage: local fs + S3 presigned URLs
 storage-db = ["storage", "orm", "sutegi-storage/db"]      # blobs in SQLite/Postgres over the Backend seam
+repl = ["dep:sutegi-repl"]                                # tinker-style REPL (data commands light up with `orm`)
 
 [package.metadata.docs.rs]
 all-features = true

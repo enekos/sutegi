@@ -22,6 +22,7 @@ fn main() -> ExitCode {
         "make:model" => cmd_make_model(args.get(1)),
         "make:route" => cmd_make_route(args.get(1)),
         "introspect" => cmd_introspect(args.get(1)),
+        "repl" => cmd_repl(args.get(1)),
         "version" | "--version" | "-V" => {
             println!("sutegi {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -59,6 +60,8 @@ COMMANDS:
     make:route <name>     Generate a route module under src/routes/
     introspect [url]      Fetch and pretty-print a running app's /__introspect
                           (default url: http://127.0.0.1:8080/__introspect)
+    repl [addr]           Interactive REPL against a running app's HTTP surface
+                          (default addr: 127.0.0.1:8080)
     version               Print the version
     help                  Show this help
 "#,
@@ -168,6 +171,18 @@ pub fn register(app: App) -> App {{
 }}
 "#
     )
+}
+
+// ---- repl -------------------------------------------------------------------
+
+/// Attach the tinker REPL to a running app — remote mode drives the app's
+/// public HTTP surface (introspection, routes, tools), no source access needed.
+fn cmd_repl(addr: Option<&String>) -> Result<(), String> {
+    let default = "127.0.0.1:8080".to_string();
+    let addr = addr.unwrap_or(&default);
+    sutegi_repl::Repl::connect(addr)
+        .run()
+        .map_err(|e| e.to_string())
 }
 
 // ---- introspect (tiny HTTP client) ----------------------------------------

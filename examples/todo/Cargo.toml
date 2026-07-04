@@ -16,4 +16,4 @@ path = "src/main.rs"
 [dependencies]
 # This demo uses the runnable SQLite layer + graceful shutdown; the framework
 # core stays zero-dep. (derive/orm/validate/ai/queue come from default features.)
-sutegi = { path = "../../crates/sutegi", features = ["sqlite", "graceful"] }
+sutegi = { path = "../../crates/sutegi", features = ["sqlite", "graceful", "repl"] }

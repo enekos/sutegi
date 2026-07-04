@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "The sutegi command-line tool: scaffold apps, models, and routes; introspect a running app."
+description = "The sutegi command-line tool: scaffold apps, models, and routes; introspect or REPL into a running app."
 
 [[bin]]
 name = "sutegi"
@@ -14,3 +14,5 @@ path = "src/main.rs"
 
 [dependencies]
 sutegi-json = { path = "../sutegi-json", version = "0.5.1" }
+# Remote-only REPL (no `orm`): data lives behind the running app's surface.
+sutegi-repl = { path = "../sutegi-repl", version = "0.5.1" }

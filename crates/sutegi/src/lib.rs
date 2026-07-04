@@ -50,6 +50,8 @@ pub use sutegi_mail as mail;
 pub use sutegi_orm as orm;
 #[cfg(feature = "queue")]
 pub use sutegi_queue as queue;
+#[cfg(feature = "repl")]
+pub use sutegi_repl as repl;
 #[cfg(feature = "session")]
 pub use sutegi_session as session;
 #[cfg(feature = "storage")]
@@ -255,6 +257,8 @@ pub mod prelude {
     };
     #[cfg(feature = "queue")]
     pub use sutegi_queue::{Queue, Workers};
+    #[cfg(feature = "repl")]
+    pub use sutegi_repl::Repl;
     #[cfg(feature = "validate")]
     pub use sutegi_validate::{validate_schema, Rule, Ruleset, Validate, ValidationErrors};
 

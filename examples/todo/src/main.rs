@@ -14,6 +14,9 @@
 //! curl localhost:8080/api/todos/1
 //! curl -X POST localhost:8080/__tools/create_todo -d '{"title":"via agent"}'
 //! ```
+//!
+//! `todo repl` drops into the tinker shell instead of serving — same app,
+//! same db handle: `call create_todo {"title":"hi"}`, `table todos`, `routes`.
 
 use std::time::Duration;
 
@@ -51,8 +54,8 @@ fn main() -> std::io::Result<()> {
     migrations().run(&db).expect("migrate");
 
     let ready = db.clone(); // readiness probe holds its own handle
-    App::new("todo")
-        .state(db)
+    let app = App::new("todo")
+        .state(db.clone())
         .readiness(move || ready.query("SELECT 1", &[]).is_ok())
         .get("/", "Health check.", |_| "sutegi up")
         .get(
@@ -108,8 +111,13 @@ fn main() -> std::io::Result<()> {
                 }
                 sink.event("done", "{}")
             },
-        )
-        .serve()
+        );
+
+    // `todo repl` — tinker with the app in-process instead of serving it.
+    if std::env::args().nth(1).as_deref() == Some("repl") {
+        return Repl::new(app).db(db).run();
+    }
+    app.serve()
 }
 
 /// Group middleware: log every request to the `/api` group, then continue.

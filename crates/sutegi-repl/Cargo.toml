@@ -1,0 +1,27 @@
+[package]
+name = "sutegi-repl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Tinker-style interactive REPL for sutegi apps: drive routes, tools, and data in-process or against a running server."
+
+[dependencies]
+sutegi-json = { path = "../sutegi-json", version = "0.5.1" }
+sutegi-http = { path = "../sutegi-http", version = "0.5.1" }
+sutegi-web = { path = "../sutegi-web", version = "0.5.1" }
+sutegi-orm = { path = "../sutegi-orm", version = "0.5.1", optional = true }
+
+[features]
+default = []
+# Data commands (sql / q / table / count / kv / events / jobs) over an attached
+# `Backend`. Off by default so the remote-only REPL (e.g. the CLI) stays lean.
+orm = ["dep:sutegi-orm"]
+
+[dev-dependencies]
+sutegi-orm = { path = "../sutegi-orm", version = "0.5.1", features = ["sqlite"] }
+# The fixture app validates tool args (exercising the REPL's 422 reporting)
+# and reaches its Db through ToolCtx::db.
+sutegi-web = { path = "../sutegi-web", version = "0.5.1", features = ["validate", "orm"] }
