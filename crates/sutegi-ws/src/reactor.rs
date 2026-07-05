@@ -29,7 +29,7 @@
 //! Broadcasts share one encoded buffer (`Arc`) across all queues, so fanning
 //! a frame to a million sockets allocates it once.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::os::fd::AsRawFd;
@@ -53,6 +53,15 @@ const CLOSE_GRACE: Duration = Duration::from_secs(5);
 /// client cannot starve the rest of the shard (level-triggered polling
 /// re-fires for whatever stays in the kernel buffer).
 const READ_QUANTUM: usize = 128 * 1024;
+/// Cap on frames *parsed* per connection per loop iteration. Bytes alone
+/// don't bound work: a client can pack thousands of tiny control frames into
+/// one read, and answering them all inline (e.g. a PONG per PING) would
+/// starve every other connection on the shard. Past this the connection is
+/// parked on `pending_parse` and resumed round-robin next iteration.
+const FRAMES_PER_WAKE: usize = 256;
+/// Floor the inbound buffer keeps after a burst drains — enough to hold the
+/// next few frames without reallocating, without pinning a large spike.
+const RBUF_FLOOR: usize = 16 * 1024;
 
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -75,6 +84,11 @@ pub struct WsConfig {
     pub max_buffered: usize,
     /// Process-wide connection cap. Default 1_048_576.
     pub max_connections: usize,
+    /// Max concurrent connections from a single source IP (0 = unlimited).
+    /// Bounds single-source connection-exhaustion — one IP can otherwise eat
+    /// the whole `max_connections` pool. Default 1024 (generous enough for a
+    /// shared NAT, tight enough that exhausting the pool needs 1000+ hosts).
+    pub max_connections_per_ip: u32,
     /// Raise `RLIMIT_NOFILE` toward the hard cap at startup. Default true.
     pub raise_nofile: bool,
 }
@@ -89,6 +103,7 @@ impl Default for WsConfig {
             idle_timeout: Duration::from_secs(75),
             max_buffered: 1 << 20,
             max_connections: 1 << 20,
+            max_connections_per_ip: 1024,
             raise_nofile: true,
         }
     }
@@ -108,19 +123,33 @@ pub type OnOpen = Arc<dyn Fn(&Conn, &Request) + Send + Sync>;
 pub type OnMessage = Arc<dyn Fn(&Conn, Msg) + Send + Sync>;
 /// `on_close(conn, close_code)` callback.
 pub type OnClose = Arc<dyn Fn(&Conn, u16) + Send + Sync>;
+/// `authorize(upgrade_request) -> allow` gate, run in the HTTP worker
+/// **before** the `101` is written (unlike `on_open`, which runs after the
+/// upgrade is already committed). This is where cross-site protection lives.
+pub type Authorize = Arc<dyn Fn(&Request) -> bool + Send + Sync>;
 
-/// Per-endpoint callbacks. All optional; all run inline on the shard thread
-/// (see module docs for the threading contract).
+/// Per-endpoint callbacks. `on_*` run inline on the shard thread (see module
+/// docs for the threading contract); `authorize`/`allowed_origins` run in the
+/// HTTP worker during the handshake.
 #[derive(Clone, Default)]
 pub struct Handlers {
     /// Connection adopted. Receives the upgrade [`Request`] (path params,
-    /// headers, cookies) for auth/identity decisions.
+    /// headers, cookies) for identity decisions. Runs *after* the 101 — for
+    /// admission control use `authorize`/`allowed_origins` instead.
     pub on_open: Option<OnOpen>,
     /// A complete text/binary message arrived.
     pub on_message: Option<OnMessage>,
     /// Connection gone (clean close code, or 1006 for a dirty drop). The
     /// handle is already dead: sends from inside `on_close` are no-ops.
     pub on_close: Option<OnClose>,
+    /// If set, the handshake is refused with `403` unless this returns `true`.
+    /// Checked before the 101 so a rejected client never becomes a socket.
+    pub authorize: Option<Authorize>,
+    /// If set, the `Origin` header must be present and exactly match one of
+    /// these — the built-in defense against Cross-Site WebSocket Hijacking
+    /// (a cookie-authenticated socket opened by an attacker's page). Checked
+    /// before `authorize`.
+    pub allowed_origins: Option<Vec<String>>,
 }
 
 /// Pre-encode a text frame for fan-out: `Conn::send_shared` clones only the
@@ -138,16 +167,29 @@ pub fn binary_frame(data: &[u8]) -> Arc<Vec<u8>> {
 // Cross-thread command surface
 // ---------------------------------------------------------------------------
 
+/// Everything needed to take over an upgraded socket. Boxed inside
+/// [`Cmd::Adopt`] so the rare, large adopt payload doesn't bloat the
+/// per-message `Send` variant that dominates the inbox on a broadcast.
+struct AdoptData {
+    stream: TcpStream,
+    leftover: Vec<u8>,
+    handlers: Arc<Handlers>,
+    req: Request,
+    /// Source IP (for per-IP release), already reserved by the runtime.
+    ip: Option<String>,
+}
+
 enum Cmd {
-    Adopt {
-        stream: TcpStream,
-        leftover: Vec<u8>,
-        handlers: Arc<Handlers>,
-        req: Box<Request>,
-    },
+    Adopt(Box<AdoptData>),
     Send {
         token: u32,
         gen: u32,
+        buf: Arc<Vec<u8>>,
+    },
+    /// One frame to many connections on the same shard — a broadcast that
+    /// takes the shard lock once instead of once per target.
+    SendMany {
+        targets: Vec<(u32, u32)>,
         buf: Arc<Vec<u8>>,
     },
     Close {
@@ -205,8 +247,9 @@ impl Conn {
         self.send_shared(&binary_frame(data));
     }
 
-    /// Enqueue a pre-encoded frame (from [`text_frame`]/[`binary_frame`]).
-    /// This is the broadcast fast path: one encode, N queue pushes.
+    /// Enqueue a pre-encoded frame (from [`text_frame`]/[`binary_frame`]) to
+    /// this one connection. To fan a frame out to many, prefer [`broadcast`],
+    /// which takes each shard's lock once instead of once per connection.
     pub fn send_shared(&self, frame: &Arc<Vec<u8>>) {
         self.shard.inject(Cmd::Send {
             token: self.token,
@@ -233,6 +276,104 @@ impl std::fmt::Debug for Conn {
     }
 }
 
+/// Fan one pre-encoded frame out to many connections, grouping targets by
+/// shard so each shard's inbox lock is taken **once** — the difference
+/// between `shards` lock cycles and one-per-connection at a million sockets.
+/// Encode the frame once with [`text_frame`]/[`binary_frame`] and pass it here.
+///
+/// ```ignore
+/// let frame = text_frame(&msg);
+/// broadcast(roster.values(), &frame);   // roster: HashMap<u64, Conn>
+/// ```
+pub fn broadcast<'a, I>(conns: I, frame: &Arc<Vec<u8>>)
+where
+    I: IntoIterator<Item = &'a Conn>,
+{
+    // Group by shard identity (the Arc's pointer), carrying one Arc clone of
+    // the shard per group so we can inject after the grouping pass.
+    type ShardGroup = (Arc<ShardShared>, Vec<(u32, u32)>);
+    let mut by_shard: HashMap<usize, ShardGroup> = HashMap::new();
+    for conn in conns {
+        let key = Arc::as_ptr(&conn.shard) as usize;
+        by_shard
+            .entry(key)
+            .or_insert_with(|| (Arc::clone(&conn.shard), Vec::new()))
+            .1
+            .push((conn.token, conn.gen));
+    }
+    for (_, (shard, targets)) in by_shard {
+        shard.inject(Cmd::SendMany {
+            targets,
+            buf: Arc::clone(frame),
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Admission control
+// ---------------------------------------------------------------------------
+
+/// Global + per-IP admission, shared by the runtime (which *reserves* a slot
+/// before the `101` is written) and the shards (which *release* on teardown).
+/// Reserving up front makes the cap a hard bound: a burst of upgrades can't
+/// overshoot it in the window between an advisory check and a deferred
+/// increment, because the count moves atomically at admission time.
+struct Admission {
+    total: AtomicUsize,
+    max_total: usize,
+    per_ip: Mutex<HashMap<String, u32>>,
+    max_per_ip: u32,
+}
+
+impl Admission {
+    /// Try to reserve one slot for `ip`. Returns false (nothing reserved) if
+    /// the global or per-IP cap is already met.
+    fn reserve(&self, ip: Option<&str>) -> bool {
+        let prev = self.total.fetch_add(1, Ordering::AcqRel);
+        if prev >= self.max_total {
+            self.total.fetch_sub(1, Ordering::AcqRel);
+            return false;
+        }
+        if self.max_per_ip > 0 {
+            if let Some(ip) = ip {
+                let mut map = self.per_ip.lock().unwrap();
+                let n = map.entry(ip.to_string()).or_insert(0);
+                if *n >= self.max_per_ip {
+                    drop(map);
+                    self.total.fetch_sub(1, Ordering::AcqRel);
+                    return false;
+                }
+                *n += 1;
+            }
+        }
+        true
+    }
+
+    /// Release a previously reserved slot.
+    fn release(&self, ip: Option<&str>) {
+        self.total.fetch_sub(1, Ordering::AcqRel);
+        if self.max_per_ip > 0 {
+            if let Some(ip) = ip {
+                let mut map = self.per_ip.lock().unwrap();
+                if let Some(n) = map.get_mut(ip) {
+                    *n -= 1;
+                    if *n == 0 {
+                        map.remove(ip);
+                    }
+                }
+            }
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.total.load(Ordering::Relaxed)
+    }
+
+    fn has_capacity(&self) -> bool {
+        self.total.load(Ordering::Relaxed) < self.max_total
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Runtime
 // ---------------------------------------------------------------------------
@@ -242,8 +383,7 @@ impl std::fmt::Debug for Conn {
 pub struct WsRuntime {
     shards: Vec<Arc<ShardShared>>,
     next_shard: AtomicUsize,
-    conn_count: Arc<AtomicUsize>,
-    cfg: WsConfig,
+    admission: Arc<Admission>,
 }
 
 impl WsRuntime {
@@ -259,7 +399,12 @@ impl WsRuntime {
         } else {
             cfg.shards
         };
-        let conn_count = Arc::new(AtomicUsize::new(0));
+        let admission = Arc::new(Admission {
+            total: AtomicUsize::new(0),
+            max_total: cfg.max_connections,
+            per_ip: Mutex::new(HashMap::new()),
+            max_per_ip: cfg.max_connections_per_ip,
+        });
         let mut shards = Vec::with_capacity(n);
         for i in 0..n {
             let shared = Arc::new(ShardShared {
@@ -275,8 +420,9 @@ impl WsRuntime {
                 slab: Vec::new(),
                 gens: Vec::new(),
                 free: Vec::new(),
+                pending_parse: Vec::new(),
                 cfg: cfg.clone(),
-                conn_count: Arc::clone(&conn_count),
+                admission: Arc::clone(&admission),
                 last_sweep: Instant::now(),
                 scratch: vec![0u8; 64 * 1024],
             };
@@ -288,14 +434,18 @@ impl WsRuntime {
         Ok(Arc::new(WsRuntime {
             shards,
             next_shard: AtomicUsize::new(0),
-            conn_count,
-            cfg,
+            admission,
         }))
     }
 
     /// Hand an upgraded socket to a shard. `leftover` is whatever the HTTP
     /// parser had already buffered past the upgrade request; `req` is the
     /// upgrade request itself, passed to `on_open`.
+    ///
+    /// Reserves the connection slot atomically here — before returning to the
+    /// HTTP worker that wrote the 101 — so the global and per-IP caps are hard
+    /// bounds, not counts a burst can race past. Returns `Err` (and adopts
+    /// nothing) when a cap is met.
     pub fn adopt(
         &self,
         stream: TcpStream,
@@ -303,27 +453,30 @@ impl WsRuntime {
         handlers: Arc<Handlers>,
         req: Request,
     ) -> io::Result<()> {
-        if self.conn_count.load(Ordering::Relaxed) >= self.cfg.max_connections {
+        let ip = req.peer_ip();
+        if !self.admission.reserve(ip.as_deref()) {
             return Err(io::Error::other("connection cap reached"));
         }
         let i = self.next_shard.fetch_add(1, Ordering::Relaxed) % self.shards.len();
-        self.shards[i].inject(Cmd::Adopt {
+        self.shards[i].inject(Cmd::Adopt(Box::new(AdoptData {
             stream,
             leftover,
             handlers,
-            req: Box::new(req),
-        });
+            req,
+            ip,
+        })));
         Ok(())
     }
 
-    /// Live connection count across all shards.
+    /// Live connection count (admitted, not yet released) across all shards.
     pub fn connections(&self) -> usize {
-        self.conn_count.load(Ordering::Relaxed)
+        self.admission.count()
     }
 
-    /// Whether a new connection would currently be admitted.
+    /// Whether a new connection would currently be admitted (advisory: the
+    /// authoritative reservation happens in [`adopt`](Self::adopt)).
     pub fn has_capacity(&self) -> bool {
-        self.conn_count.load(Ordering::Relaxed) < self.cfg.max_connections
+        self.admission.has_capacity()
     }
 }
 
@@ -356,6 +509,8 @@ struct ConnState {
     last_activity: Instant,
     awaiting_pong: bool,
     handlers: Arc<Handlers>,
+    /// Source IP, for releasing the per-IP reservation on teardown.
+    peer: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -370,8 +525,12 @@ struct Shard {
     /// queued commands) for a reused slot are recognized and dropped.
     gens: Vec<u32>,
     free: Vec<u32>,
+    /// Connections that hit the per-wakeup frame cap with bytes still
+    /// buffered — resumed round-robin next iteration so no single peer can
+    /// monopolize the shard thread.
+    pending_parse: Vec<u32>,
     cfg: WsConfig,
-    conn_count: Arc<AtomicUsize>,
+    admission: Arc<Admission>,
     last_sweep: Instant,
     scratch: Vec<u8>,
 }
@@ -380,7 +539,14 @@ impl Shard {
     fn run(mut self) {
         let mut events = Vec::with_capacity(1024);
         loop {
-            if let Err(e) = self.poller.wait(&mut events, Duration::from_secs(1)) {
+            // Don't block for a second when connections are mid-parse waiting
+            // to resume (frame-cap fairness) — poll and come straight back.
+            let timeout = if self.pending_parse.is_empty() {
+                Duration::from_secs(1)
+            } else {
+                Duration::ZERO
+            };
+            if let Err(e) = self.poller.wait(&mut events, timeout) {
                 // A failing poller is unrecoverable for this shard; don't
                 // spin at 100% CPU on a persistent error.
                 eprintln!("sutegi-ws: poller error: {e}");
@@ -403,6 +569,14 @@ impl Shard {
             }
             events = batch;
             self.drain_inbox();
+            // Resume connections parked by the per-wakeup frame cap. One pass
+            // per loop = round-robin fairness; re-parking is fine.
+            if !self.pending_parse.is_empty() {
+                let todo = std::mem::take(&mut self.pending_parse);
+                for token in todo {
+                    self.parse_frames(token);
+                }
+            }
             self.tick();
         }
     }
@@ -418,15 +592,17 @@ impl Shard {
         };
         for cmd in cmds {
             match cmd {
-                Cmd::Adopt {
-                    stream,
-                    leftover,
-                    handlers,
-                    req,
-                } => self.adopt(stream, leftover, handlers, *req),
+                Cmd::Adopt(data) => self.adopt(*data),
                 Cmd::Send { token, gen, buf } => {
                     if self.live(token, gen) {
                         self.enqueue(token, buf);
+                    }
+                }
+                Cmd::SendMany { targets, buf } => {
+                    for (token, gen) in targets {
+                        if self.live(token, gen) {
+                            self.enqueue(token, Arc::clone(&buf));
+                        }
                     }
                 }
                 Cmd::Close {
@@ -458,17 +634,18 @@ impl Shard {
         }
     }
 
-    fn adopt(
-        &mut self,
-        stream: TcpStream,
-        leftover: Vec<u8>,
-        handlers: Arc<Handlers>,
-        req: Request,
-    ) {
-        if self.conn_count.load(Ordering::Relaxed) >= self.cfg.max_connections {
-            return; // admission is also checked pre-101; this is the backstop
-        }
+    fn adopt(&mut self, data: AdoptData) {
+        let AdoptData {
+            stream,
+            leftover,
+            handlers,
+            req,
+            ip,
+        } = data;
+        // The slot was already reserved by `WsRuntime::adopt`; any early
+        // return here must release it or the count leaks.
         if stream.set_nonblocking(true).is_err() {
+            self.admission.release(ip.as_deref());
             return;
         }
         let _ = stream.set_nodelay(true);
@@ -487,6 +664,7 @@ impl Shard {
             .is_err()
         {
             self.free.push(token);
+            self.admission.release(ip.as_deref());
             return;
         }
         let state = ConnState {
@@ -502,9 +680,9 @@ impl Shard {
             last_activity: Instant::now(),
             awaiting_pong: false,
             handlers,
+            peer: ip,
         };
         self.slab[token as usize] = Some(state);
-        self.conn_count.fetch_add(1, Ordering::Relaxed);
 
         let conn = self.conn_handle(token);
         let handlers = Arc::clone(&self.slab[token as usize].as_ref().unwrap().handlers);
@@ -564,15 +742,24 @@ impl Shard {
     fn parse_frames(&mut self, token: u32) {
         let t = token as usize;
         let mut consumed = 0usize;
+        let mut frames = 0usize;
+        // Set when we stop with parseable bytes still buffered (frame cap hit)
+        // — the connection is parked and resumed next loop for fairness.
+        let mut more = false;
         loop {
             let state = match self.slab[t].as_mut() {
                 Some(s) => s,
                 None => return, // removed by a handler mid-loop
             };
+            if frames >= FRAMES_PER_WAKE {
+                more = consumed < state.rbuf.len();
+                break;
+            }
             match decode_frame(&state.rbuf[consumed..], self.cfg.max_frame) {
                 Ok(None) => break,
                 Ok(Some((frame, used))) => {
                     consumed += used;
+                    frames += 1;
                     self.handle_frame(token, frame);
                 }
                 Err(err) => {
@@ -585,9 +772,13 @@ impl Shard {
             if consumed > 0 {
                 state.rbuf.drain(..consumed);
             }
-            // Don't let a burst permanently pin per-connection memory.
-            if state.rbuf.is_empty() && state.rbuf.capacity() > 16 * 1024 {
-                state.rbuf = Vec::new();
+            // Reclaim a large post-burst buffer, but keep a working floor so
+            // steady traffic doesn't free-and-regrow every read.
+            if state.rbuf.len() < RBUF_FLOOR && state.rbuf.capacity() > RBUF_FLOOR {
+                state.rbuf.shrink_to(RBUF_FLOOR);
+            }
+            if more {
+                self.pending_parse.push(token);
             }
         }
     }
@@ -755,9 +946,6 @@ impl Shard {
                     let fd = state.stream.as_raw_fd();
                     let _ = self.poller.set_write(fd, t, false);
                 }
-                if state.out.capacity() > 64 {
-                    state.out.shrink_to_fit();
-                }
                 return;
             };
             match (&state.stream).write(&front.buf[front.pos..]) {
@@ -805,7 +993,7 @@ impl Shard {
         self.free.push(token);
         let _ = self.poller.del(state.stream.as_raw_fd());
         drop(state.stream); // close(2): kqueue/epoll deregister with the fd
-        self.conn_count.fetch_sub(1, Ordering::Relaxed);
+        self.admission.release(state.peer.as_deref());
         if let Some(on_close) = &state.handlers.on_close {
             let _ =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_close(&conn, code)));
@@ -851,6 +1039,32 @@ impl Shard {
                 }
                 self.enqueue(token, Arc::clone(&frame));
             }
+        }
+        self.reclaim_slab();
+    }
+
+    /// Give back the trailing free slots so a shard that spiked to a million
+    /// connections and drained doesn't keep hundreds of MB of empty slab (and
+    /// a million-entry sweep) forever. Only touches the free tail — live slots
+    /// keep their tokens, so in-flight `Conn` handles stay valid. A truncated
+    /// slot that later regrows restarts at generation 0, which can only be
+    /// aliased by a stale handle whose gen is also 0 — impossible, since any
+    /// freed slot was removed at least once and so has gen ≥ 1.
+    fn reclaim_slab(&mut self) {
+        let mut new_len = self.slab.len();
+        while new_len > 0 && self.slab[new_len - 1].is_none() {
+            new_len -= 1;
+        }
+        if new_len == self.slab.len() {
+            return;
+        }
+        self.slab.truncate(new_len);
+        self.gens.truncate(new_len);
+        self.free.retain(|&t| (t as usize) < new_len);
+        // Only pay the reallocation when the win is large.
+        if self.slab.capacity() > 4 * new_len.max(1) {
+            self.slab.shrink_to_fit();
+            self.gens.shrink_to_fit();
         }
     }
 }

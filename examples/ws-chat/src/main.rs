@@ -12,17 +12,18 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use sutegi::prelude::*;
+use sutegi::ws::broadcast;
 
 /// name + handle per live connection. `Conn` is cheap to clone and safe to
 /// use from any thread, so a plain map is the whole "presence" story here.
 static ROSTER: Mutex<Option<HashMap<u64, (String, Conn)>>> = Mutex::new(None);
 
-fn broadcast(text: &str) {
+/// Fan a line out to the whole room. `broadcast` encodes once and takes each
+/// shard's lock once — the right primitive even when the room is large.
+fn say(text: &str) {
     let frame = text_frame(text);
     if let Some(roster) = ROSTER.lock().unwrap().as_ref() {
-        for (_, conn) in roster.values() {
-            conn.send_shared(&frame);
-        }
+        broadcast(roster.values().map(|(_, conn)| conn), &frame);
     }
 }
 
@@ -34,6 +35,11 @@ fn main() -> std::io::Result<()> {
         .ws(
             "/ws",
             "Chat socket. Pass ?name=<nick>; every text message is broadcast to the room.",
+            // Public, cookieless demo, so no origin gate. An app that
+            // authenticates the socket by cookie MUST add one or it's open to
+            // cross-site hijacking: `.check_origin(["https://app.example.com"])`
+            // (or `.authorize(|req| ...)` for a token check) — both refuse
+            // before the 101.
             Ws::new()
                 .on_open(|conn: &Conn, req: &Request| {
                     let name = req
@@ -45,7 +51,7 @@ fn main() -> std::io::Result<()> {
                     if let Some(roster) = ROSTER.lock().unwrap().as_mut() {
                         roster.insert(conn.id(), (name.clone(), conn.clone()));
                     }
-                    broadcast(&format!("* {name} joined"));
+                    say(&format!("* {name} joined"));
                 })
                 .on_message(|conn: &Conn, msg: Msg| {
                     if let Msg::Text(text) = msg {
@@ -55,7 +61,7 @@ fn main() -> std::io::Result<()> {
                             .as_ref()
                             .and_then(|r| r.get(&conn.id()).map(|(n, _)| n.clone()))
                             .unwrap_or_else(|| "anon".into());
-                        broadcast(&format!("{name}: {text}"));
+                        say(&format!("{name}: {text}"));
                     }
                 })
                 .on_close(|conn: &Conn, _code| {
@@ -66,7 +72,7 @@ fn main() -> std::io::Result<()> {
                         .and_then(|r| r.remove(&conn.id()))
                         .map(|(n, _)| n);
                     if let Some(name) = name {
-                        broadcast(&format!("* {name} left"));
+                        say(&format!("* {name} left"));
                     }
                 }),
         )
