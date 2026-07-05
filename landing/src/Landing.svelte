@@ -415,7 +415,8 @@ App::new("api")
     <div class="flex items-center gap-2 sm:gap-3">
       <a href="#features" class="hidden sm:inline-flex px-4 py-2 text-sm text-[#a0a0b0] hover:text-white transition-colors">Features</a>
       <a href="#quickstart" class="hidden sm:inline-flex px-4 py-2 text-sm text-[#a0a0b0] hover:text-white transition-colors">Quick start</a>
-      <a href="#docs" class="hidden sm:inline-flex px-4 py-2 text-sm text-[#a0a0b0] hover:text-white transition-colors">Docs</a>
+      <a href="#docs" class="hidden sm:inline-flex px-4 py-2 text-sm text-[#a0a0b0] hover:text-white transition-colors">Tutorial</a>
+      <a href="#/docs" class="hidden sm:inline-flex px-4 py-2 text-sm text-[#a0a0b0] hover:text-white transition-colors">Docs</a>
       <a href="https://github.com/enekos/sutegi" target="_blank" rel="noopener" class="px-3 sm:px-4 py-2 border border-white/10 rounded-full text-white hover:bg-white/10 hover:border-[#ff6a3d]/50 transition-all duration-300 text-xs sm:text-sm flex items-center gap-2">
         <GitBranch size={14} /> GitHub
       </a>
