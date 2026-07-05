@@ -29,6 +29,8 @@ use sutegi::orm::db::Db;
 use sutegi::orm::{QueryBuilder, UpdateBuilder, Value};
 use sutegi::prelude::*;
 use sutegi::validate::{validate_schema, Rule, Ruleset};
+use sutegi::ws::protocol::{decode_frame, encode_frame, Opcode};
+use sutegi::ws::accept_key;
 
 const ADDR: &str = "127.0.0.1:18099";
 
@@ -283,7 +285,83 @@ fn main() {
         keep(http_post("/__tools/echo", r#"{"msg":"hi"}"#));
     });
 
+    // --- WebSockets: RFC 6455 codec (pure) + full reactor round-trip ---
+    let small = masked_ws_frame(0x1, b"hello sutegi ws bench!");
+    bench(&mut suite, "ws_decode_small", || {
+        keep(decode_frame(&small, 1 << 20).unwrap().unwrap());
+    });
+    // 16 KiB frame: dominated by the u64-chunk unmask, i.e. memory speed.
+    let big = masked_ws_frame(0x2, &vec![0xA7u8; 16 * 1024]);
+    bench(&mut suite, "ws_decode_16k", || {
+        keep(decode_frame(&big, 1 << 20).unwrap().unwrap());
+    });
+    bench(&mut suite, "ws_encode_small", || {
+        keep(encode_frame(Opcode::Text, b"hello sutegi ws bench!", true));
+    });
+    bench(&mut suite, "ws_accept_key", || {
+        keep(accept_key("dGhlIHNhbXBsZSBub25jZQ=="));
+    });
+    // Full path: masked frame over a live upgraded socket -> HTTP-detached
+    // reactor shard -> decode -> handler -> encode -> write -> read echo.
+    // One persistent connection, reused across iterations.
+    {
+        let mut ws = ws_connect("/ws");
+        let payload = b"ping-round-trip";
+        let frame = masked_ws_frame(0x1, payload);
+        let mut echo = vec![0u8; 2 + payload.len()];
+        bench(&mut suite, "e2e_ws_echo", move || {
+            ws.write_all(&frame).unwrap();
+            ws.read_exact(&mut echo).unwrap();
+            keep(echo[0]);
+        });
+    }
+
     suite.emit_stdout();
+}
+
+/// A masked (client-side) WebSocket frame, as a browser would put on the wire.
+fn masked_ws_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+    let mask = [0x12u8, 0x34, 0x56, 0x78];
+    let mut out = vec![0x80 | opcode];
+    match payload.len() {
+        n if n <= 125 => out.push(0x80 | n as u8),
+        n if n <= 65535 => {
+            out.push(0x80 | 126);
+            out.extend_from_slice(&(n as u16).to_be_bytes());
+        }
+        n => {
+            out.push(0x80 | 127);
+            out.extend_from_slice(&(n as u64).to_be_bytes());
+        }
+    }
+    out.extend_from_slice(&mask);
+    out.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i & 3]));
+    out
+}
+
+/// Open a WebSocket against the bench server: TCP connect + RFC 6455 upgrade.
+fn ws_connect(path: &str) -> TcpStream {
+    let mut stream = TcpStream::connect(ADDR).expect("ws connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: bench\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    )
+    .unwrap();
+    // Read the 101 head byte-wise up to the blank line (no over-read).
+    let mut last4 = [0u8; 4];
+    let mut b = [0u8; 1];
+    loop {
+        stream.read_exact(&mut b).expect("ws handshake head");
+        last4.rotate_left(1);
+        last4[3] = b[0];
+        if &last4 == b"\r\n\r\n" {
+            return stream;
+        }
+    }
 }
 
 /// An app with `n` distinct parameterized routes, for router benches.
@@ -322,6 +400,16 @@ fn spawn_server() {
                 Ok::<_, Error>(json(200, &body))
             })
             // An echo tool so e2e_tool_call exercises the AI invoke + validate path.
+            // WS echo endpoint for the e2e_ws_echo reactor round-trip bench.
+            .ws(
+                "/ws",
+                "Echo socket for ws benches.",
+                Ws::new().on_message(|conn: &Conn, msg: Msg| {
+                    if let Msg::Text(t) = msg {
+                        conn.send_text(&t);
+                    }
+                }),
+            )
             .tool(
                 "echo",
                 "Echo a message back.",

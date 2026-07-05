@@ -17,7 +17,7 @@ path = "src/main.rs"
 [dependencies]
 # The framework under test, with the runnable SQLite layer for DB benches and
 # the pure-std Postgres driver for the (env-gated) pg_* benches.
-sutegi = { path = "../crates/sutegi", features = ["sqlite", "postgres"] }
+sutegi = { path = "../crates/sutegi", features = ["sqlite", "postgres", "ws"] }
 # aatxe statistical microbench SDK (adaptive sampling, CV-gated, JSON RunReport).
 aatxe-bench = { path = "../../aatxe/sdk/rust" }
 
