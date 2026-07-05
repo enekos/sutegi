@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sutegi_http::{Method, Request};
-use sutegi_ws::{text_frame, Conn, Handlers, Msg, WsConfig, WsRuntime};
+use sutegi_ws::{broadcast, text_frame, Conn, Handlers, Msg, WsConfig, WsRuntime};
 
 // ---- client-side wire helpers ----------------------------------------------
 
@@ -122,6 +122,7 @@ fn echo_roundtrip_and_open_close_callbacks() {
             let closed = Arc::clone(&closed_code);
             move |_conn: &Conn, code: u16| closed.store(code, Ordering::SeqCst)
         })),
+        ..Handlers::default()
     };
     let (rt, mut client) = connect_pair(handlers, test_config());
     wait_for("open", || opened.load(Ordering::SeqCst) == 1);
@@ -381,4 +382,144 @@ fn handler_panic_does_not_kill_the_shard() {
     let (op, payload) = read_frame(&mut client);
     assert_eq!(op, 0x1);
     assert_eq!(payload, b"ok:still here");
+}
+
+/// An upgrade request carrying a source address (`ip:port`), so admission can
+/// enforce the per-IP cap.
+fn upgrade_request_from(peer: &str) -> Request {
+    Request {
+        peer: Some(peer.to_string()),
+        ..upgrade_request()
+    }
+}
+
+#[test]
+fn broadcast_batches_across_a_shard() {
+    // The batched `broadcast` free fn must reach every connection (this is the
+    // shard-lock-once fan-out path, distinct from per-conn send_shared).
+    let roster: Arc<Mutex<Vec<Conn>>> = Arc::new(Mutex::new(Vec::new()));
+    let handlers = Handlers {
+        on_open: Some(Arc::new({
+            let roster = Arc::clone(&roster);
+            move |conn: &Conn, _req: &Request| roster.lock().unwrap().push(conn.clone())
+        })),
+        ..Handlers::default()
+    };
+    let rt = WsRuntime::start(WsConfig {
+        shards: 2,
+        raise_nofile: false,
+        ..WsConfig::default()
+    })
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handlers = Arc::new(handlers);
+    let mut clients = Vec::new();
+    for _ in 0..12 {
+        let client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let (server, _) = listener.accept().unwrap();
+        rt.adopt(server, Vec::new(), Arc::clone(&handlers), upgrade_request())
+            .unwrap();
+        clients.push(client);
+    }
+    wait_for("all opened", || roster.lock().unwrap().len() == 12);
+
+    let frame = text_frame("all-shards");
+    broadcast(roster.lock().unwrap().iter(), &frame);
+    for client in &mut clients {
+        let (op, payload) = read_frame(client);
+        assert_eq!(op, 0x1);
+        assert_eq!(payload, b"all-shards");
+    }
+}
+
+#[test]
+fn per_ip_cap_refuses_beyond_limit() {
+    let rt = WsRuntime::start(WsConfig {
+        shards: 1,
+        raise_nofile: false,
+        max_connections_per_ip: 2,
+        ..WsConfig::default()
+    })
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handlers = Arc::new(Handlers::default());
+
+    // Keep the client sockets alive: dropping one would tear the connection
+    // down and release its reservation, hiding the cap.
+    let mut clients = Vec::new();
+    let mut adopt_from = |peer: &str| {
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let r = rt.adopt(
+            server,
+            Vec::new(),
+            Arc::clone(&handlers),
+            upgrade_request_from(peer),
+        );
+        clients.push(client);
+        r
+    };
+
+    // Two from the same IP are admitted; the third is refused.
+    assert!(adopt_from("10.0.0.1:1000").is_ok());
+    assert!(adopt_from("10.0.0.1:1001").is_ok());
+    assert!(adopt_from("10.0.0.1:1002").is_err());
+    // A different IP is unaffected.
+    assert!(adopt_from("10.0.0.2:1000").is_ok());
+}
+
+#[test]
+fn global_cap_reserved_before_adopt() {
+    let rt = WsRuntime::start(WsConfig {
+        shards: 1,
+        raise_nofile: false,
+        max_connections: 1,
+        ..WsConfig::default()
+    })
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handlers = Arc::new(Handlers::default());
+    let mut clients = Vec::new();
+    let mut adopt = || {
+        let c = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let r = rt.adopt(server, Vec::new(), Arc::clone(&handlers), upgrade_request());
+        clients.push(c);
+        r
+    };
+    // The reservation is synchronous with adopt, so the cap is exact — no
+    // dependence on shard-drain timing.
+    assert!(adopt().is_ok());
+    assert!(adopt().is_err());
+}
+
+#[test]
+fn frame_cap_does_not_drop_frames() {
+    // Far more frames than FRAMES_PER_WAKE (256) in one burst: the shard
+    // parks the connection mid-parse and resumes it, so every frame is still
+    // delivered — nothing is lost to the fairness cap.
+    let count = Arc::new(AtomicUsize::new(0));
+    let handlers = Handlers {
+        on_message: Some(Arc::new({
+            let count = Arc::clone(&count);
+            move |_conn: &Conn, _msg: Msg| {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+        })),
+        ..Handlers::default()
+    };
+    let (_rt, mut client) = connect_pair(handlers, test_config());
+    let n = 1000;
+    let mut burst = Vec::new();
+    for i in 0..n {
+        burst.extend_from_slice(&client_frame(0x1, format!("f{i}").as_bytes(), true));
+    }
+    client.write_all(&burst).unwrap();
+    wait_for("all frames processed", || count.load(Ordering::SeqCst) == n);
 }

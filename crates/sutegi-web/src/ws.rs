@@ -51,6 +51,29 @@ impl Ws {
         self.handlers.on_close = Some(Arc::new(f));
         self
     }
+
+    /// Reject the handshake with `403` unless `f(&Request)` returns `true`.
+    /// Runs in the HTTP worker **before** the `101`, so a refused client never
+    /// becomes a socket — the place to check tokens, cookies, or a custom
+    /// origin policy. (`on_open`, by contrast, runs only after the upgrade is
+    /// already committed.)
+    pub fn authorize(mut self, f: impl Fn(&Request) -> bool + Send + Sync + 'static) -> Ws {
+        self.handlers.authorize = Some(Arc::new(f));
+        self
+    }
+
+    /// Restrict the handshake to these exact `Origin` values — the built-in
+    /// guard against Cross-Site WebSocket Hijacking. A browser always sends
+    /// `Origin`; with an allowlist set, a missing or non-matching one is
+    /// refused with `403`. Omit only for non-browser / public endpoints.
+    pub fn check_origin<I, S>(mut self, origins: I) -> Ws
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.handlers.allowed_origins = Some(origins.into_iter().map(Into::into).collect());
+        self
+    }
 }
 
 /// Validate an RFC 6455 client handshake and produce the `101` upgrade
@@ -81,6 +104,22 @@ pub(crate) fn upgrade_response(
     else {
         return Response::new(400).with_body(&b"missing Sec-WebSocket-Key"[..]);
     };
+    // Cross-site protection, before the 101: an allowlisted Origin must be
+    // present and match, then the custom authorize gate (if any) must pass.
+    if let Some(allowed) = &handlers.allowed_origins {
+        let ok = req
+            .header("origin")
+            .map(|o| allowed.iter().any(|a| a == o))
+            .unwrap_or(false);
+        if !ok {
+            return Response::new(403).with_body(&b"origin not allowed"[..]);
+        }
+    }
+    if let Some(authorize) = &handlers.authorize {
+        if !authorize(req) {
+            return Response::new(403).with_body(&b"forbidden"[..]);
+        }
+    }
     if !runtime.has_capacity() {
         // Refuse before the 101 so the client sees a clean HTTP error and
         // can back off / be routed elsewhere.
@@ -97,4 +136,121 @@ pub(crate) fn upgrade_response(
     .with_header("upgrade", "websocket")
     .with_header("connection", "Upgrade")
     .with_header("sec-websocket-accept", &accept)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sutegi_http::Method;
+    use sutegi_ws::Handlers;
+
+    fn ws_request(headers: &[(&str, &str)]) -> Request {
+        Request {
+            method: Method::Get,
+            path: "/ws".into(),
+            query: String::new(),
+            version: "HTTP/1.1".into(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            body: Vec::new(),
+            peer: Some("203.0.113.7:5000".into()),
+        }
+    }
+
+    const BASE: &[(&str, &str)] = &[
+        ("upgrade", "websocket"),
+        ("connection", "Upgrade"),
+        ("sec-websocket-version", "13"),
+        ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+    ];
+
+    fn with_extra(extra: &[(&str, &str)]) -> Request {
+        let mut h = BASE.to_vec();
+        h.extend_from_slice(extra);
+        ws_request(&h)
+    }
+
+    fn runtime() -> Arc<WsRuntime> {
+        WsRuntime::start(WsConfig {
+            shards: 1,
+            raise_nofile: false,
+            ..WsConfig::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn origin_allowlist_gates_before_the_101() {
+        let rt = runtime();
+        let handlers = Arc::new(Handlers {
+            allowed_origins: Some(vec!["https://app.example.com".into()]),
+            ..Handlers::default()
+        });
+
+        // Matching origin → 101 upgrade.
+        let ok = upgrade_response(
+            &with_extra(&[("origin", "https://app.example.com")]),
+            &rt,
+            &handlers,
+        );
+        assert_eq!(ok.status, 101);
+        assert!(ok.is_upgrade());
+
+        // Foreign origin (CSWSH attempt) → 403, no upgrade.
+        let bad = upgrade_response(
+            &with_extra(&[("origin", "https://evil.example")]),
+            &rt,
+            &handlers,
+        );
+        assert_eq!(bad.status, 403);
+        assert!(!bad.is_upgrade());
+
+        // Missing origin with an allowlist set → 403.
+        let none = upgrade_response(&with_extra(&[]), &rt, &handlers);
+        assert_eq!(none.status, 403);
+    }
+
+    #[test]
+    fn authorize_hook_can_reject() {
+        let rt = runtime();
+        let handlers = Arc::new(Handlers {
+            authorize: Some(Arc::new(|req: &Request| {
+                req.header("authorization") == Some("Bearer good")
+            })),
+            ..Handlers::default()
+        });
+        let ok = upgrade_response(
+            &with_extra(&[("authorization", "Bearer good")]),
+            &rt,
+            &handlers,
+        );
+        assert_eq!(ok.status, 101);
+        let bad = upgrade_response(
+            &with_extra(&[("authorization", "Bearer bad")]),
+            &rt,
+            &handlers,
+        );
+        assert_eq!(bad.status, 403);
+    }
+
+    #[test]
+    fn bad_handshakes_still_refused() {
+        let rt = runtime();
+        let handlers = Arc::new(Handlers::default());
+        // Missing upgrade headers.
+        assert_eq!(
+            upgrade_response(&ws_request(&[]), &rt, &handlers).status,
+            400
+        );
+        // Wrong version (only version 8 present, not 13).
+        let wrong_version = ws_request(&[
+            ("upgrade", "websocket"),
+            ("connection", "Upgrade"),
+            ("sec-websocket-version", "8"),
+            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ]);
+        assert_eq!(upgrade_response(&wrong_version, &rt, &handlers).status, 426);
+    }
 }

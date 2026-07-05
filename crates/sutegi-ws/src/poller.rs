@@ -275,11 +275,10 @@ pub fn raise_nofile_limit() -> u64 {
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 {
             return 0;
         }
-        let mut target = rl.rlim_max;
+        // macOS refuses rlim_cur = RLIM_INFINITY; its true per-process
+        // ceiling is kern.maxfilesperproc, so clamp to it there.
         #[cfg(target_os = "macos")]
-        {
-            // macOS refuses rlim_cur = RLIM_INFINITY; the true per-process
-            // ceiling is kern.maxfilesperproc.
+        let target = {
             let mut maxfiles: libc::c_int = 0;
             let mut len = std::mem::size_of::<libc::c_int>();
             let name = std::ffi::CString::new("kern.maxfilesperproc").unwrap();
@@ -292,9 +291,13 @@ pub fn raise_nofile_limit() -> u64 {
             ) == 0
                 && maxfiles > 0
             {
-                target = target.min(maxfiles as libc::rlim_t);
+                rl.rlim_max.min(maxfiles as libc::rlim_t)
+            } else {
+                rl.rlim_max
             }
-        }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let target = rl.rlim_max;
         let attempt = libc::rlimit {
             rlim_cur: target,
             rlim_max: rl.rlim_max,
