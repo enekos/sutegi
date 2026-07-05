@@ -129,9 +129,18 @@ impl Request {
 /// closes).
 pub type StreamProducer = Box<dyn FnOnce(&mut dyn Write) -> io::Result<()> + Send + 'static>;
 
+/// Takeover closure for a protocol upgrade (WebSocket): receives the raw
+/// socket plus any bytes the client pipelined after its upgrade request that
+/// the request parser had already buffered. The closure MUST NOT block — it
+/// should hand the socket to an event loop and return, freeing this worker
+/// thread. That handoff is what lets one process hold hundreds of thousands
+/// of live sockets while the HTTP side stays thread-per-connection.
+pub type UpgradeTakeover = Box<dyn FnOnce(TcpStream, Vec<u8>) + Send + 'static>;
+
 pub enum Body {
     Full(Vec<u8>),
     Stream(StreamProducer),
+    Upgrade(UpgradeTakeover),
 }
 
 /// An HTTP response.
@@ -171,9 +180,25 @@ impl Response {
         self
     }
 
+    /// A `101 Switching Protocols` response: the server writes the status
+    /// line + `headers`, then detaches the connection from the HTTP loop and
+    /// hands the raw socket (plus any already-buffered bytes) to `takeover`.
+    pub fn upgrade(takeover: impl FnOnce(TcpStream, Vec<u8>) + Send + 'static) -> Response {
+        Response {
+            status: 101,
+            headers: Vec::new(),
+            body: Body::Upgrade(Box::new(takeover)),
+        }
+    }
+
     /// Whether this response streams (no `Content-Length`).
     pub fn is_stream(&self) -> bool {
         matches!(self.body, Body::Stream(_))
+    }
+
+    /// Whether this response upgrades the connection (`Body::Upgrade`).
+    pub fn is_upgrade(&self) -> bool {
+        matches!(self.body, Body::Upgrade(_))
     }
 }
 
@@ -461,7 +486,37 @@ pub fn write_response<W: Write>(w: &mut W, resp: Response, keep_alive: bool) -> 
             w.flush()?;
             producer(w)
         }
+        // Upgrades need the raw `TcpStream`, which only the server loop has:
+        // `handle_connection` intercepts them before ever calling this
+        // function. Reaching this arm means an upgrade response was written
+        // to a plain writer (a test, a proxy layer) — emit the head so the
+        // output is still valid HTTP, and drop the takeover.
+        Body::Upgrade(_) => {
+            head.push_str("\r\n");
+            w.write_all(head.as_bytes())?;
+            w.flush()
+        }
     }
+}
+
+/// Write the head of an upgrade response: status line + headers + blank line,
+/// with no content-type/length/connection defaults injected (RFC 6455 clients
+/// reject a 101 carrying unexpected framing headers).
+fn write_upgrade_head<W: Write>(
+    w: &mut W,
+    status: u16,
+    headers: &[(String, String)],
+) -> io::Result<()> {
+    let mut head = format!("HTTP/1.1 {} {}\r\n", status, status_reason(status));
+    for (k, v) in headers {
+        head.push_str(k);
+        head.push_str(": ");
+        head.push_str(v);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
+    w.write_all(head.as_bytes())?;
+    w.flush()
 }
 
 /// Whether the client asked to keep the connection open: HTTP/1.1 defaults to
@@ -479,6 +534,8 @@ fn wants_keep_alive(req: &Request) -> bool {
 /// Map a status code to its canonical reason phrase.
 pub fn status_reason(status: u16) -> &'static str {
     match status {
+        100 => "Continue",
+        101 => "Switching Protocols",
         200 => "OK",
         201 => "Created",
         202 => "Accepted",
@@ -503,6 +560,7 @@ pub fn status_reason(status: u16) -> &'static str {
         503 => "Service Unavailable",
         504 => "Gateway Timeout",
         // Fall back to a class-appropriate phrase rather than a misleading "OK".
+        s if (100..200).contains(&s) => "Informational",
         s if (200..300).contains(&s) => "OK",
         s if (300..400).contains(&s) => "Redirect",
         s if (400..500).contains(&s) => "Client Error",
@@ -621,6 +679,21 @@ where
                     .unwrap_or_else(|_| {
                         Response::new(500).with_body(&b"500 Internal Server Error"[..])
                     });
+                if let Body::Upgrade(takeover) = resp.body {
+                    // Protocol upgrade: write the 101 head, then detach. Any
+                    // bytes the client pipelined after its request (e.g. the
+                    // first WebSocket frames) are sitting in the parser's
+                    // buffer — recover them so the new protocol sees them.
+                    write_upgrade_head(&mut writer, resp.status, &resp.headers)?;
+                    let leftover = reader.buffer().to_vec();
+                    drop(reader); // closes the try_clone'd read handle
+                                  // Upgraded sockets are event-loop-managed; per-op
+                                  // timeouts belong to the blocking HTTP path.
+                    let _ = writer.set_read_timeout(None);
+                    let _ = writer.set_write_timeout(None);
+                    takeover(writer, leftover);
+                    return Ok(());
+                }
                 let persist = keep && !resp.is_stream() && served + 1 < limits.keep_alive_max;
                 write_response(&mut writer, resp, persist)?;
                 if !persist {
@@ -994,6 +1067,58 @@ mod tests {
         let mut rest = Vec::new();
         stream.read_to_end(&mut rest).unwrap();
         assert!(String::from_utf8_lossy(&rest).contains("connection: close"));
+
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn upgrade_detaches_socket_with_pipelined_bytes() {
+        use std::io::Read;
+        let addr = "127.0.0.1:18462";
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&shutdown);
+        let server = thread::spawn(move || {
+            serve_until(
+                addr,
+                2,
+                Limits::default(),
+                |_req| {
+                    Response::upgrade(|mut stream, leftover| {
+                        // Echo whatever the client pipelined behind the
+                        // request, then speak the "new protocol" directly.
+                        let _ = stream.write_all(b"echo:");
+                        let _ = stream.write_all(&leftover);
+                        let _ = stream.write_all(b":done");
+                    })
+                    .with_header("upgrade", "test-proto")
+                    .with_header("connection", "Upgrade")
+                },
+                flag,
+            )
+        });
+        for _ in 0..100 {
+            if TcpStream::connect(addr).is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        // Upgrade request with bytes of the next protocol pipelined behind it.
+        stream
+            .write_all(b"GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: test-proto\r\n\r\nHELLO")
+            .unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).unwrap();
+        let s = String::from_utf8_lossy(&buf);
+        assert!(s.starts_with("HTTP/1.1 101 "), "got: {s}");
+        assert!(s.contains("upgrade: test-proto\r\n"));
+        // No framing headers on a 101.
+        assert!(!s.to_lowercase().contains("content-length"));
+        assert!(!s.to_lowercase().contains("content-type"));
+        // The pipelined bytes reached the takeover closure intact.
+        assert!(s.ends_with("echo:HELLO:done"), "got: {s}");
 
         shutdown.store(true, Ordering::Relaxed);
         server.join().unwrap().unwrap();

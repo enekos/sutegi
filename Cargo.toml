@@ -7,6 +7,7 @@ members = [
     "crates/sutegi-orm",
     "crates/sutegi-crypto",
     "crates/sutegi-pg",
+    "crates/sutegi-ws",
     "crates/sutegi-storage",
     "crates/sutegi-validate",
     "crates/sutegi-queue",
@@ -29,6 +30,8 @@ members = [
     "examples/storage",
     "examples/events",
     "examples/redactor",
+    "examples/ws-chat",
+    "examples/ws-load",
 ]
 # Standalone tooling workspaces, each excluded so normal builds / tests /
 # publish never touch them and no third-party dep enters the shipped tree:

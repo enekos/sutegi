@@ -279,6 +279,10 @@ impl Repl {
                         }
                         writeln!(out)
                     }
+                    // A REPL request is not a socket to hand over.
+                    Body::Upgrade(_) => {
+                        writeln!(out, "[101] connection upgrade (unsupported here)")
+                    }
                 }
             }
             Surface::Remote { host, port } => {
@@ -382,6 +386,7 @@ impl Repl {
                 match resp.body {
                     Body::Full(bytes) => Json::parse(&String::from_utf8_lossy(&bytes)),
                     Body::Stream(_) => Err(format!("GET {target} unexpectedly streams")),
+                    Body::Upgrade(_) => Err(format!("GET {target} unexpectedly upgrades")),
                 }
             }
             Surface::Remote { host, port } => {

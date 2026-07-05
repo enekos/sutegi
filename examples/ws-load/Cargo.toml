@@ -1,0 +1,21 @@
+[package]
+name = "ws-load-example"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "WebSocket stress harness: hold six-figure connection counts and measure broadcast fan-out latency."
+publish = false
+
+[[bin]]
+name = "ws-load"
+path = "src/main.rs"
+
+[dependencies]
+sutegi = { path = "../../crates/sutegi", default-features = false, features = ["ws"] }
+sutegi-ws = { path = "../../crates/sutegi-ws" }
+# Source-port binding for the client fleet: macOS allocates ephemeral ports
+# globally (~16k), so past that the client must pick its own (src, dst) tuples.
+libc = "0.2"

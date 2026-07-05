@@ -30,6 +30,7 @@ sutegi-storage = { path = "../sutegi-storage", version = "0.5.1", optional = tru
 sutegi-mail = { path = "../sutegi-mail", version = "0.5.1", optional = true }
 sutegi-template = { path = "../sutegi-template", version = "0.5.1", optional = true }
 sutegi-repl = { path = "../sutegi-repl", version = "0.5.1", optional = true }
+sutegi-ws = { path = "../sutegi-ws", version = "0.5.1", optional = true }
 
 [features]
 # Batteries-included by default; opt out with `default-features = false` and
@@ -48,6 +49,7 @@ derive = ["dep:sutegi-macros", "orm"]                     # #[derive(Model)] / #
 sqlite = ["orm", "sutegi-orm/sqlite"]                     # runnable bundled SQLite (per-pod)
 postgres = ["orm", "sutegi-orm/postgres"]                 # pure-std Postgres driver (cross-pod)
 graceful = ["sutegi-web/graceful"]                        # SIGTERM/SIGINT draining
+ws = ["dep:sutegi-ws", "sutegi-web/ws"]                   # WebSockets: App::ws on the sharded kqueue/epoll reactor
 hex = ["dep:sutegi-hex"]                                  # hexagonal-architecture primitives
 session = ["dep:sutegi-session"]                          # signed-cookie sessions (HMAC-SHA256)
 auth = ["session", "orm", "dep:sutegi-auth"]              # the user system: passwords, Users, guards, API tokens

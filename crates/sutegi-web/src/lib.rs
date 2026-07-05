@@ -21,6 +21,11 @@ pub use respond::{Error, IntoResponse};
 
 pub mod schema;
 
+#[cfg(feature = "ws")]
+pub mod ws;
+#[cfg(feature = "ws")]
+pub use ws::Ws;
+
 /// Path parameters captured from a route pattern (`:name` segments).
 pub type Params = BTreeMap<String, String>;
 
@@ -283,6 +288,10 @@ pub struct App {
     readiness: Option<Box<dyn Fn() -> bool + Send + Sync + 'static>>,
     after: Vec<AfterMiddleware>,
     limits: Limits,
+    #[cfg(feature = "ws")]
+    ws_config: sutegi_ws::WsConfig,
+    #[cfg(feature = "ws")]
+    ws_runtime: Option<Arc<sutegi_ws::WsRuntime>>,
 }
 
 /// Process-wide request counters, exposed at `/__metrics` in Prometheus text
@@ -348,6 +357,10 @@ impl App {
             readiness: None,
             after: Vec::new(),
             limits: Limits::default(),
+            #[cfg(feature = "ws")]
+            ws_config: sutegi_ws::WsConfig::default(),
+            #[cfg(feature = "ws")]
+            ws_runtime: None,
         }
     }
 
@@ -422,6 +435,42 @@ impl App {
             middleware: Vec::new(),
         });
         self
+    }
+
+    /// Tune the WebSocket engine (shard count, frame/message caps, ping and
+    /// idle timers, buffering, connection cap). Call **before** the first
+    /// [`App::ws`] registration — that's what starts the reactor.
+    #[cfg(feature = "ws")]
+    pub fn ws_config(mut self, config: sutegi_ws::WsConfig) -> App {
+        debug_assert!(
+            self.ws_runtime.is_none(),
+            "ws_config must come before the first .ws(...) route"
+        );
+        self.ws_config = config;
+        self
+    }
+
+    /// Register a WebSocket endpoint. `GET pattern` answers the RFC 6455
+    /// handshake, hands the socket to the shared reactor, and frees the HTTP
+    /// worker; `ws` holds the endpoint's callbacks (see [`Ws`]).
+    ///
+    /// The first registration starts the reactor threads (configure them
+    /// first via [`App::ws_config`]).
+    #[cfg(feature = "ws")]
+    pub fn ws(mut self, pattern: &str, doc: &str, ws: Ws) -> App {
+        let runtime = match &self.ws_runtime {
+            Some(rt) => Arc::clone(rt),
+            None => {
+                let rt = sutegi_ws::WsRuntime::start(self.ws_config.clone())
+                    .expect("sutegi-ws: failed to start reactor (kqueue/epoll/pipe unavailable)");
+                self.ws_runtime = Some(Arc::clone(&rt));
+                rt
+            }
+        };
+        let handlers = Arc::new(ws.handlers);
+        self.route(Method::Get, pattern, doc, move |c: &Ctx| {
+            ws::upgrade_response(c.req, &runtime, &handlers)
+        })
     }
 
     /// Register a non-streaming AI tool: a `name`, a `description`, its JSON

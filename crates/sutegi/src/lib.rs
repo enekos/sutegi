@@ -60,6 +60,8 @@ pub use sutegi_storage as storage;
 pub use sutegi_template as template;
 #[cfg(feature = "validate")]
 pub use sutegi_validate as validate;
+#[cfg(feature = "ws")]
+pub use sutegi_ws as ws;
 
 /// The `#[derive(Model)]` and `#[derive(Validate)]` macros (require the
 /// `derive` feature; `Validate` additionally needs `validate`).
@@ -269,6 +271,10 @@ pub mod prelude {
     pub use sutegi_session::{Session, Sessions};
     #[cfg(feature = "storage-db")]
     pub use sutegi_storage::DbStorage;
+    #[cfg(feature = "ws")]
+    pub use sutegi_web::ws::{binary_frame, text_frame, Conn, Msg, WsConfig};
+    #[cfg(feature = "ws")]
+    pub use sutegi_web::Ws;
 
     #[cfg(feature = "auth")]
     pub use sutegi_auth::{

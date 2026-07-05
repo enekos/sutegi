@@ -1,0 +1,17 @@
+[package]
+name = "ws-chat-example"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The canonical realtime demo: a browser chat room over sutegi WebSockets."
+publish = false
+
+[[bin]]
+name = "ws-chat"
+path = "src/main.rs"
+
+[dependencies]
+sutegi = { path = "../../crates/sutegi", default-features = false, features = ["ws"] }

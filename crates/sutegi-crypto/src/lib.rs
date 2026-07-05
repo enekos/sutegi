@@ -133,6 +133,68 @@ pub fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8;
 }
 
 // ---------------------------------------------------------------------------
+// SHA-1 (RFC 3174) — only for the RFC 6455 WebSocket handshake, whose
+// `Sec-WebSocket-Accept` is pinned to SHA-1 by the spec. Not collision-safe;
+// never use it for signatures or password hashing.
+// ---------------------------------------------------------------------------
+
+/// SHA-1 digest of `data` (20 bytes). WebSocket handshake only — see above.
+pub fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut h: [u32; 5] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
+
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+
+    for block in msg.chunks_exact(64) {
+        let mut w = [0u32; 80];
+        for (i, word) in w.iter_mut().enumerate().take(16) {
+            let j = i * 4;
+            *word = u32::from_be_bytes([block[j], block[j + 1], block[j + 2], block[j + 3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+
+        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+        for (i, wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5a827999u32),
+                20..=39 => (b ^ c ^ d, 0x6ed9eba1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1bbcdc),
+                _ => (b ^ c ^ d, 0xca62c1d6),
+            };
+            let t = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(*wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = t;
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+    }
+
+    let mut out = [0u8; 20];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // MD5 (RFC 1321) — only for PostgreSQL's legacy `md5` auth method.
 // ---------------------------------------------------------------------------
 
@@ -358,6 +420,35 @@ mod tests {
             hex(&dk),
             "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc"
         );
+    }
+
+    #[test]
+    fn sha1_known_vectors() {
+        // FIPS 180-1 / RFC 3174 test vectors.
+        assert_eq!(hex(&sha1(b"")), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+        assert_eq!(
+            hex(&sha1(b"abc")),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        assert_eq!(
+            hex(&sha1(
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            )),
+            "84983e441c3bd26ebaae4aa1f95129e5e54670f1"
+        );
+        // Multi-block (>64 bytes) coverage.
+        assert_eq!(
+            hex(&sha1(&[b'a'; 200])),
+            "e61cfffe0d9195a525fc6cf06ca2d77119c24a40"
+        );
+    }
+
+    #[test]
+    fn sha1_websocket_handshake_vector() {
+        // RFC 6455 §1.3: the worked Sec-WebSocket-Accept example.
+        let mut input = b"dGhlIHNhbXBsZSBub25jZQ==".to_vec();
+        input.extend_from_slice(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+        assert_eq!(base64_encode(&sha1(&input)), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
     }
 
     #[test]
