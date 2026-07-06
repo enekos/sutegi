@@ -133,7 +133,11 @@ fn replay_reproduces_the_exact_session() {
         panic!("expected sub start");
     };
     for now in [1_720_000_000_123u64, 1_720_000_000_224] {
-        let tick = Frame::Notify { id: sub_id, now };
+        let tick = Frame::Notify {
+            id: sub_id,
+            now,
+            body: String::new(),
+        };
         apply(&mut live, &tick);
         inputs.push(tick);
     }
@@ -161,6 +165,89 @@ fn replay_reproduces_the_exact_session() {
     assert_eq!(b.subs.len(), 1);
 }
 
+// The multi-client path, at the pubsub/runtime seam (no reactor): two chat
+// programs both subscribe to a topic; a publish from one fans out to both.
+#[test]
+fn publish_fans_out_to_every_topic_subscriber() {
+    use sutegi_pubsub::{Broker, PubSub};
+    use zumar_core::{el, VNode};
+    use zumar_runtime::effects::{publish, topic, Cmds, Sub};
+
+    #[derive(Clone)]
+    enum M {
+        Send,
+        Got(String),
+    }
+    #[derive(Default)]
+    struct Chat {
+        log: Vec<String>,
+    }
+    fn update(m: &mut Chat, msg: M) -> Cmds<M> {
+        match msg {
+            M::Send => return vec![publish("room", "hello everyone")],
+            M::Got(s) => m.log.push(s),
+        }
+        Vec::new()
+    }
+    fn view(m: &Chat) -> VNode<M> {
+        el("div")
+            .child(el("button").on("click", M::Send).text("send"))
+            .child(el("span").text(m.log.join(",")))
+            .into()
+    }
+    fn subs(_: &Chat) -> Vec<Sub<M>> {
+        vec![topic("room", M::Got)]
+    }
+    fn chat() -> Program<Chat, M> {
+        Program::new(Chat::default(), update, view).with_subscriptions(subs)
+    }
+
+    // Two independent programs, each subscribed to "room" via the same bus.
+    let bus = PubSub::new();
+    let alice = std::sync::Arc::new(std::sync::Mutex::new(chat()));
+    let bob = std::sync::Arc::new(std::sync::Mutex::new(chat()));
+
+    for p in [&alice, &bob] {
+        let start = p.lock().unwrap().initial_render();
+        // each program allocates its own topic-sub id (independent counters)
+        let SubDelta::Start {
+            id: sub_id,
+            spec: SubSpec::Topic { .. },
+        } = start.subs[0]
+        else {
+            panic!("expected a Topic sub start, got {:?}", start.subs);
+        };
+        let prog = std::sync::Arc::clone(p);
+        bus.on("room", move |msg| {
+            prog.lock().unwrap().notify(
+                sub_id,
+                &FxPayload {
+                    body: Some(msg.to_string()),
+                    ..Default::default()
+                },
+            );
+        });
+    }
+
+    // Alice clicks send → her update returns a publish cmd. The bridge
+    // executes it against the bus; fan-out reaches BOTH programs' topic
+    // subs (Alice's own included) — the multi-client path.
+    let sent = alice
+        .lock()
+        .unwrap()
+        .dispatch(&[0], "click", &EventPayload::default());
+    match &sent.cmds[0].spec {
+        CmdSpec::Publish { topic, message } => bus.publish(topic, message),
+        other => panic!("expected a publish cmd, got {other:?}"),
+    }
+
+    let render = |p: &std::sync::Arc<std::sync::Mutex<Program<Chat, M>>>| {
+        format!("{:?}", p.lock().unwrap().rerender().root)
+    };
+    assert!(render(&alice).contains("hello everyone"), "alice missed it");
+    assert!(render(&bob).contains("hello everyone"), "bob missed it");
+}
+
 #[test]
 fn journal_frames_round_trip_through_the_codec() {
     // the bridge journals its own encodings; every frame it can produce
@@ -176,6 +263,12 @@ fn journal_frames_round_trip_through_the_codec() {
         Frame::Notify {
             id: 4,
             now: u64::MAX / 2,
+            body: String::new(),
+        },
+        Frame::Notify {
+            id: 5,
+            now: 0,
+            body: "a topic message".into(),
         },
     ] {
         assert_eq!(frames::decode(&frames::encode(&f)).unwrap(), f);

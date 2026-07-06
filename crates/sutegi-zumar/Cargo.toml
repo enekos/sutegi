@@ -18,6 +18,7 @@ sutegi-json = { path = "../sutegi-json" }
 sutegi-crypto = { path = "../sutegi-crypto" }
 sutegi-events = { path = "../sutegi-events" }
 sutegi-orm = { path = "../sutegi-orm" }
+sutegi-pubsub = { path = "../sutegi-pubsub" }
 zumar-core = { path = "../../../zumar/crates/zumar-core" }
 zumar-runtime = { path = "../../../zumar/crates/zumar-runtime" }
 

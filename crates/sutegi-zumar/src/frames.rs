@@ -37,6 +37,10 @@ pub enum Frame {
     Notify {
         id: u32,
         now: u64,
+        /// The fired payload for a `topic` sub (the published message);
+        /// empty for a clock `every` tick. Journaled, so a reconnect replays
+        /// the exact messages a session received.
+        body: String,
     },
 }
 
@@ -127,7 +131,8 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, String> {
         2 => {
             let id = u32::try_from(r.vu()?).map_err(|_| "id overflow")?;
             let now = r.vu()?;
-            Ok(Frame::Notify { id, now })
+            let body = r.str()?;
+            Ok(Frame::Notify { id, now, body })
         }
         _ => Err("unknown frame kind".into()),
     }
@@ -196,10 +201,11 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
             vu(&mut b, u64::from(*status));
             s(&mut b, body);
         }
-        Frame::Notify { id, now } => {
+        Frame::Notify { id, now, body } => {
             b.push(2);
             vu(&mut b, u64::from(*id));
             vu(&mut b, *now);
+            s(&mut b, body);
         }
     }
     b
@@ -235,6 +241,12 @@ mod tests {
             Frame::Notify {
                 id: 3,
                 now: 1_720_000_000_000,
+                body: String::new(),
+            },
+            Frame::Notify {
+                id: 4,
+                now: 0,
+                body: "a published message".into(),
             },
         ] {
             assert_eq!(decode(&encode(&f)).unwrap(), f);

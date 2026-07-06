@@ -35,10 +35,11 @@ pub use frames::Frame;
 pub use journal::{EventJournal, Journal, MemJournal};
 
 use scheduler::{Fire, Scheduler};
+use sutegi_pubsub::{Broker, PubSub};
 use sutegi_web::ws::{Conn, Msg};
 use sutegi_web::{Request, Ws};
 use zumar_core::EventPayload;
-use zumar_runtime::effects::{CmdSpec, FxPayload, SubDelta};
+use zumar_runtime::effects::{CmdSpec, FxPayload, SubDelta, SubSpec};
 use zumar_runtime::{Program, Update};
 
 /// Builder for a live endpoint. `factory` runs once per connection (and per
@@ -50,6 +51,7 @@ pub struct Live<M, Ms> {
     factory: Factory<M, Ms>,
     journal: Option<Arc<dyn Journal>>,
     http_base: Option<String>,
+    pubsub: Option<Arc<dyn Broker>>,
 }
 
 type Factory<M, Ms> = Arc<dyn Fn(&Request) -> Program<M, Ms> + Send + Sync>;
@@ -61,7 +63,18 @@ impl<M: Send + 'static, Ms: Clone + Send + 'static> Live<M, Ms> {
             factory: Arc::new(factory),
             journal: None,
             http_base: None,
+            pubsub: None,
         }
+    }
+
+    /// Share a pubsub broker across this endpoint's connections (and,
+    /// optionally, with the rest of the app — pass a clone of one held in
+    /// `App::state`). A `topic(name, Ctor)` sub subscribes the connection;
+    /// a `publish(topic, msg)` cmd fans out to every subscriber. Defaults to
+    /// a fresh in-process [`PubSub`] scoped to this endpoint.
+    pub fn pubsub(mut self, broker: impl Broker + 'static) -> Self {
+        self.pubsub = Some(Arc::new(broker));
+        self
     }
 
     /// Journal program inputs per session (`?session=<id>` on the socket
@@ -91,6 +104,7 @@ impl<M: Send + 'static, Ms: Clone + Send + 'static> Live<M, Ms> {
             factory: self.factory,
             journal: self.journal,
             http_base,
+            pubsub: self.pubsub.unwrap_or_else(|| Arc::new(PubSub::new())),
             scheduler: OnceLock::new(),
         });
         // The scheduler thread holds a Weak so a dropped endpoint can wind
@@ -124,6 +138,9 @@ struct Session<M, Ms> {
     conn: Conn,
     /// Journal stream id (validated client session id), when journaling.
     stream: Option<String>,
+    /// Live topic subscriptions: sub id → (topic, broker subscription id),
+    /// so a `Stop` delta or a connection close can unsubscribe from pubsub.
+    topics: Mutex<HashMap<u32, (String, u64)>>,
 }
 
 struct Shared<M, Ms> {
@@ -131,6 +148,7 @@ struct Shared<M, Ms> {
     factory: Factory<M, Ms>,
     journal: Option<Arc<dyn Journal>>,
     http_base: String,
+    pubsub: Arc<dyn Broker>,
     scheduler: OnceLock<Scheduler>,
 }
 
@@ -184,6 +202,7 @@ impl<M: Send + 'static, Ms: Clone + Send + 'static> Shared<M, Ms> {
             program: Mutex::new(program),
             conn: conn.clone(),
             stream,
+            topics: Mutex::new(HashMap::new()),
         });
         self.sessions
             .lock()
@@ -216,7 +235,15 @@ impl<M: Send + 'static, Ms: Clone + Send + 'static> Shared<M, Ms> {
     }
 
     fn on_close(&self, conn: u64) {
-        self.sessions.lock().unwrap().remove(&conn);
+        let session = self.sessions.lock().unwrap().remove(&conn);
+        // Drop the connection's pubsub subscriptions so a closed socket
+        // stops receiving fan-out (its callback holds only a Weak, but
+        // unsubscribing frees the registry slot promptly).
+        if let Some(session) = session {
+            for (_sub_id, (topic, broker_id)) in session.topics.lock().unwrap().drain() {
+                self.pubsub.unsubscribe(&topic, broker_id);
+            }
+        }
         self.scheduler().drop_conn(conn);
     }
 
@@ -281,15 +308,63 @@ impl<M: Send + 'static, Ms: Clone + Send + 'static> Shared<M, Ms> {
                         shared.feed(conn, &frame, &frames::encode(&frame));
                     });
                 }
+                // Fire-and-forget: fan out to every subscriber (this
+                // connection's own topic sub included, and every *other*
+                // connection's — the multi-client path).
+                CmdSpec::Publish { topic, message } => self.pubsub.publish(&topic, &message),
             }
         }
         for delta in subs {
             match delta {
-                SubDelta::Start { id, spec } => {
-                    let zumar_runtime::effects::SubSpec::Every { ms } = spec;
-                    self.scheduler().start_every(conn, id, ms);
+                SubDelta::Start {
+                    id,
+                    spec: SubSpec::Every { ms },
+                } => self.scheduler().start_every(conn, id, ms),
+                SubDelta::Start {
+                    id,
+                    spec: SubSpec::Topic { name },
+                } => self.subscribe_topic(conn, id, name),
+                SubDelta::Stop { id } => {
+                    self.scheduler().stop_every(conn, id);
+                    self.unsubscribe_topic(conn, id);
                 }
-                SubDelta::Stop { id } => self.scheduler().stop_every(conn, id),
+            }
+        }
+    }
+
+    /// Subscribe a connection's `topic(...)` sub to the pubsub broker. Each
+    /// published message becomes a `notify(id, body=message)` fed into that
+    /// connection's program — journaled, so it replays on reconnect.
+    fn subscribe_topic(self: &Arc<Self>, conn: u64, sub_id: u32, topic: String) {
+        let Some(session) = self.session(conn) else {
+            return;
+        };
+        let weak = Arc::downgrade(self);
+        let topic_for_cb = topic.clone();
+        let broker_id = self.pubsub.subscribe(
+            &topic,
+            Arc::new(move |message: &str| {
+                let Some(shared) = weak.upgrade() else { return };
+                let _ = &topic_for_cb; // captured for clarity/debugging
+                let frame = Frame::Notify {
+                    id: sub_id,
+                    now: 0,
+                    body: message.to_string(),
+                };
+                shared.feed(conn, &frame, &frames::encode(&frame));
+            }),
+        );
+        session
+            .topics
+            .lock()
+            .unwrap()
+            .insert(sub_id, (topic, broker_id));
+    }
+
+    fn unsubscribe_topic(&self, conn: u64, sub_id: u32) {
+        if let Some(session) = self.session(conn) {
+            if let Some((topic, broker_id)) = session.topics.lock().unwrap().remove(&sub_id) {
+                self.pubsub.unsubscribe(&topic, broker_id);
             }
         }
     }
@@ -308,6 +383,7 @@ impl<M: Send + 'static, Ms: Clone + Send + 'static> Shared<M, Ms> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0),
+                body: String::new(),
             },
         };
         self.feed(conn, &frame, &frames::encode(&frame));
@@ -345,9 +421,17 @@ fn apply<M, Ms: Clone>(program: &mut Program<M, Ms>, frame: &Frame) -> Update {
             };
             program.resolve(*id, &payload)
         }
-        Frame::Notify { id, now } => {
+        Frame::Notify { id, now, body } => {
+            // `every` ticks carry `now`; `topic` fires carry `body`. One
+            // notify path serves both — the sub's callback reads whichever
+            // field it wants.
             let payload = FxPayload {
                 now: Some(*now as f64),
+                body: if body.is_empty() {
+                    None
+                } else {
+                    Some(body.clone())
+                },
                 ..FxPayload::default()
             };
             program.notify(*id, &payload)

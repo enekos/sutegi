@@ -1,0 +1,13 @@
+[package]
+name = "sutegi-pubsub"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "sutegi's in-process publish/subscribe broker: topic fan-out over a Broker seam, zero third-party dependencies. Powers realtime subscriptions (zumar live mode, Channels); a Postgres LISTEN/NOTIFY broker slots in behind the same trait for cross-pod fan-out."
+keywords = ["pubsub", "broker", "realtime", "zero-dependency"]
+categories = ["web-programming", "concurrency"]
+
+[dependencies]

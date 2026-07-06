@@ -48,6 +48,8 @@ pub use sutegi_hex as hex;
 pub use sutegi_mail as mail;
 #[cfg(feature = "orm")]
 pub use sutegi_orm as orm;
+#[cfg(feature = "pubsub")]
+pub use sutegi_pubsub as pubsub;
 #[cfg(feature = "queue")]
 pub use sutegi_queue as queue;
 #[cfg(feature = "repl")]
@@ -267,6 +269,8 @@ pub mod prelude {
     #[cfg(feature = "derive")]
     pub use sutegi_macros::{Model, Validate};
 
+    #[cfg(feature = "pubsub")]
+    pub use sutegi_pubsub::{Broker, BrokerExt, PubSub};
     #[cfg(feature = "session")]
     pub use sutegi_session::{Session, Sessions};
     #[cfg(feature = "storage-db")]
