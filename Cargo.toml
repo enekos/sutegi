@@ -38,7 +38,7 @@ members = [
 #   benches      — aatxe statistical microbench runner (path dep on ../aatxe)
 #   fuzz         — coverage-guided libFuzzer targets (nightly, cargo-fuzz)
 #   differential — sutegi-vs-serde_json JSON oracle (stable, `cargo test`)
-exclude = ["benches", "fuzz", "differential"]
+exclude = ["benches", "fuzz", "differential", "crates/sutegi-zumar"]
 
 [workspace.package]
 version = "0.5.1"
