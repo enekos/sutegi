@@ -18,7 +18,15 @@ fn main() -> ExitCode {
     let cmd = args.first().map(String::as_str).unwrap_or("help");
 
     let result = match cmd {
-        "new" => cmd_new(args.get(1)),
+        "new" => {
+            let name = args.iter().skip(1).find(|a| !a.starts_with("--"));
+            if args.iter().any(|a| a == "--fullstack") {
+                cmd_new_fullstack(name)
+            } else {
+                cmd_new(name)
+            }
+        }
+        "dev" => cmd_dev(),
         "make:model" => cmd_make_model(args.get(1)),
         "make:route" => cmd_make_route(args.get(1)),
         "introspect" => cmd_introspect(args.get(1)),
@@ -56,6 +64,12 @@ USAGE:
 
 COMMANDS:
     new <name>            Scaffold a new sutegi application
+    new <name> --fullstack
+                          Scaffold a fullstack app: server/ (sutegi) +
+                          app/*.zu (zumar frontend) + www/ (static root)
+    dev                   Run a fullstack project: the server plus a zuc
+                          watch loop (gc backend, ms rebuilds, live reload).
+                          Needs `zuc` on PATH (or $ZUC); run from the root.
     make:model <Name>     Generate a model under src/models/
     make:route <name>     Generate a route module under src/routes/
     introspect [url]      Fetch and pretty-print a running app's /__introspect
@@ -110,6 +124,325 @@ fn main() -> std::io::Result<()> {
         .serve()
 }
 "#;
+
+// ---- new --fullstack --------------------------------------------------------
+//
+// The Phoenix-shaped layout: one repo, one mental model. `server/` is a
+// plain sutegi app that owns the API and serves `www/` as the site root;
+// `app/*.zu` is the zumar frontend, compiled by `sutegi dev` (via zuc, gc
+// backend) into `www/pkg/`. The framework JS in www/ is a zuc artifact,
+// refreshed on every `sutegi dev` start — only index.html is yours there.
+
+fn cmd_new_fullstack(name: Option<&String>) -> Result<(), String> {
+    let name = name.ok_or("usage: sutegi new <name> --fullstack")?;
+    let root = Path::new(name);
+    if root.exists() {
+        return Err(format!("'{}' already exists", name));
+    }
+    let dep = sutegi_dep(std::env::var("SUTEGI_HOME").ok().as_deref());
+    write_file(
+        &root.join("server/Cargo.toml"),
+        &fullstack_cargo_toml(name, &dep),
+    )?;
+    write_file(&root.join("server/src/main.rs"), &fullstack_main_rs(name))?;
+    write_file(&root.join("app/main.zu"), &fullstack_main_zu(name))?;
+    write_file(&root.join("www/index.html"), &fullstack_index_html(name))?;
+    write_file(&root.join(".gitignore"), FULLSTACK_GITIGNORE)?;
+    println!("created fullstack sutegi app '{}'", name);
+    println!("  {name}/server/   the sutegi app (API + serves www/)");
+    println!("  {name}/app/      the zumar frontend (.zu)");
+    println!("  {name}/www/      static root (index.html is yours; the rest is zuc's)");
+    println!("next: cd {name} && sutegi dev    (needs zuc: cargo install --path <zumar>/crates/zumar-cli)");
+    Ok(())
+}
+
+/// The scaffold's sutegi dependency: a path dep against a local checkout when
+/// `SUTEGI_HOME` names one (fast, offline, pre-release features), git otherwise.
+fn sutegi_dep(home: Option<&str>) -> String {
+    match home {
+        Some(p) => format!(
+            "sutegi = {{ path = \"{}/crates/sutegi\" }}",
+            p.trim_end_matches('/')
+        ),
+        None => "sutegi = { git = \"https://github.com/enekos/sutegi\" }".to_string(),
+    }
+}
+
+fn fullstack_cargo_toml(name: &str, dep: &str) -> String {
+    format!(
+        r#"[package]
+name = "{name}-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+{dep}
+"#
+    )
+}
+
+fn fullstack_main_rs(name: &str) -> String {
+    format!(
+        r#"use sutegi::prelude::*;
+
+fn main() -> std::io::Result<()> {{
+    // The .zu frontend (../app) is compiled by `sutegi dev` into ../www/pkg;
+    // this server owns the API and serves www/ as the site root. Register
+    // API routes before `static_dir` — routes match in order.
+    App::new("{name}")
+        .get("/api/hello", "The greeting the frontend fetches.", |_| {{
+            text(200, "aupa from the sutegi server")
+        }})
+        .static_dir("/", concat!(env!("CARGO_MANIFEST_DIR"), "/../www"))
+        .serve()
+}}
+"#
+    )
+}
+
+fn fullstack_main_zu(name: &str) -> String {
+    let app = to_pascal(name);
+    format!(
+        r#"# main.zu — the frontend. `sutegi dev` compiles this (zuc, gc backend)
+# into www/pkg/app.wasm on every save; the page reloads itself.
+
+app {app}
+
+model {{ count: Int, greeting: String }}
+
+init = {{ count = 0, greeting = "" }}
+
+msg Inc | Dec | Fetch | Got String
+
+update Inc = {{ count = model.count + 1 }}
+update Dec = {{ count = model.count - 1 }}
+update Fetch = {{ greeting = "..." }} then httpGet("/api/hello", Got)
+update Got s = {{ greeting = s }}
+
+view =
+  div [class "app"] [
+    h1 [] [ text "{name}" ],
+    p [class "sub"] [ text "counter in the browser, greeting from the server" ],
+    div [class "row"] [
+      button [onClick Dec] [ text "-" ],
+      span [class "count"] [ text show(model.count) ],
+      button [onClick Inc] [ text "+" ]
+    ],
+    div [class "row"] [
+      button [class "fetch", onClick Fetch] [ text "fetch /api/hello" ],
+      span [class "greeting"] [ text model.greeting ]
+    ]
+  ]
+"#
+    )
+}
+
+fn fullstack_index_html(name: &str) -> String {
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{name}</title>
+  <style>
+    :root {{ color-scheme: dark; }}
+    body {{ margin: 0; min-height: 100vh; display: grid; place-items: center;
+           background: #16130f; color: #e8ddcf;
+           font-family: ui-monospace, "SF Mono", Menlo, monospace; }}
+    .app {{ text-align: center; }}
+    .app h1 {{ letter-spacing: 0.2em; color: #d9a76a; }}
+    .sub {{ color: #6f7362; font-size: 0.8rem; }}
+    .row {{ display: flex; align-items: center; justify-content: center; gap: 1.2rem; margin: 1.6rem 0; }}
+    .count {{ font-size: 3rem; min-width: 4ch; font-variant-numeric: tabular-nums; }}
+    .greeting {{ color: #d9a76a; min-height: 1em; }}
+    button {{ background: #1e2318; color: #e8ddcf; border: 1px solid #3a4230;
+             border-radius: 8px; font: inherit; font-size: 1.4rem;
+             width: 3rem; height: 3rem; cursor: pointer; }}
+    button:hover {{ border-color: #d9a76a; }}
+    button.fetch {{ width: auto; height: auto; font-size: 0.9rem; padding: 0.4rem 1rem; }}
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <script type="module" src="/boot.js"></script>
+  <script>
+    // sutegi dev live reload: poll the build stamp zuc writes on rebuild.
+    // Gated to localhost so a deployed www/ never polls.
+    if (["localhost", "127.0.0.1"].includes(location.hostname)) (async () => {{
+      let last = null;
+      for (;;) {{
+        try {{
+          const r = await fetch("/pkg/build-id", {{ cache: "no-store" }});
+          if (r.ok) {{
+            const b = await r.text();
+            if (last !== null && b !== last) location.reload();
+            last = b;
+          }}
+        }} catch {{}}
+        await new Promise((res) => setTimeout(res, 400));
+      }}
+    }})();
+  </script>
+</body>
+</html>
+"#
+    )
+}
+
+const FULLSTACK_GITIGNORE: &str = "\
+/server/target
+/www/pkg/
+/www/boot.js
+/www/zumar.js
+/www/zumar-wire.js
+/www/zumar-gc.js
+/www/zumar-live.js
+";
+
+// ---- dev (fullstack) --------------------------------------------------------
+//
+// `sutegi dev` = the server (cargo run, inherited stdio) + a zuc watch loop.
+// zuc's standalone dev server retires here: sutegi serves everything, zuc
+// only compiles. Live reload is a stamp file under www/pkg/ the scaffolded
+// index.html polls — no server cooperation needed beyond static serving.
+
+fn cmd_dev() -> Result<(), String> {
+    if !Path::new("server/Cargo.toml").exists() || !Path::new("app").is_dir() {
+        return Err(
+            "not a fullstack project (expected server/Cargo.toml and app/) — \
+             scaffold one with `sutegi new <name> --fullstack`"
+                .into(),
+        );
+    }
+    let zuc = std::env::var("ZUC").unwrap_or_else(|_| "zuc".to_string());
+
+    // Refresh the framework JS so the shim always matches the installed zuc.
+    zuc_run(&zuc, &["assets", "www"])?;
+
+    let mut stamp: u64 = 1;
+    for f in zu_files()? {
+        match build_zu(&zuc, &f) {
+            Ok(secs) => println!(
+                "sutegi dev: built {} in {:.0}ms",
+                f.display(),
+                secs * 1000.0
+            ),
+            Err(e) => eprintln!("{e}\nsutegi dev: fix {} and save again", f.display()),
+        }
+    }
+    write_stamp(stamp)?;
+
+    let mut server = std::process::Command::new("cargo")
+        .args(["run", "--manifest-path", "server/Cargo.toml"])
+        .spawn()
+        .map_err(|e| format!("cargo run: {e}"))?;
+    println!("sutegi dev: watching app/*.zu (gc backend) — save and the page reloads");
+
+    let index = Path::new("www/index.html").to_path_buf();
+    let mut seen: std::collections::BTreeMap<std::path::PathBuf, Option<std::time::SystemTime>> =
+        zu_files()?
+            .into_iter()
+            .map(|f| (f.clone(), mtime(&f)))
+            .collect();
+    seen.insert(index.clone(), mtime(&index));
+
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        if let Some(status) = server.try_wait().map_err(|e| e.to_string())? {
+            return Err(format!(
+                "server exited ({status}) — sutegi dev stops with it"
+            ));
+        }
+        let mut reload = false;
+        for f in zu_files()? {
+            let m = mtime(&f);
+            if seen.get(&f) == Some(&m) {
+                continue;
+            }
+            seen.insert(f.clone(), m);
+            match build_zu(&zuc, &f) {
+                Ok(secs) => {
+                    println!(
+                        "sutegi dev: rebuilt {} in {:.0}ms — reloading",
+                        f.display(),
+                        secs * 1000.0
+                    );
+                    reload = true;
+                }
+                Err(e) => eprintln!("{e}\nsutegi dev: still serving the last good build"),
+            }
+        }
+        let m = mtime(&index);
+        if seen.get(&index) != Some(&m) {
+            seen.insert(index.clone(), m);
+            println!("sutegi dev: index.html changed — reloading");
+            reload = true;
+        }
+        if reload {
+            stamp += 1;
+            write_stamp(stamp)?;
+        }
+    }
+}
+
+fn zu_files() -> Result<Vec<std::path::PathBuf>, String> {
+    let mut files: Vec<_> = std::fs::read_dir("app")
+        .map_err(|e| format!("app/: {e}"))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "zu"))
+        .collect();
+    files.sort();
+    Ok(files)
+}
+
+fn mtime(p: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(p).and_then(|m| m.modified()).ok()
+}
+
+/// `main.zu` becomes `pkg/app.wasm` (what boot.js loads); any other `.zu`
+/// keeps its stem, ready for multi-page setups.
+fn wasm_out(stem: &str) -> String {
+    if stem == "main" {
+        "www/pkg/app.wasm".to_string()
+    } else {
+        format!("www/pkg/{stem}.wasm")
+    }
+}
+
+fn build_zu(zuc: &str, file: &Path) -> Result<f64, String> {
+    let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("app");
+    let out = wasm_out(stem);
+    std::fs::create_dir_all("www/pkg").map_err(|e| format!("www/pkg: {e}"))?;
+    let started = std::time::Instant::now();
+    let file = file.to_str().ok_or("non-utf8 path")?;
+    zuc_run(zuc, &["build", file, "--backend", "gc", "--out", &out])?;
+    Ok(started.elapsed().as_secs_f64())
+}
+
+fn zuc_run(zuc: &str, args: &[&str]) -> Result<(), String> {
+    let output = std::process::Command::new(zuc)
+        .args(args)
+        .output()
+        .map_err(|e| {
+            format!(
+                "{zuc}: {e}\nsutegi dev needs the zumar compiler — \
+             cargo install --path <zumar>/crates/zumar-cli (or set ZUC=<path>)"
+            )
+        })?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr)
+            .trim_end()
+            .to_string());
+    }
+    Ok(())
+}
+
+fn write_stamp(stamp: u64) -> Result<(), String> {
+    std::fs::create_dir_all("www/pkg").map_err(|e| format!("www/pkg: {e}"))?;
+    std::fs::write("www/pkg/build-id", stamp.to_string())
+        .map_err(|e| format!("www/pkg/build-id: {e}"))
+}
 
 // ---- make:model -----------------------------------------------------------
 
@@ -343,5 +676,49 @@ mod tests {
         assert!(toml.contains(r#"name = "my_app""#));
         assert!(toml.contains("sutegi = {"));
         assert!(toml.contains(r#"edition = "2021""#));
+    }
+
+    #[test]
+    fn sutegi_dep_prefers_a_local_checkout() {
+        assert!(sutegi_dep(None).contains("git = \"https://github.com/enekos/sutegi\""));
+        assert_eq!(
+            sutegi_dep(Some("/home/e/sutegi/")),
+            "sutegi = { path = \"/home/e/sutegi/crates/sutegi\" }"
+        );
+    }
+
+    #[test]
+    fn fullstack_templates_wire_the_three_tiers_together() {
+        let toml = fullstack_cargo_toml("shop", &sutegi_dep(None));
+        assert!(toml.contains(r#"name = "shop-server""#));
+
+        // server: API before static_dir, www served manifest-relative
+        let main = fullstack_main_rs("shop");
+        assert!(main.contains(r#".get("/api/hello""#));
+        let api_pos = main.find("/api/hello").unwrap();
+        let static_pos = main.find(".static_dir").unwrap();
+        assert!(
+            api_pos < static_pos,
+            "API routes must register before static_dir"
+        );
+        assert!(main.contains(r#"concat!(env!("CARGO_MANIFEST_DIR"), "/../www")"#));
+
+        // frontend: pascal app name, fetches the same endpoint the server serves
+        let zu = fullstack_main_zu("shop");
+        assert!(zu.contains("app Shop"));
+        assert!(zu.contains(r#"httpGet("/api/hello", Got)"#));
+
+        // page: boots zuc's loader and polls the reload stamp sutegi dev bumps
+        let html = fullstack_index_html("shop");
+        assert!(html.contains(r#"src="/boot.js""#));
+        assert!(html.contains("/pkg/build-id"));
+        assert!(html.contains("location.hostname"));
+    }
+
+    #[test]
+    fn build_output_paths_follow_the_stem_rule() {
+        // main.zu is the page boot.js loads; other stems keep their names.
+        assert_eq!(wasm_out("main"), "www/pkg/app.wasm");
+        assert_eq!(wasm_out("admin"), "www/pkg/admin.wasm");
     }
 }

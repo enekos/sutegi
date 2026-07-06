@@ -16,6 +16,7 @@ use std::time::Duration;
 pub use sutegi_http::{Body, Limits, Method, Request, Response, SseSink, StreamSink};
 use sutegi_json::Json;
 
+mod files;
 mod respond;
 pub use respond::{Error, IntoResponse};
 
@@ -243,11 +244,14 @@ impl ToolDef {
     }
 }
 
-/// One compiled segment of a route pattern: a literal to compare, or a
-/// `:name` parameter to capture.
+/// One compiled segment of a route pattern: a literal to compare, a `:name`
+/// parameter to capture, or a trailing `*name` rest segment that captures
+/// everything remaining (zero or more segments, slashes included) — what
+/// static file serving needs for nested paths like `/assets/img/logo.png`.
 enum Seg {
     Lit(String),
     Param(String),
+    Rest(String),
 }
 
 /// Compile a `/users/:id`-style pattern once, at registration time, so
@@ -256,9 +260,14 @@ fn compile_pattern(pattern: &str) -> Vec<Seg> {
     pattern
         .trim_matches('/')
         .split('/')
-        .map(|s| match s.strip_prefix(':') {
-            Some(name) => Seg::Param(name.to_string()),
-            None => Seg::Lit(s.to_string()),
+        .map(|s| {
+            if let Some(name) = s.strip_prefix(':') {
+                Seg::Param(name.to_string())
+            } else if let Some(name) = s.strip_prefix('*') {
+                Seg::Rest(name.to_string())
+            } else {
+                Seg::Lit(s.to_string())
+            }
         })
         .collect()
 }
@@ -532,6 +541,20 @@ impl App {
         handler: impl Fn(&Ctx) -> R + Send + Sync + 'static,
     ) -> App {
         self.route(Method::Get, pattern, doc, handler)
+    }
+
+    /// Serve a directory of static files under `prefix` (a trailing `*path`
+    /// rest route). `prefix = "/"` makes `dir` the site root; a directory
+    /// (or the bare prefix) serves its `index.html`. Traversal, dotfiles
+    /// and backslashes are 404s. Routes match in registration order, so
+    /// register API routes first and `static_dir` last.
+    pub fn static_dir(self, prefix: &str, dir: impl Into<std::path::PathBuf>) -> App {
+        let root: std::path::PathBuf = dir.into();
+        let pattern = format!("{}/*path", prefix.trim_end_matches('/'));
+        let doc = format!("Static files from {}.", root.display());
+        self.get(&pattern, &doc, move |c: &Ctx| {
+            files::serve(&root, c.param("path").unwrap_or(""))
+        })
     }
 
     pub fn post<R: IntoResponse>(
@@ -1000,20 +1023,30 @@ fn match_route<'a>(routes: &'a [Route], method: Method, path: &str) -> Option<(&
 }
 
 /// Match pre-split path segments against a compiled pattern, capturing params.
+/// A trailing `Rest` segment absorbs everything left (possibly nothing).
 fn match_segs(pattern: &[Seg], path: &[&str]) -> Option<Params> {
-    if pattern.len() != path.len() {
+    let has_rest = matches!(pattern.last(), Some(Seg::Rest(_)));
+    if has_rest {
+        if path.len() + 1 < pattern.len() {
+            return None;
+        }
+    } else if pattern.len() != path.len() {
         return None;
     }
     let mut params = Params::new();
-    for (seg, val) in pattern.iter().zip(path.iter()) {
+    for (i, seg) in pattern.iter().enumerate() {
         match seg {
             Seg::Lit(lit) => {
-                if lit != val {
+                if lit != path[i] {
                     return None;
                 }
             }
             Seg::Param(name) => {
-                params.insert(name.clone(), val.to_string());
+                params.insert(name.clone(), path[i].to_string());
+            }
+            Seg::Rest(name) => {
+                params.insert(name.clone(), path.get(i..).unwrap_or(&[]).join("/"));
+                break;
             }
         }
     }
@@ -1326,6 +1359,27 @@ mod tests {
     #[test]
     fn pattern_rejects_length_mismatch() {
         assert!(match_pattern("/users/:id", "/users/42/extra").is_none());
+    }
+
+    #[test]
+    fn rest_segment_captures_remainder() {
+        let p = match_pattern("/assets/*path", "/assets/img/logo.png").unwrap();
+        assert_eq!(p.get("path").map(String::as_str), Some("img/logo.png"));
+        // zero remaining segments is a valid (empty) rest
+        let p = match_pattern("/assets/*path", "/assets").unwrap();
+        assert_eq!(p.get("path").map(String::as_str), Some(""));
+        // a root-level rest matches everything, "/" included
+        let p = match_pattern("/*path", "/pkg/app.wasm").unwrap();
+        assert_eq!(p.get("path").map(String::as_str), Some("pkg/app.wasm"));
+        assert_eq!(
+            match_pattern("/*path", "/")
+                .unwrap()
+                .get("path")
+                .map(String::as_str),
+            Some("")
+        );
+        // literals before the rest still gate the match
+        assert!(match_pattern("/assets/*path", "/api/x").is_none());
     }
 
     #[test]
