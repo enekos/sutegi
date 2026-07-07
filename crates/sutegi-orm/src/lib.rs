@@ -32,6 +32,11 @@ pub use value::{
     FkAction, ForeignKey, Index, TableSchema, Value,
 };
 
+/// The pure schema diff engine: [`schema_diff::SchemaOp`],
+/// [`schema_diff::diff`], and the [`schema_diff::apply`] fold that builds the
+/// shadow schema. No I/O — it operates on [`TableSchema`] values.
+pub mod schema_diff;
+
 /// Versioned, up/down migrations with a `_sutegi_migrations` history table,
 /// over any [`Backend`].
 pub mod migrate;
