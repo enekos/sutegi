@@ -1,8 +1,6 @@
 //! The event store: append-only writes with optimistic concurrency, stream
 //! reads, and aggregate folding, over any ORM backend.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use sutegi_json::Json;
 use sutegi_orm::{row, Backend, Transactional, Value};
 
@@ -399,12 +397,7 @@ pub(crate) fn is_unique_violation(e: &str) -> bool {
     e.contains("UNIQUE constraint failed") || e.contains("23505") || e.contains("duplicate key")
 }
 
-pub(crate) fn now_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
+pub(crate) use sutegi_crypto::now_millis;
 
 #[cfg(test)]
 mod tests {

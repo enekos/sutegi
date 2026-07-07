@@ -11,6 +11,7 @@ keywords = ["event-sourcing", "cqrs", "events", "projections", "zero-dependency"
 categories = ["database", "web-programming"]
 
 [dependencies]
+sutegi-crypto = { path = "../sutegi-crypto", version = "0.5.1" }
 sutegi-json = { path = "../sutegi-json", version = "0.5.1" }
 sutegi-orm = { path = "../sutegi-orm", version = "0.5.1" }
 

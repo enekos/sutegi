@@ -14,4 +14,4 @@ name = "hexagonal"
 path = "src/main.rs"
 
 [dependencies]
-sutegi = { path = "../../crates/sutegi", features = ["hex", "sqlite", "graceful"] }
+sutegi = { path = "../../crates/sutegi", features = ["hexagon", "sqlite", "graceful"] }

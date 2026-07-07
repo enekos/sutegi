@@ -14,7 +14,7 @@ members = [
     "crates/sutegi-queue",
     "crates/sutegi-events",
     "crates/sutegi-macros",
-    "crates/sutegi-hex",
+    "crates/sutegi-hexagon",
     "crates/sutegi-session",
     "crates/sutegi-auth",
     "crates/sutegi-mail",

@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use sutegi::hex::{AppError, AppResult, UseCase};
+use sutegi::hexagon::{AppError, AppResult, UseCase};
 
 use crate::domain::Todo;
 use crate::ports::TodoRepository;

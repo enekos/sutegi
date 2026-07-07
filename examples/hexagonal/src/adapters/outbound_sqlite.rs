@@ -6,7 +6,7 @@
 //! `Db` is a pooled, `Send + Sync + Clone` handle, so the adapter just holds one
 //! — no `Arc<Mutex<…>>`.
 
-use sutegi::hex::{AppError, AppResult};
+use sutegi::hexagon::{AppError, AppResult};
 use sutegi::prelude::*;
 
 use crate::domain::Todo;

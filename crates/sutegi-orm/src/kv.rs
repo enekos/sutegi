@@ -32,7 +32,7 @@
 
 use crate::backend::Backend;
 use crate::value::Value;
-use std::time::{SystemTime, UNIX_EPOCH};
+use sutegi_crypto::now_millis;
 use sutegi_json::Json;
 
 /// A namespaced JSON key/value store backed by a single table on any
@@ -202,13 +202,6 @@ impl<B: Backend> Kv<B> {
             })
             .collect()
     }
-}
-
-fn now_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(all(test, feature = "sqlite"))]

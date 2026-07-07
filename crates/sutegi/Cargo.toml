@@ -12,17 +12,18 @@ keywords = ["web", "framework", "agent", "llm", "zero-dependency"]
 categories = ["web-programming::http-server", "web-programming"]
 
 [dependencies]
-# --- core (always compiled): HTTP server, routing, JSON ---
+# --- core (always compiled): HTTP server, routing, JSON, crypto primitives ---
 sutegi-json = { path = "../sutegi-json", version = "0.5.1" }
 sutegi-http = { path = "../sutegi-http", version = "0.5.1" }
 sutegi-web = { path = "../sutegi-web", version = "0.5.1" }
+sutegi-crypto = { path = "../sutegi-crypto", version = "0.5.1" }
 # --- optional pillars: pulled in only by their feature ---
 sutegi-orm = { path = "../sutegi-orm", version = "0.5.1", optional = true }
 sutegi-validate = { path = "../sutegi-validate", version = "0.5.1", optional = true }
 sutegi-queue = { path = "../sutegi-queue", version = "0.5.1", optional = true }
 sutegi-events = { path = "../sutegi-events", version = "0.5.1", optional = true }
 sutegi-ai = { path = "../sutegi-ai", version = "0.5.1", optional = true }
-sutegi-hex = { path = "../sutegi-hex", version = "0.5.1", optional = true }
+sutegi-hexagon = { path = "../sutegi-hexagon", version = "0.5.1", optional = true }
 sutegi-session = { path = "../sutegi-session", version = "0.5.1", optional = true }
 sutegi-auth = { path = "../sutegi-auth", version = "0.5.1", optional = true }
 sutegi-macros = { path = "../sutegi-macros", version = "0.5.1", optional = true }
@@ -52,7 +53,7 @@ postgres = ["orm", "sutegi-orm/postgres"]                 # pure-std Postgres dr
 graceful = ["sutegi-web/graceful"]                        # SIGTERM/SIGINT draining
 ws = ["dep:sutegi-ws", "sutegi-web/ws"]                   # WebSockets: App::ws on the sharded kqueue/epoll reactor
 pubsub = ["dep:sutegi-pubsub"]                            # in-process publish/subscribe broker (topic fan-out)
-hex = ["dep:sutegi-hex"]                                  # hexagonal-architecture primitives
+hexagon = ["dep:sutegi-hexagon"]                                  # hexagonal-architecture primitives
 session = ["dep:sutegi-session"]                          # signed-cookie sessions (HMAC-SHA256)
 auth = ["session", "orm", "dep:sutegi-auth"]              # the user system: passwords, Users, guards, API tokens
 template = ["dep:sutegi-template"]                        # Blade-style template engine over Json contexts

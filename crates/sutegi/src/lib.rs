@@ -31,6 +31,7 @@
 //! `GET /__metrics` (Prometheus), `GET /__introspect` (full app surface).
 
 // --- core, always available ---
+pub use sutegi_crypto as crypto;
 pub use sutegi_http as http;
 pub use sutegi_json as json;
 pub use sutegi_web as web;
@@ -42,8 +43,8 @@ pub use sutegi_ai as ai;
 pub use sutegi_auth as auth;
 #[cfg(feature = "events")]
 pub use sutegi_events as events;
-#[cfg(feature = "hex")]
-pub use sutegi_hex as hex;
+#[cfg(feature = "hexagon")]
+pub use sutegi_hexagon as hexagon;
 #[cfg(feature = "mail")]
 pub use sutegi_mail as mail;
 #[cfg(feature = "orm")]
@@ -308,8 +309,8 @@ pub mod prelude {
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub use sutegi_orm::kv::Kv;
 
-    #[cfg(feature = "hex")]
-    pub use sutegi_hex::{
+    #[cfg(feature = "hexagon")]
+    pub use sutegi_hexagon::{
         respond, respond_created, AppError, AppResult, Command, Event, EventBus, IntoJson, Query,
         UseCase,
     };

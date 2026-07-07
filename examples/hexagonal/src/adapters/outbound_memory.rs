@@ -4,7 +4,7 @@
 
 use std::sync::Mutex;
 
-use sutegi::hex::{AppError, AppResult};
+use sutegi::hexagon::{AppError, AppResult};
 
 use crate::domain::Todo;
 use crate::ports::TodoRepository;

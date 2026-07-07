@@ -11,6 +11,7 @@ description = "Zero-dependency SQL query builder, model/schema layer, and migrat
 [dependencies]
 rusqlite = { version = "0.40.1", features = ["bundled"], optional = true }
 sutegi-pg = { path = "../sutegi-pg", version = "0.5.1", optional = true }
+sutegi-crypto = { path = "../sutegi-crypto", version = "0.5.1" }
 sutegi-json = { path = "../sutegi-json", version = "0.5.1" }
 
 # Both execution backends are OFF by default so the zero-dependency core stays

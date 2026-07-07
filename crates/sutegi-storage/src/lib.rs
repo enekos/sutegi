@@ -171,12 +171,7 @@ pub fn content_type_of(key: &str) -> &'static str {
 }
 
 #[cfg(feature = "db")]
-pub(crate) fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
+pub(crate) use sutegi_crypto::now_secs;
 
 #[cfg(test)]
 mod tests {

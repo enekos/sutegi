@@ -1,5 +1,5 @@
 [package]
-name = "sutegi-hex"
+name = "sutegi-hexagon"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

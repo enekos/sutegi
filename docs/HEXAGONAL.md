@@ -33,8 +33,8 @@ that's the rule being broken.
 | Layer | Directory | May depend on | Never touches |
 |-------|-----------|---------------|---------------|
 | **domain** | `src/domain.rs` | nothing | sutegi, JSON, SQL, HTTP |
-| **ports** | `src/ports.rs` | domain, `sutegi::hex::AppResult` | concrete adapters |
-| **application** (use cases) | `src/application.rs` | domain, ports, `sutegi::hex` | HTTP/JSON/SQL |
+| **ports** | `src/ports.rs` | domain, `sutegi::hexagon::AppResult` | concrete adapters |
+| **application** (use cases) | `src/application.rs` | domain, ports, `sutegi::hexagon` | HTTP/JSON/SQL |
 | **adapters** | `src/adapters/` | application, ports, domain, sutegi | — |
 | **composition root** | `src/main.rs` | everything (it wires it) | business logic |
 
@@ -43,7 +43,7 @@ that's the rule being broken.
 - **Ports** — traits the application needs, in *domain* terms. The outbound
   `TodoRepository` says nothing about SQL. Inbound ports are the use cases.
 - **Application** — one struct per use case implementing
-  [`sutegi::hex::UseCase`]. It orchestrates the domain over the ports and is
+  [`sutegi::hexagon::UseCase`]. It orchestrates the domain over the ports and is
   unit-testable with an in-memory adapter — no server required.
 - **Adapters** — all the framework/IO code:
   - *inbound* drive the app: `inbound_http.rs` (routes → use cases),
@@ -57,9 +57,9 @@ that's the rule being broken.
   adapters. It picks one (`REPO=memory|sqlite`), injects it, mounts inbound
   adapters, runs.
 
-## What `sutegi::hex` gives you
+## What `sutegi::hexagon` gives you
 
-Enable the `hex` feature. You get three primitives:
+Enable the `hexagon` feature. You get three primitives:
 
 - **`AppError`** — a transport-agnostic error (`NotFound`, `Invalid`,
   `Conflict`, `Unauthorized`, `Internal`) with a canonical HTTP mapping

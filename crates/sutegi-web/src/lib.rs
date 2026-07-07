@@ -692,7 +692,8 @@ impl App {
                 }
 
                 // Route table (run group-scoped middleware before the handler).
-                if let Some((route, params)) = match_route(&routes, req.method, &req.path) {
+                let segs = split_segments(&req.path);
+                if let Some((route, params)) = match_route(&routes, req.method, &segs) {
                     for mw in &route.middleware {
                         if let Some(resp) = mw(&req) {
                             return resp;
@@ -707,7 +708,6 @@ impl App {
                 }
 
                 // Distinguish "no such path" from "wrong method".
-                let segs = split_segments(&req.path);
                 if routes.iter().any(|r| match_segs(&r.segs, &segs).is_some()) {
                     return text(405, "405 Method Not Allowed");
                 }
@@ -1002,20 +1002,22 @@ fn join_prefix(prefix: &str, pattern: &str) -> String {
     }
 }
 
-/// Split a request path into segments — done once per request, where the old
-/// matcher re-split (and re-allocated) both pattern and path per candidate
-/// route.
+/// Split a request path into segments — once per request, shared by route
+/// matching and the 405 method check.
 fn split_segments(path: &str) -> Vec<&str> {
     path.trim_matches('/').split('/').collect()
 }
 
-fn match_route<'a>(routes: &'a [Route], method: Method, path: &str) -> Option<(&'a Route, Params)> {
-    let segs = split_segments(path);
+fn match_route<'a>(
+    routes: &'a [Route],
+    method: Method,
+    segs: &[&str],
+) -> Option<(&'a Route, Params)> {
     for r in routes {
         if r.method != method {
             continue;
         }
-        if let Some(params) = match_segs(&r.segs, &segs) {
+        if let Some(params) = match_segs(&r.segs, segs) {
             return Some((r, params));
         }
     }
@@ -1060,11 +1062,15 @@ pub fn text(status: u16, body: &str) -> Response {
     Response::new(status).with_body(body.as_bytes().to_vec())
 }
 
-/// An `application/json` response from a `Json` value.
+/// An `application/json` response from a `Json` value. Serializes straight
+/// into one buffer via [`Json::write_to`] — `to_string()` would build that
+/// buffer inside `Display` and then copy it again.
 pub fn json(status: u16, value: &Json) -> Response {
+    let mut body = String::with_capacity(128);
+    value.write_to(&mut body);
     Response::new(status)
         .with_header("content-type", "application/json; charset=utf-8")
-        .with_body(value.to_string().into_bytes())
+        .with_body(body.into_bytes())
 }
 
 /// A canned 404.
@@ -1148,7 +1154,7 @@ pub fn basic(
 ) -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static {
     let expected = format!(
         "Basic {}",
-        base64_encode(format!("{}:{}", user, pass).as_bytes())
+        sutegi_crypto::base64_encode(format!("{}:{}", user, pass).as_bytes())
     );
     move |req: &Request| match req.header("authorization") {
         Some(h) if h == expected => None,
@@ -1202,30 +1208,6 @@ pub fn rate_limit(
             Some(text(429, "429 Too Many Requests").with_header("retry-after", "1"))
         }
     }
-}
-
-/// Minimal standard base64 encoder (used by `basic`).
-fn base64_encode(input: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = *chunk.get(1).unwrap_or(&0);
-        let b2 = *chunk.get(2).unwrap_or(&0);
-        out.push(T[(b0 >> 2) as usize] as char);
-        out.push(T[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            T[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            T[(b2 & 0x3f) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
 }
 
 /// A streaming response: `producer` writes (and flushes) bytes over time via a

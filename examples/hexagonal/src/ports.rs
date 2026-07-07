@@ -6,7 +6,7 @@
 //! inversion is what lets us swap an in-memory repo for SQLite without touching
 //! a single use case.
 
-use sutegi::hex::AppResult;
+use sutegi::hexagon::AppResult;
 
 use crate::domain::Todo;
 

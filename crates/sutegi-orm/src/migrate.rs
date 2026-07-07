@@ -203,7 +203,7 @@ impl Migrator {
         let done: std::collections::BTreeSet<&str> =
             applied.iter().map(|(v, _, _)| v.as_str()).collect();
         let next_batch = applied.iter().map(|(_, _, b)| *b).max().unwrap_or(0) + 1;
-        let now = now_epoch();
+        let now = sutegi_crypto::now_secs();
 
         let mut ran = Vec::new();
         for m in self.sorted() {
@@ -374,14 +374,6 @@ fn in_transaction<B: Backend>(
             Err(e)
         }
     }
-}
-
-/// Seconds since the Unix epoch (stored in the history table's `applied_at`).
-fn now_epoch() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(all(test, feature = "sqlite"))]

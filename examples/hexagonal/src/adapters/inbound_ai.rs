@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use sutegi::hex::{IntoJson, UseCase};
+use sutegi::hexagon::{IntoJson, UseCase};
 use sutegi::prelude::*;
 
 use crate::application::CreateTodo;

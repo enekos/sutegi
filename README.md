@@ -97,7 +97,7 @@ fn main() -> std::io::Result<()> {
 | `sutegi-validate` | Fluent `Validator`-style rule sets **and** a JSON Schema subset validator, with structured errors. |
 | `sutegi-queue` | Durable, cross-pod job queue backed by Postgres (`FOR UPDATE SKIP LOCKED` claim, visibility-timeout retries, dead-letter). |
 | `sutegi-ai`   | The agent surface (`schema` helpers, `ToolCtx`). Tools are first-class on the `App` (`App::tool`/`stream_tool`), auto-mounted at `/__tools` with schema-validated args. |
-| `sutegi-hex`  | Opinionated hexagonal/clean-architecture primitives: `AppError`, `UseCase` ports, `respond` adapter glue. |
+| `sutegi-hexagon`  | Opinionated hexagonal/clean-architecture primitives: `AppError`, `UseCase` ports, `respond` adapter glue. |
 | `sutegi`      | Facade crate + `prelude`. |
 | `sutegi-cli`  | The `sutegi` command: scaffold apps/models/routes, `introspect` a live app. |
 
@@ -117,7 +117,7 @@ what you use:
 | `postgres` |   | Postgres backend — the **multi-pod** runnable store (pure std) |
 | `queue`    |   | durable, cross-pod job queue (Postgres-backed) |
 | `graceful` |   | SIGTERM/SIGINT draining (libc) |
-| `hex`      |   | hexagonal/clean-architecture primitives |
+| `hexagon`  |   | hexagonal/clean-architecture primitives |
 | `session`  |   | signed-cookie sessions (HMAC-SHA256) |
 | `auth`     |   | the user system: passwords, `Users`, login sessions, guards, API tokens |
 | `template` |   | Blade-style template engine (`{{ }}`, `@if`, `@foreach`, `@include`) |
@@ -216,7 +216,7 @@ hook for clean draining, Prometheus scrape annotations, and small resource asks
 ## Architecture: building clean apps (hexagonal)
 
 For non-trivial apps, sutegi ships an opinionated **ports & adapters** structure
-(the `hex` feature). The dependency rule — *source dependencies point inward* —
+(the `hexagon` feature). The dependency rule — *source dependencies point inward* —
 keeps your domain free of HTTP/SQL, makes business logic unit-testable without a
 server, and lets you expose one use case over many transports.
 
@@ -227,7 +227,7 @@ inbound adapters (HTTP, AI tools) ──▶ application (use cases) ──▶ po
                                           domain (pure)      outbound adapters (SQLite, …)
 ```
 
-`sutegi::hex` provides `AppError` (with a canonical HTTP mapping), the `UseCase`
+`sutegi::hexagon` provides `AppError` (with a canonical HTTP mapping), the `UseCase`
 port trait, and `respond()`/`respond_created()` glue. The
 [`examples/hexagonal`](./examples/hexagonal) app is a full worked reference:
 domain → ports → use cases → adapters, with the **same `CreateTodo` use case

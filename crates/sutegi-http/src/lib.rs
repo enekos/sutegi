@@ -444,14 +444,21 @@ pub fn parse_request<R: BufRead>(reader: &mut R, limits: &Limits) -> io::Result<
 /// close. Takes the response by value so a streaming body's `FnOnce` producer
 /// can be invoked.
 pub fn write_response<W: Write>(w: &mut W, resp: Response, keep_alive: bool) -> io::Result<()> {
+    use std::fmt::Write as _;
+
     let reason = status_reason(resp.status);
-    let mut head = format!("HTTP/1.1 {} {}\r\n", resp.status, reason);
+    // One growable buffer for the whole head — no per-header `format!` allocs.
+    let mut head = String::with_capacity(256);
+    let _ = write!(head, "HTTP/1.1 {} {}\r\n", resp.status, reason);
     let mut has_content_type = false;
     for (k, v) in &resp.headers {
         if k.eq_ignore_ascii_case("content-type") {
             has_content_type = true;
         }
-        head.push_str(&format!("{}: {}\r\n", k, v));
+        head.push_str(k);
+        head.push_str(": ");
+        head.push_str(v);
+        head.push_str("\r\n");
     }
     if !has_content_type {
         head.push_str("content-type: text/plain; charset=utf-8\r\n");
@@ -459,7 +466,7 @@ pub fn write_response<W: Write>(w: &mut W, resp: Response, keep_alive: bool) -> 
 
     match resp.body {
         Body::Full(bytes) => {
-            head.push_str(&format!("content-length: {}\r\n", bytes.len()));
+            let _ = write!(head, "content-length: {}\r\n", bytes.len());
             head.push_str(if keep_alive {
                 "connection: keep-alive\r\n\r\n"
             } else {

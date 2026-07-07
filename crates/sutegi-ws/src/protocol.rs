@@ -230,20 +230,19 @@ pub fn encode_close(code: u16, reason: &str) -> Vec<u8> {
     encode_frame(Opcode::Close, &payload, true)
 }
 
-/// Validate a received close-frame payload → `(code, reason)`.
+/// Validate a received close-frame payload → `(code, reason)`. The reason
+/// borrows from the payload — no allocation for the common discard-it case.
 /// Empty payload means "no code" and is treated as 1000 (RFC 6455 §7.1.5).
-pub fn parse_close(payload: &[u8]) -> Result<(u16, String), ProtocolError> {
+pub fn parse_close(payload: &[u8]) -> Result<(u16, &str), ProtocolError> {
     match payload.len() {
-        0 => Ok((1000, String::new())),
+        0 => Ok((1000, "")),
         1 => Err(ProtocolError::BadCloseFrame),
         _ => {
             let code = u16::from_be_bytes([payload[0], payload[1]]);
             if !valid_close_code(code) {
                 return Err(ProtocolError::BadCloseFrame);
             }
-            let reason = std::str::from_utf8(&payload[2..])
-                .map_err(|_| ProtocolError::BadUtf8)?
-                .to_string();
+            let reason = std::str::from_utf8(&payload[2..]).map_err(|_| ProtocolError::BadUtf8)?;
             Ok((code, reason))
         }
     }
@@ -386,15 +385,12 @@ mod tests {
 
     #[test]
     fn close_frame_payloads() {
-        assert_eq!(parse_close(&[]), Ok((1000, String::new())));
+        assert_eq!(parse_close(&[]), Ok((1000, "")));
         assert_eq!(parse_close(&[0x03]), Err(ProtocolError::BadCloseFrame));
-        assert_eq!(
-            parse_close(&1000u16.to_be_bytes()),
-            Ok((1000, String::new()))
-        );
+        assert_eq!(parse_close(&1000u16.to_be_bytes()), Ok((1000, "")));
         let mut p = 1001u16.to_be_bytes().to_vec();
         p.extend_from_slice("adiós".as_bytes());
-        assert_eq!(parse_close(&p), Ok((1001, "adiós".to_string())));
+        assert_eq!(parse_close(&p), Ok((1001, "adiós")));
         // Reserved codes a peer must not send.
         for code in [0u16, 999, 1004, 1005, 1006, 1012, 2999] {
             assert_eq!(

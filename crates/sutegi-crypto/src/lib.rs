@@ -1,6 +1,7 @@
 //! sutegi's shared pure-`std` cryptographic primitives: SHA-256, HMAC-SHA-256,
 //! PBKDF2-HMAC-SHA-256, MD5 (legacy Postgres auth only), hex, Base64,
-//! constant-time comparison, and OS randomness.
+//! constant-time comparison, OS randomness — plus the epoch clock helpers
+//! ([`now_secs`]/[`now_millis`]) every row-stamping crate shares.
 //!
 //! Born inside the Postgres driver (SCRAM-SHA-256 needs the full HMAC/PBKDF2
 //! chain) and extracted once it grew more consumers: `sutegi-pg` (SCRAM),
@@ -314,6 +315,27 @@ pub fn random_bytes(n: usize) -> Result<Vec<u8>, String> {
     f.read_exact(&mut buf)
         .map_err(|e| format!("read /dev/urandom: {e}"))?;
     Ok(buf)
+}
+
+// ---------------------------------------------------------------------------
+// Clock — the one epoch-timestamp helper, shared by every crate that stamps
+// rows (auth token expiry, migration history, KV/event `created_at`).
+// ---------------------------------------------------------------------------
+
+/// Seconds since the Unix epoch (0 if the system clock is before it).
+pub fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Milliseconds since the Unix epoch (0 if the system clock is before it).
+pub fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
