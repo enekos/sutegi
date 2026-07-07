@@ -109,6 +109,158 @@ fn pk_from_rows(rows: &[Json], pk: &str) -> i64 {
         .unwrap_or(0)
 }
 
+/// Map a Postgres `information_schema` type back to a [`ColType`].
+fn pg_coltype(data_type: &str, udt_name: &str) -> crate::value::ColType {
+    use crate::value::ColType;
+    match data_type {
+        "bigint" | "integer" | "smallint" => ColType::Integer,
+        "double precision" | "real" | "numeric" => ColType::Real,
+        "boolean" => ColType::Boolean,
+        "jsonb" | "json" => ColType::Json,
+        // pgvector surfaces as USER-DEFINED with udt_name `vector`. The declared
+        // dimension lives in `atttypmod`, not information_schema — reflect it
+        // back dimensionless (the diff compares storage, and a dim'd vs
+        // dimensionless vector both render `vector*` — documented lossiness).
+        _ if udt_name == "vector" => ColType::Vector { dim: None },
+        _ => ColType::Text,
+    }
+}
+
+/// Reflect every public user table out of Postgres over any [`Backend`]
+/// (a [`Pg`] pool or a [`Tx`]). Uses `information_schema` + `pg_index`; the
+/// framework's `_sutegi_migrations` ledger is excluded.
+fn introspect_pg(exec: &dyn Backend) -> Result<Vec<TableSchema>, String> {
+    use crate::value::{parse_default_literal, Column, FkAction, ForeignKey, Index};
+
+    let s = |j: &Json, k: &str| j.get(k).and_then(Json::as_str).unwrap_or("").to_string();
+    let b = |j: &Json, k: &str| j.get(k).and_then(Json::as_bool).unwrap_or(false);
+
+    let tables = exec.query(
+        "SELECT table_name FROM information_schema.tables \
+         WHERE table_schema = 'public' AND table_type = 'BASE TABLE' \
+         AND table_name NOT LIKE '\\_sutegi\\_%' ORDER BY table_name",
+        &[],
+    )?;
+
+    let mut out = Vec::new();
+    for t in &tables {
+        let table = s(t, "table_name");
+        let mut schema = TableSchema::new(table.clone());
+
+        // Primary-key columns for this table.
+        let pk_rows = exec.query(
+            "SELECT kcu.column_name AS col FROM information_schema.table_constraints tc \
+             JOIN information_schema.key_column_usage kcu \
+               ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema \
+             WHERE tc.table_schema = 'public' AND tc.table_name = ? \
+               AND tc.constraint_type = 'PRIMARY KEY'",
+            &[Value::Text(table.clone())],
+        )?;
+        let pks: Vec<String> = pk_rows.iter().map(|r| s(r, "col")).collect();
+
+        let cols = exec.query(
+            "SELECT column_name, data_type, udt_name, is_nullable, column_default \
+             FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = ? ORDER BY ordinal_position",
+            &[Value::Text(table.clone())],
+        )?;
+        for c in &cols {
+            let name = s(c, "column_name");
+            let mut col = Column::new(
+                name.clone(),
+                pg_coltype(&s(c, "data_type"), &s(c, "udt_name")),
+            );
+            let is_pk = pks.contains(&name);
+            if s(c, "is_nullable") == "YES" && !is_pk {
+                col = col.nullable();
+            }
+            if is_pk {
+                col = col.primary();
+            }
+            if let Some(d) = c.get("column_default").and_then(Json::as_str) {
+                if let Some(v) = parse_default_literal(d) {
+                    col = col.default(v);
+                }
+            }
+            schema.columns.push(col);
+        }
+
+        // Foreign keys with their delete rule.
+        let fks = exec.query(
+            "SELECT kcu.column_name AS col, ccu.table_name AS ref_table, \
+                    ccu.column_name AS ref_col, rc.delete_rule AS del \
+             FROM information_schema.table_constraints tc \
+             JOIN information_schema.key_column_usage kcu \
+               ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema \
+             JOIN information_schema.constraint_column_usage ccu \
+               ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema \
+             JOIN information_schema.referential_constraints rc \
+               ON tc.constraint_name = rc.constraint_name \
+             WHERE tc.table_schema = 'public' AND tc.table_name = ? \
+               AND tc.constraint_type = 'FOREIGN KEY'",
+            &[Value::Text(table.clone())],
+        )?;
+        for fk in &fks {
+            schema.foreign_keys.push(ForeignKey {
+                column: s(fk, "col"),
+                ref_table: s(fk, "ref_table"),
+                ref_column: s(fk, "ref_col"),
+                on_delete: FkAction::from_sql(&s(fk, "del")),
+            });
+        }
+
+        // Indexes + uniques. Group multi-column indexes by name; a unique
+        // single-column index that isn't ours (`idx_*`) is a column-level
+        // UNIQUE (Postgres names it `<table>_<col>_key`) — fold it back.
+        let idx_rows = exec.query(
+            "SELECT i.relname AS index_name, ix.indisunique AS is_unique, \
+                    ix.indisprimary AS is_primary, a.attname AS column_name \
+             FROM pg_index ix \
+             JOIN pg_class i ON i.oid = ix.indexrelid \
+             JOIN pg_class t ON t.oid = ix.indrelid \
+             JOIN pg_namespace n ON n.oid = t.relnamespace \
+             JOIN unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON true \
+             JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum \
+             WHERE t.relname = ? AND n.nspname = 'public' ORDER BY i.relname, k.ord",
+            &[Value::Text(table.clone())],
+        )?;
+        // Preserve first-seen order of index names.
+        let mut order: Vec<String> = Vec::new();
+        let mut grouped: std::collections::HashMap<String, (bool, bool, Vec<String>)> =
+            std::collections::HashMap::new();
+        for r in &idx_rows {
+            let name = s(r, "index_name");
+            let entry = grouped
+                .entry(name.clone())
+                .or_insert_with(|| (b(r, "is_unique"), b(r, "is_primary"), Vec::new()));
+            entry.2.push(s(r, "column_name"));
+            if !order.contains(&name) {
+                order.push(name);
+            }
+        }
+        for name in order {
+            let (unique, primary, columns) = &grouped[&name];
+            if *primary {
+                continue;
+            }
+            if *unique && columns.len() == 1 && !name.starts_with("idx_") {
+                if let Some(col) = schema.columns.iter_mut().find(|c| c.name == columns[0]) {
+                    col.unique = true;
+                }
+                continue;
+            }
+            schema.indexes.push(Index {
+                name,
+                columns: columns.clone(),
+                unique: *unique,
+            });
+        }
+
+        out.push(schema.normalized());
+    }
+    Ok(out)
+}
+
 /// A PostgreSQL-backed handle, cloneable and shareable across threads (it holds
 /// a connection [`Pool`]).
 #[derive(Clone)]
@@ -198,6 +350,10 @@ impl Backend for Pg {
         self.pool
             .batch(&create_table_sql(schema, Dialect::Postgres))
     }
+
+    fn introspect(&self) -> Result<Vec<TableSchema>, String> {
+        introspect_pg(self)
+    }
 }
 
 impl crate::backend::Transactional for Pg {
@@ -259,6 +415,10 @@ impl Backend for Tx<'_> {
         self.client
             .borrow_mut()
             .batch(&create_table_sql(schema, Dialect::Postgres))
+    }
+
+    fn introspect(&self) -> Result<Vec<TableSchema>, String> {
+        introspect_pg(self)
     }
 }
 

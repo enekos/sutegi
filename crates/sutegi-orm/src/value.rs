@@ -311,6 +311,20 @@ impl TableSchema {
     pub fn col(&self, name: &str) -> Option<&Column> {
         self.columns.iter().find(|c| c.name == name)
     }
+
+    /// A canonical copy for comparison: columns keep their declared order (it is
+    /// semantic — it drives row shape), but indexes and foreign keys are sorted
+    /// into a stable order, since they're *sets* whose declaration order carries
+    /// no meaning. Diffing and round-trip checks compare normalized schemas so a
+    /// database that reports its indexes in a different order doesn't false-diff.
+    pub fn normalized(&self) -> TableSchema {
+        let mut s = self.clone();
+        s.indexes.sort_by(|a, b| a.name.cmp(&b.name));
+        s.foreign_keys.sort_by(|a, b| {
+            (&a.column, &a.ref_table, &a.ref_column).cmp(&(&b.column, &b.ref_table, &b.ref_column))
+        });
+        s
+    }
 }
 
 /// Render a [`Value`] as a SQL DDL literal, for `DEFAULT` clauses. Text (and
@@ -328,6 +342,47 @@ pub fn default_sql(value: &Value) -> String {
         Value::Json(j) => quote(&j.to_string()),
         Value::Vector(v) => quote(&vector_to_text(v)),
     }
+}
+
+/// Parse a SQL `DEFAULT` clause literal back into a [`Value`] — the best-effort
+/// inverse of [`default_sql`], used when introspecting a live database.
+///
+/// Handles the literal forms both dialects emit (quoted strings, integers,
+/// floats, `TRUE`/`FALSE`) and strips Postgres's trailing `::type` cast. Returns
+/// `None` for `NULL` or any expression it can't reduce to a scalar (a computed
+/// default like `now()` has no `Value` equivalent; the diff treats it as absent).
+pub fn parse_default_literal(raw: &str) -> Option<Value> {
+    let mut s = raw.trim();
+    // Strip a Postgres cast suffix: `'draft'::text`, `0::bigint`.
+    if let Some(idx) = s.rfind("::") {
+        let cast = &s[idx + 2..];
+        if !cast.is_empty()
+            && cast
+                .chars()
+                .all(|c| c.is_ascii_alphabetic() || c == ' ' || c == '"')
+        {
+            s = s[..idx].trim();
+        }
+    }
+    if s.eq_ignore_ascii_case("null") || s.is_empty() {
+        return None;
+    }
+    if s.eq_ignore_ascii_case("true") {
+        return Some(Value::Bool(true));
+    }
+    if s.eq_ignore_ascii_case("false") {
+        return Some(Value::Bool(false));
+    }
+    if let Some(inner) = s.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
+        return Some(Value::Text(inner.replace("''", "'")));
+    }
+    if let Ok(i) = s.parse::<i64>() {
+        return Some(Value::Int(i));
+    }
+    if let Ok(r) = s.parse::<f64>() {
+        return Some(Value::Real(r));
+    }
+    None
 }
 
 /// Describe a table schema as JSON, for `/__introspect` and schema files.

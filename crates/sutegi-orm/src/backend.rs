@@ -54,6 +54,18 @@ pub trait Backend {
     /// Create a table from a schema if it does not already exist.
     fn migrate(&self, schema: &TableSchema) -> Result<(), String>;
 
+    /// Read the live schema of every user table back out of the database, as
+    /// [`TableSchema`]s — the inverse of [`migrate`](Backend::migrate). The
+    /// framework's own `_sutegi_migrations` history table is excluded.
+    ///
+    /// This backs schema diffing and drift detection. The default errors: a
+    /// backend that can't reflect its own catalog (e.g. an in-memory test
+    /// double) simply doesn't support it. The real SQLite and Postgres backends
+    /// override it.
+    fn introspect(&self) -> Result<Vec<TableSchema>, String> {
+        Err("this backend does not support schema introspection".into())
+    }
+
     // --- default methods (shared, implemented via the primitives) ---
 
     /// Run a query builder and return rows as JSON objects.

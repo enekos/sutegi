@@ -220,6 +220,54 @@ fn migrations_run_and_roll_back_over_postgres() {
 }
 
 #[test]
+fn introspect_round_trips_over_postgres() {
+    use sutegi_orm::FkAction;
+
+    let Some(db) = db() else {
+        eprintln!("skipping: SUTEGI_PG_TEST_URL not set");
+        return;
+    };
+    db.pool()
+        .batch("DROP TABLE IF EXISTS orm_pg_posts")
+        .unwrap();
+    db.pool()
+        .batch("DROP TABLE IF EXISTS orm_pg_users")
+        .unwrap();
+
+    let users = TableSchema::new("orm_pg_users")
+        .column(Column::new("id", ColType::Integer).primary())
+        .column(Column::new("email", ColType::Text).unique());
+    let posts = TableSchema::new("orm_pg_posts")
+        .column(Column::new("id", ColType::Integer).primary())
+        .column(Column::new("title", ColType::Text))
+        .column(Column::new("body", ColType::Text).nullable())
+        .column(Column::new("views", ColType::Integer).default(Value::Int(0)))
+        .column(Column::new("slug", ColType::Text))
+        .column(Column::new("user_id", ColType::Integer))
+        .foreign_key("user_id", "orm_pg_users", "id", FkAction::Cascade)
+        .index(&["user_id"])
+        .unique_index(&["slug"]);
+
+    db.migrate(&users).unwrap();
+    db.migrate(&posts).unwrap();
+
+    let reflected = db.introspect().unwrap();
+    let got_users = reflected
+        .iter()
+        .find(|t| t.table == "orm_pg_users")
+        .expect("users reflected");
+    let got_posts = reflected
+        .iter()
+        .find(|t| t.table == "orm_pg_posts")
+        .expect("posts reflected");
+    assert_eq!(got_users, &users.normalized());
+    assert_eq!(got_posts, &posts.normalized());
+
+    db.pool().batch("DROP TABLE orm_pg_posts").unwrap();
+    db.pool().batch("DROP TABLE orm_pg_users").unwrap();
+}
+
+#[test]
 fn kv_store_over_postgres() {
     use sutegi_orm::kv::Kv;
 

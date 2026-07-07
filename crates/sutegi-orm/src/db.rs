@@ -276,6 +276,118 @@ fn upsert_conn(
     Ok(conn.last_insert_rowid())
 }
 
+/// Map a SQLite declared column type back to a [`ColType`]. JSON- and
+/// vector-typed columns are stored as `TEXT`, so they reflect back as `Text` —
+/// the diff compares storage types, so this collapse never produces a false
+/// change (see [`ColType::storage`](crate::value::ColType::storage)).
+fn sqlite_coltype(decl: &str) -> crate::value::ColType {
+    use crate::value::ColType;
+    match decl.to_ascii_uppercase().as_str() {
+        "INTEGER" => ColType::Integer,
+        "REAL" => ColType::Real,
+        "BOOLEAN" => ColType::Boolean,
+        _ => ColType::Text,
+    }
+}
+
+/// Reflect every user table's schema out of a SQLite connection via `PRAGMA`.
+/// Shared by [`Db`] and [`Tx`].
+fn introspect_sqlite(conn: &Connection) -> Result<Vec<TableSchema>, String> {
+    use crate::value::{parse_default_literal, Column, ForeignKey, Index};
+
+    let s = |j: &Json, k: &str| j.get(k).and_then(Json::as_str).unwrap_or("").to_string();
+    let i = |j: &Json, k: &str| j.get(k).and_then(Json::as_i64).unwrap_or(0);
+
+    // User tables only: skip sqlite internals and our own migration ledger.
+    let tables = query_conn(
+        conn,
+        "SELECT name FROM sqlite_master WHERE type = 'table' \
+         AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '\\_sutegi\\_%' ESCAPE '\\' \
+         ORDER BY name",
+        &[],
+    )?;
+
+    let mut out = Vec::new();
+    for t in &tables {
+        let table = s(t, "name");
+        let mut schema = TableSchema::new(table.clone());
+
+        let cols = query_conn(
+            conn,
+            "SELECT name, type, \"notnull\", dflt_value, pk FROM pragma_table_info(?)",
+            &[Value::Text(table.clone())],
+        )?;
+        for c in &cols {
+            let mut col = Column::new(s(c, "name"), sqlite_coltype(&s(c, "type")));
+            let is_pk = i(c, "pk") > 0;
+            // `INTEGER PRIMARY KEY` reports notnull=0, but a key is never null.
+            if i(c, "notnull") == 0 && !is_pk {
+                col = col.nullable();
+            }
+            if is_pk {
+                col = col.primary();
+            }
+            if let Some(d) = c.get("dflt_value").and_then(Json::as_str) {
+                if let Some(v) = parse_default_literal(d) {
+                    col = col.default(v);
+                }
+            }
+            schema.columns.push(col);
+        }
+
+        // Indexes: origin 'u' is a UNIQUE constraint's auto-index (fold single
+        // columns back into the column's `unique` flag); 'c' is a named
+        // secondary index; 'pk' is the primary key (skip).
+        let idx_list = query_conn(
+            conn,
+            "SELECT name, \"unique\", origin FROM pragma_index_list(?)",
+            &[Value::Text(table.clone())],
+        )?;
+        for idx in &idx_list {
+            let name = s(idx, "name");
+            let origin = s(idx, "origin");
+            let unique = i(idx, "unique") == 1;
+            if origin == "pk" {
+                continue;
+            }
+            let cols = query_conn(
+                conn,
+                "SELECT name FROM pragma_index_info(?) ORDER BY seqno",
+                &[Value::Text(name.clone())],
+            )?;
+            let columns: Vec<String> = cols.iter().map(|c| s(c, "name")).collect();
+            if origin == "u" && columns.len() == 1 {
+                if let Some(col) = schema.columns.iter_mut().find(|c| c.name == columns[0]) {
+                    col.unique = true;
+                }
+                continue;
+            }
+            schema.indexes.push(Index {
+                name,
+                columns,
+                unique,
+            });
+        }
+
+        let fks = query_conn(
+            conn,
+            "SELECT \"table\", \"from\", \"to\", on_delete FROM pragma_foreign_key_list(?)",
+            &[Value::Text(table.clone())],
+        )?;
+        for fk in &fks {
+            schema.foreign_keys.push(ForeignKey {
+                column: s(fk, "from"),
+                ref_table: s(fk, "table"),
+                ref_column: s(fk, "to"),
+                on_delete: crate::value::FkAction::from_sql(&s(fk, "on_delete")),
+            });
+        }
+
+        out.push(schema.normalized());
+    }
+    Ok(out)
+}
+
 impl Backend for Db {
     fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Json>, String> {
         self.pool.with(|conn| query_conn(conn, sql, params))
@@ -307,6 +419,10 @@ impl Backend for Db {
             conn.execute_batch(&create_table_sql(schema, Dialect::Sqlite))
                 .map_err(|e| e.to_string())
         })
+    }
+
+    fn introspect(&self) -> Result<Vec<TableSchema>, String> {
+        self.pool.with(|conn| introspect_sqlite(conn))
     }
 }
 
@@ -358,6 +474,10 @@ impl Backend for Tx<'_> {
             .borrow()
             .execute_batch(&create_table_sql(schema, Dialect::Sqlite))
             .map_err(|e| e.to_string())
+    }
+
+    fn introspect(&self) -> Result<Vec<TableSchema>, String> {
+        introspect_sqlite(&self.conn.borrow())
     }
 }
 
@@ -553,5 +673,67 @@ mod tests {
     fn pooled_file_db_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Db>();
+    }
+
+    #[test]
+    fn introspect_round_trips_a_migrated_schema() {
+        use crate::value::{FkAction, TableSchema};
+
+        let db = Db::memory().unwrap();
+
+        // A parent, then a child exercising every IR feature: unique column,
+        // integer default, secondary index, unique index, and a foreign key.
+        let users = TableSchema::new("users")
+            .column(Column::new("id", ColType::Integer).primary())
+            .column(Column::new("email", ColType::Text).unique());
+        let posts = TableSchema::new("posts")
+            .column(Column::new("id", ColType::Integer).primary())
+            .column(Column::new("title", ColType::Text))
+            .column(Column::new("body", ColType::Text).nullable())
+            .column(Column::new("views", ColType::Integer).default(Value::Int(0)))
+            .column(Column::new("slug", ColType::Text))
+            .column(Column::new("user_id", ColType::Integer))
+            .foreign_key("user_id", "users", "id", FkAction::Cascade)
+            .index(&["user_id"])
+            .unique_index(&["slug"]);
+
+        db.migrate(&users).unwrap();
+        db.migrate(&posts).unwrap();
+
+        let reflected = db.introspect().unwrap();
+        assert_eq!(reflected.len(), 2);
+
+        // Introspection lists tables alphabetically: posts, users.
+        let got_posts = reflected.iter().find(|t| t.table == "posts").unwrap();
+        assert_eq!(
+            got_posts,
+            &posts.normalized(),
+            "posts schema did not round-trip"
+        );
+
+        let got_users = reflected.iter().find(|t| t.table == "users").unwrap();
+        assert_eq!(
+            got_users,
+            &users.normalized(),
+            "users schema did not round-trip"
+        );
+    }
+
+    #[test]
+    fn introspect_skips_the_migration_ledger() {
+        let db = Db::memory().unwrap();
+        db.execute(
+            "CREATE TABLE _sutegi_migrations (version TEXT PRIMARY KEY)",
+            &[],
+        )
+        .unwrap();
+        db.migrate(&todos_schema()).unwrap();
+        let names: Vec<String> = db
+            .introspect()
+            .unwrap()
+            .into_iter()
+            .map(|t| t.table)
+            .collect();
+        assert_eq!(names, vec!["todos".to_string()]);
     }
 }
