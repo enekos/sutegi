@@ -28,8 +28,9 @@ mod value;
 pub use backend::{row, Backend, FromInput, FromRow, Model, Transactional};
 pub use builder::{DeleteBuilder, Page, QueryBuilder, UpdateBuilder};
 pub use value::{
-    create_table_sql, default_sql, parse_default_literal, schema_json, ColType, Column, Dialect,
-    FkAction, ForeignKey, Index, TableSchema, Value,
+    create_table_sql, default_sql, parse_default_literal, schema_from_json, schema_json,
+    schema_to_json, value_from_json, value_to_json, ColType, Column, Dialect, FkAction, ForeignKey,
+    Index, TableSchema, Value,
 };
 
 /// The pure schema diff engine: [`schema_diff::SchemaOp`],

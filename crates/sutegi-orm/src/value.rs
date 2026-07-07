@@ -457,6 +457,227 @@ pub fn schema_json(schema: &TableSchema) -> Json {
     Json::obj(fields)
 }
 
+// ---------------------------------------------------------------------------
+// Lossless JSON serialization for migration files (schema_json above is for the
+// human/agent-facing /__introspect view; this pair round-trips exactly).
+// ---------------------------------------------------------------------------
+
+/// A [`Value`] as a self-describing tagged object, so a default's exact variant
+/// survives a round trip (`Int(5)` and `Real(5.0)` are distinguishable, unlike
+/// [`Value::to_json`]).
+pub fn value_to_json(v: &Value) -> Json {
+    let (t, val) = match v {
+        Value::Null => ("null", Json::Null),
+        Value::Int(i) => ("int", Json::int(*i)),
+        Value::Real(r) => ("real", Json::Num(*r)),
+        Value::Text(s) => ("text", Json::str(s.clone())),
+        Value::Bool(b) => ("bool", Json::Bool(*b)),
+        Value::Json(j) => ("json", j.clone()),
+        Value::Vector(vec) => (
+            "vector",
+            Json::arr(vec.iter().map(|x| Json::Num(*x as f64)).collect()),
+        ),
+    };
+    Json::obj(vec![("t", Json::str(t)), ("v", val)])
+}
+
+/// Parse a [`value_to_json`] tagged object back into a [`Value`].
+pub fn value_from_json(j: &Json) -> Result<Value, String> {
+    let t = j
+        .get("t")
+        .and_then(Json::as_str)
+        .ok_or("value: missing tag `t`")?;
+    let v = j.get("v").unwrap_or(&Json::Null);
+    Ok(match t {
+        "null" => Value::Null,
+        "int" => Value::Int(v.as_i64().ok_or("value: `int` needs a number")?),
+        "real" => Value::Real(v.as_f64().ok_or("value: `real` needs a number")?),
+        "text" => Value::Text(
+            v.as_str()
+                .ok_or("value: `text` needs a string")?
+                .to_string(),
+        ),
+        "bool" => Value::Bool(v.as_bool().ok_or("value: `bool` needs a boolean")?),
+        "json" => Value::Json(v.clone()),
+        "vector" => {
+            let arr = v.as_array().ok_or("value: `vector` needs an array")?;
+            Value::Vector(
+                arr.iter()
+                    .filter_map(|x| x.as_f64().map(|f| f as f32))
+                    .collect(),
+            )
+        }
+        other => return Err(format!("value: unknown tag `{other}`")),
+    })
+}
+
+/// Serialize a [`Column`] losslessly (tagged default), for migration files.
+pub fn column_to_json(c: &Column) -> Json {
+    let mut f = vec![
+        ("name", Json::str(c.name.clone())),
+        ("type", Json::str(c.ty.name())),
+        ("nullable", Json::Bool(c.nullable)),
+        ("primary", Json::Bool(c.primary)),
+        ("unique", Json::Bool(c.unique)),
+    ];
+    if let ColType::Vector { dim: Some(d) } = c.ty {
+        f.push(("dim", Json::int(d as i64)));
+    }
+    if let Some(d) = &c.default {
+        f.push(("default", value_to_json(d)));
+    }
+    Json::obj(f)
+}
+
+/// Parse a [`column_to_json`] object back into a [`Column`].
+pub fn column_from_json(c: &Json) -> Result<Column, String> {
+    let name = c
+        .get("name")
+        .and_then(Json::as_str)
+        .ok_or("column: missing `name`")?;
+    let type_name = c
+        .get("type")
+        .and_then(Json::as_str)
+        .ok_or("column: missing `type`")?;
+    let dim = c.get("dim").and_then(Json::as_i64).map(|d| d as usize);
+    let ty = ColType::from_name(type_name, dim)
+        .ok_or_else(|| format!("column: unknown type `{type_name}`"))?;
+    let mut col = Column::new(name, ty);
+    if c.get("nullable").and_then(Json::as_bool) == Some(true) {
+        col = col.nullable();
+    }
+    if c.get("primary").and_then(Json::as_bool) == Some(true) {
+        col = col.primary();
+    }
+    if c.get("unique").and_then(Json::as_bool) == Some(true) {
+        col = col.unique();
+    }
+    if let Some(d) = c.get("default") {
+        if !matches!(d, Json::Null) {
+            col = col.default(value_from_json(d)?);
+        }
+    }
+    Ok(col)
+}
+
+/// Serialize an [`Index`].
+pub fn index_to_json(i: &Index) -> Json {
+    Json::obj(vec![
+        ("name", Json::str(i.name.clone())),
+        (
+            "columns",
+            Json::arr(i.columns.iter().map(|c| Json::str(c.clone())).collect()),
+        ),
+        ("unique", Json::Bool(i.unique)),
+    ])
+}
+
+/// Parse an [`index_to_json`] object.
+pub fn index_from_json(i: &Json) -> Result<Index, String> {
+    Ok(Index {
+        name: i
+            .get("name")
+            .and_then(Json::as_str)
+            .ok_or("index: missing `name`")?
+            .to_string(),
+        columns: i
+            .get("columns")
+            .and_then(Json::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|c| c.as_str().map(str::to_string))
+            .collect(),
+        unique: i.get("unique").and_then(Json::as_bool).unwrap_or(false),
+    })
+}
+
+/// Serialize a [`ForeignKey`].
+pub fn fk_to_json(f: &ForeignKey) -> Json {
+    Json::obj(vec![
+        ("column", Json::str(f.column.clone())),
+        ("ref_table", Json::str(f.ref_table.clone())),
+        ("ref_column", Json::str(f.ref_column.clone())),
+        ("on_delete", Json::str(f.on_delete.sql())),
+    ])
+}
+
+/// Parse an [`fk_to_json`] object.
+pub fn fk_from_json(f: &Json) -> Result<ForeignKey, String> {
+    Ok(ForeignKey {
+        column: f
+            .get("column")
+            .and_then(Json::as_str)
+            .ok_or("fk: missing `column`")?
+            .to_string(),
+        ref_table: f
+            .get("ref_table")
+            .and_then(Json::as_str)
+            .ok_or("fk: missing `ref_table`")?
+            .to_string(),
+        ref_column: f
+            .get("ref_column")
+            .and_then(Json::as_str)
+            .ok_or("fk: missing `ref_column`")?
+            .to_string(),
+        on_delete: FkAction::from_sql(f.get("on_delete").and_then(Json::as_str).unwrap_or("")),
+    })
+}
+
+/// Serialize a [`TableSchema`] losslessly, for a migration file.
+pub fn schema_to_json(schema: &TableSchema) -> Json {
+    Json::obj(vec![
+        ("table", Json::str(schema.table.clone())),
+        (
+            "columns",
+            Json::arr(schema.columns.iter().map(column_to_json).collect()),
+        ),
+        (
+            "indexes",
+            Json::arr(schema.indexes.iter().map(index_to_json).collect()),
+        ),
+        (
+            "foreign_keys",
+            Json::arr(schema.foreign_keys.iter().map(fk_to_json).collect()),
+        ),
+    ])
+}
+
+/// Parse a [`schema_to_json`] object back into a [`TableSchema`].
+pub fn schema_from_json(j: &Json) -> Result<TableSchema, String> {
+    let table = j
+        .get("table")
+        .and_then(Json::as_str)
+        .ok_or("schema: missing `table`")?
+        .to_string();
+    let mut schema = TableSchema::new(table);
+    for c in j
+        .get("columns")
+        .and_then(Json::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+    {
+        schema.columns.push(column_from_json(c)?);
+    }
+    for i in j
+        .get("indexes")
+        .and_then(Json::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+    {
+        schema.indexes.push(index_from_json(i)?);
+    }
+    for f in j
+        .get("foreign_keys")
+        .and_then(Json::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+    {
+        schema.foreign_keys.push(fk_from_json(f)?);
+    }
+    Ok(schema)
+}
+
 /// Render one column definition (no indent), including inline `PRIMARY KEY`,
 /// `NOT NULL`, `UNIQUE`, and `DEFAULT`. The Postgres integer-primary-key case
 /// becomes an identity column. Shared by `CREATE TABLE` and `ADD COLUMN`.

@@ -134,8 +134,10 @@ pub mod config;
 #[cfg(feature = "orm")]
 pub mod migrate {
     pub use sutegi_orm::migrate::{
-        status_json, Migration, MigrationOps, MigrationStatus, Migrator,
+        generate, generate_via, status_json, write_migration_file, Migration, MigrationOps,
+        MigrationStatus, Migrator,
     };
+    pub use sutegi_orm::schema_diff::{self, Plan, SchemaOp};
     use sutegi_orm::Backend;
 
     /// Inspect `std::env::args()` for a `migrate*` subcommand and run it against

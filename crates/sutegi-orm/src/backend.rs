@@ -54,6 +54,13 @@ pub trait Backend {
     /// Create a table from a schema if it does not already exist.
     fn migrate(&self, schema: &TableSchema) -> Result<(), String>;
 
+    /// The SQL dialect this backend speaks — the DDL emitter and diff engine
+    /// need it to render the right statements. Defaults to SQLite; the Postgres
+    /// backend and its transaction handle override it.
+    fn dialect(&self) -> crate::value::Dialect {
+        crate::value::Dialect::Sqlite
+    }
+
     /// Read the live schema of every user table back out of the database, as
     /// [`TableSchema`]s — the inverse of [`migrate`](Backend::migrate). The
     /// framework's own `_sutegi_migrations` history table is excluded.

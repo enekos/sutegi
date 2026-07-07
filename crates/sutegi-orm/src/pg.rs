@@ -354,6 +354,10 @@ impl Backend for Pg {
     fn introspect(&self) -> Result<Vec<TableSchema>, String> {
         introspect_pg(self)
     }
+
+    fn dialect(&self) -> Dialect {
+        Dialect::Postgres
+    }
 }
 
 impl crate::backend::Transactional for Pg {
@@ -419,6 +423,10 @@ impl Backend for Tx<'_> {
 
     fn introspect(&self) -> Result<Vec<TableSchema>, String> {
         introspect_pg(self)
+    }
+
+    fn dialect(&self) -> Dialect {
+        Dialect::Postgres
     }
 }
 

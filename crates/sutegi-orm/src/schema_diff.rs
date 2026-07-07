@@ -19,7 +19,11 @@
 //! if that's what they meant. Guessing renames is how the TypeORM-style
 //! generators silently drop data.
 
-use crate::value::{Column, Dialect, ForeignKey, Index, TableSchema};
+use crate::value::{
+    column_from_json, column_to_json, fk_from_json, fk_to_json, index_from_json, index_to_json,
+    schema_from_json, schema_to_json, Column, Dialect, ForeignKey, Index, TableSchema,
+};
+use sutegi_json::Json;
 
 /// A single, individually-reversible schema change.
 #[derive(Clone, Debug, PartialEq)]
@@ -229,6 +233,148 @@ impl SchemaOp {
                 format!("drop fk {}.{}", table, fk.column)
             }
         }
+    }
+
+    /// Serialize this op to JSON — the on-disk form of a declarative migration.
+    /// Each op is `{"op": "<kind>", …}` with the payload the kind needs.
+    pub fn to_json(&self) -> Json {
+        let obj = |kind: &str, mut fields: Vec<(&'static str, Json)>| {
+            fields.insert(0, ("op", Json::str(kind)));
+            Json::obj(fields)
+        };
+        match self {
+            SchemaOp::CreateTable(s) => obj("create_table", vec![("table", schema_to_json(s))]),
+            SchemaOp::DropTable(s) => obj("drop_table", vec![("table", schema_to_json(s))]),
+            SchemaOp::AddColumn { table, column } => obj(
+                "add_column",
+                vec![
+                    ("table", Json::str(table.clone())),
+                    ("column", column_to_json(column)),
+                ],
+            ),
+            SchemaOp::DropColumn { table, column } => obj(
+                "drop_column",
+                vec![
+                    ("table", Json::str(table.clone())),
+                    ("column", column_to_json(column)),
+                ],
+            ),
+            SchemaOp::AlterColumn { table, from, to } => obj(
+                "alter_column",
+                vec![
+                    ("table", Json::str(table.clone())),
+                    ("from", column_to_json(from)),
+                    ("to", column_to_json(to)),
+                ],
+            ),
+            SchemaOp::RenameColumn { table, from, to } => obj(
+                "rename_column",
+                vec![
+                    ("table", Json::str(table.clone())),
+                    ("from", Json::str(from.clone())),
+                    ("to", Json::str(to.clone())),
+                ],
+            ),
+            SchemaOp::RenameTable { from, to } => obj(
+                "rename_table",
+                vec![
+                    ("from", Json::str(from.clone())),
+                    ("to", Json::str(to.clone())),
+                ],
+            ),
+            SchemaOp::CreateIndex { table, index } => obj(
+                "create_index",
+                vec![
+                    ("table", Json::str(table.clone())),
+                    ("index", index_to_json(index)),
+                ],
+            ),
+            SchemaOp::DropIndex { table, index } => obj(
+                "drop_index",
+                vec![
+                    ("table", Json::str(table.clone())),
+                    ("index", index_to_json(index)),
+                ],
+            ),
+            SchemaOp::AddForeignKey { table, fk } => obj(
+                "add_foreign_key",
+                vec![("table", Json::str(table.clone())), ("fk", fk_to_json(fk))],
+            ),
+            SchemaOp::DropForeignKey { table, fk } => obj(
+                "drop_foreign_key",
+                vec![("table", Json::str(table.clone())), ("fk", fk_to_json(fk))],
+            ),
+        }
+    }
+
+    /// Parse an op from its [`to_json`](SchemaOp::to_json) form.
+    pub fn from_json(j: &Json) -> Result<SchemaOp, String> {
+        let kind = j
+            .get("op")
+            .and_then(Json::as_str)
+            .ok_or("op: missing `op`")?;
+        let table = || {
+            j.get("table")
+                .and_then(Json::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| format!("op `{kind}`: missing `table`"))
+        };
+        let sub = |key: &str| {
+            j.get(key)
+                .ok_or_else(|| format!("op `{kind}`: missing `{key}`"))
+        };
+        Ok(match kind {
+            "create_table" => SchemaOp::CreateTable(schema_from_json(sub("table")?)?),
+            "drop_table" => SchemaOp::DropTable(schema_from_json(sub("table")?)?),
+            "add_column" => SchemaOp::AddColumn {
+                table: table()?,
+                column: column_from_json(sub("column")?)?,
+            },
+            "drop_column" => SchemaOp::DropColumn {
+                table: table()?,
+                column: column_from_json(sub("column")?)?,
+            },
+            "alter_column" => SchemaOp::AlterColumn {
+                table: table()?,
+                from: column_from_json(sub("from")?)?,
+                to: column_from_json(sub("to")?)?,
+            },
+            "rename_column" => SchemaOp::RenameColumn {
+                table: table()?,
+                from: sub("from")?
+                    .as_str()
+                    .ok_or("rename_column: `from`")?
+                    .to_string(),
+                to: sub("to")?
+                    .as_str()
+                    .ok_or("rename_column: `to`")?
+                    .to_string(),
+            },
+            "rename_table" => SchemaOp::RenameTable {
+                from: sub("from")?
+                    .as_str()
+                    .ok_or("rename_table: `from`")?
+                    .to_string(),
+                to: sub("to")?.as_str().ok_or("rename_table: `to`")?.to_string(),
+            },
+            "create_index" => SchemaOp::CreateIndex {
+                table: table()?,
+                index: index_from_json(sub("index")?)?,
+            },
+            "drop_index" => SchemaOp::DropIndex {
+                table: table()?,
+                index: index_from_json(sub("index")?)?,
+            },
+            "add_foreign_key" => SchemaOp::AddForeignKey {
+                table: table()?,
+                fk: fk_from_json(sub("fk")?)?,
+            },
+            "drop_foreign_key" => SchemaOp::DropForeignKey {
+                table: table()?,
+                fk: fk_from_json(sub("fk")?)?,
+            },
+            other => return Err(format!("op: unknown kind `{other}`")),
+        })
     }
 }
 
