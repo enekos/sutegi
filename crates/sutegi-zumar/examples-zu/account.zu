@@ -1,0 +1,40 @@
+# account.zu — a private live page, authored in zumar-lang (P5 payoff).
+#
+# Two P5 features meet here:
+#   * SESSION IN LIVE MOUNTS — the greeting shows the logged-in user's name.
+#     The name isn't in the client, nor fetched: the sutegi-zumar factory
+#     reads it from the mount request's session cookie (auth.current(req))
+#     and seeds it into the model with `program_with` before the first
+#     render. The socket itself is gated by `Live::guard` — an unauthenticated
+#     browser never mounts this program at all.
+#   * FORMS via httpPost — `onSubmit Save` dispatches over the already-
+#     authenticated, same-origin socket; the server runs the POST next to the
+#     data. There is no CSRF token anywhere: in live mode the state lives on
+#     the server and there is no cross-origin POST to forge, so a live form is
+#     CSRF-free by construction.
+#
+# `zuc build account.zu --target live` compiles this to a wasm-free crate the
+# bridge mounts per connection.
+
+app Account
+
+model { name: String, note: String, saved: String, status: String }
+
+init = { name = "", note = "", saved = "", status = "" }
+
+msg Note String | Save | Saved String
+
+update Note s = { note = s }
+update Save = { status = "saving..." } then httpPost("/api/note", model.note, Saved)
+update Saved s = { status = "saved", saved = s }
+
+view =
+  div [class "account"] [
+    h1 [class "greeting"] [ text ("hi " ++ model.name) ],
+    form [class "noteform", onSubmit Save] [
+      input [class "note", type "text", value model.note, onInput Note] [],
+      button [class "save", type "submit"] [ text "save note" ]
+    ],
+    p [class "saved"] [ text ("saved: " ++ model.saved) ],
+    p [class "status"] [ text model.status ]
+  ]

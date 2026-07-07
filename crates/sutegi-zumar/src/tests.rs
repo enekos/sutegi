@@ -248,6 +248,80 @@ fn publish_fans_out_to_every_topic_subscriber() {
     assert!(render(&bob).contains("hello everyone"), "bob missed it");
 }
 
+// A live form submit: update returns an httpPost, whose completion (fed as
+// a Resolve frame, exactly as the bridge's http worker does) flows the
+// response body into the model. The forms primitive, at the apply seam.
+#[test]
+fn http_post_completion_flows_into_the_model() {
+    use zumar_runtime::effects::http_post;
+
+    #[derive(Clone)]
+    enum M {
+        Submit,
+        Result(HttpResult),
+    }
+    #[derive(Default)]
+    struct Form {
+        email: String,
+        status: String,
+    }
+    fn update(m: &mut Form, msg: M) -> Cmds<M> {
+        match msg {
+            M::Submit => {
+                return vec![http_post(
+                    "/api/login",
+                    format!("{{\"email\":\"{}\"}}", m.email),
+                    M::Result,
+                )]
+            }
+            M::Result(r) => m.status = if r.ok { r.body } else { format!("error {}", r.status) },
+        }
+        Vec::new()
+    }
+    fn view(m: &Form) -> VNode<M> {
+        el("form")
+            .child(el("button").on("submit", M::Submit).text("log in"))
+            .child(el("span").text(m.status.clone()))
+            .into()
+    }
+
+    let mut prog = Program::new(
+        Form {
+            email: "a@b.c".into(),
+            status: String::new(),
+        },
+        update,
+        view,
+    );
+    prog.initial_render();
+
+    let submit = Frame::Dispatch {
+        path: vec![0],
+        name: "submit".into(),
+        value: None,
+        checked: None,
+        key: None,
+    };
+    let up = apply(&mut prog, &submit);
+    match &up.cmds[0].spec {
+        CmdSpec::HttpPost { url, body } => {
+            assert_eq!(url, "/api/login");
+            assert_eq!(body, "{\"email\":\"a@b.c\"}");
+        }
+        other => panic!("expected an httpPost cmd, got {other:?}"),
+    }
+
+    // the bridge's http worker resolves it with the server's response
+    let done = Frame::Resolve {
+        id: up.cmds[0].id,
+        ok: true,
+        status: 200,
+        body: "welcome-eneko".into(),
+    };
+    apply(&mut prog, &done);
+    assert!(format!("{:?}", prog.rerender().root).contains("welcome-eneko"));
+}
+
 #[test]
 fn journal_frames_round_trip_through_the_codec() {
     // the bridge journals its own encodings; every frame it can produce

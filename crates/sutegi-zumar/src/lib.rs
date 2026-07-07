@@ -52,9 +52,11 @@ pub struct Live<M, Ms> {
     journal: Option<Arc<dyn Journal>>,
     http_base: Option<String>,
     pubsub: Option<Arc<dyn Broker>>,
+    guard: Option<Guard>,
 }
 
 type Factory<M, Ms> = Arc<dyn Fn(&Request) -> Program<M, Ms> + Send + Sync>;
+type Guard = Arc<dyn Fn(&Request) -> bool + Send + Sync>;
 
 /// One live endpoint: `Live::new(factory).ws()`, or [`live`] for defaults.
 impl<M: Send + 'static, Ms: Clone + Send + 'static> Live<M, Ms> {
@@ -64,7 +66,23 @@ impl<M: Send + 'static, Ms: Clone + Send + 'static> Live<M, Ms> {
             journal: None,
             http_base: None,
             pubsub: None,
+            guard: None,
         }
+    }
+
+    /// Gate the live socket: `guard(req)` runs on the WS upgrade (which
+    /// carries the browser's cookies, same-origin), and a `false` closes the
+    /// connection before any program is mounted. This is how a live page is
+    /// made private — pair it with [`sutegi_auth`] by capturing an `Auth` and
+    /// returning `auth.user_id(req).is_some()`. Because state then lives in
+    /// the server, form submits are ordinary dispatches over an already-
+    /// authenticated, same-origin socket: there is no cross-origin POST to
+    /// forge, so live forms are **CSRF-free by construction** — no token to
+    /// mint, embed, or verify. The factory sees the same `Request`, so it can
+    /// read the user and render per-session state.
+    pub fn guard(mut self, guard: impl Fn(&Request) -> bool + Send + Sync + 'static) -> Self {
+        self.guard = Some(Arc::new(guard));
+        self
     }
 
     /// Share a pubsub broker across this endpoint's connections (and,
@@ -105,6 +123,7 @@ impl<M: Send + 'static, Ms: Clone + Send + 'static> Live<M, Ms> {
             journal: self.journal,
             http_base,
             pubsub: self.pubsub.unwrap_or_else(|| Arc::new(PubSub::new())),
+            guard: self.guard,
             scheduler: OnceLock::new(),
         });
         // The scheduler thread holds a Weak so a dropped endpoint can wind
@@ -149,6 +168,7 @@ struct Shared<M, Ms> {
     journal: Option<Arc<dyn Journal>>,
     http_base: String,
     pubsub: Arc<dyn Broker>,
+    guard: Option<Guard>,
     scheduler: OnceLock<Scheduler>,
 }
 
@@ -162,6 +182,16 @@ impl<M: Send + 'static, Ms: Clone + Send + 'static> Shared<M, Ms> {
     }
 
     fn on_open(self: &Arc<Self>, conn: &Conn, req: &Request) {
+        // Auth gate: reject the upgrade before mounting anything. 1008 =
+        // policy violation (RFC 6455). zumar-live.js won't auto-reconnect a
+        // policy close, so a logged-out client stops retrying.
+        if let Some(guard) = &self.guard {
+            if !guard(req) {
+                conn.close(1008, "unauthorized");
+                return;
+            }
+        }
+
         let mut program = (self.factory)(req);
 
         let stream = self.journal.as_ref().and_then(|_| {
@@ -304,6 +334,20 @@ impl<M: Send + 'static, Ms: Clone + Send + 'static> Shared<M, Ms> {
                             ok,
                             status,
                             body,
+                        };
+                        shared.feed(conn, &frame, &frames::encode(&frame));
+                    });
+                }
+                CmdSpec::HttpPost { url, body } => {
+                    let shared = Arc::clone(self);
+                    let base = self.http_base.clone();
+                    std::thread::spawn(move || {
+                        let (ok, status, resp) = http::post(&base, &url, &body);
+                        let frame = Frame::Resolve {
+                            id: cmd.id,
+                            ok,
+                            status,
+                            body: resp,
                         };
                         shared.feed(conn, &frame, &frames::encode(&frame));
                     });
