@@ -537,6 +537,247 @@ pub fn apply_all(schemas: &mut Vec<TableSchema>, ops: &[SchemaOp]) -> Result<(),
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// DDL emission (P4): SchemaOp -> executable SQL statements, per dialect.
+// ---------------------------------------------------------------------------
+
+use crate::value::{column_sql, create_index_sql, create_table_only, default_sql, FkAction};
+
+/// PostgreSQL's conventional constraint names, matched so `DROP CONSTRAINT`
+/// finds what `CREATE TABLE`/`ADD` produced.
+fn pg_fk_name(table: &str, column: &str) -> String {
+    format!("{table}_{column}_fkey")
+}
+fn pg_unique_name(table: &str, column: &str) -> String {
+    format!("{table}_{column}_key")
+}
+
+/// Render an op into one or more executable statements for `dialect`.
+///
+/// `before` is the schema state *just before* this op — SQLite needs it to
+/// reconstruct a whole table for the changes it can't `ALTER` in place
+/// (column type/nullability/uniqueness, and any foreign-key change), which it
+/// does with the standard create-new / copy / drop / rename rebuild.
+pub fn render(
+    op: &SchemaOp,
+    dialect: Dialect,
+    before: &[TableSchema],
+) -> Result<Vec<String>, String> {
+    match dialect {
+        Dialect::Postgres => Ok(render_pg(op)),
+        Dialect::Sqlite => render_sqlite(op, before),
+    }
+}
+
+fn render_pg(op: &SchemaOp) -> Vec<String> {
+    match op {
+        SchemaOp::CreateTable(s) => {
+            let mut stmts = vec![create_table_only(s, Dialect::Postgres)];
+            for idx in &s.indexes {
+                stmts.push(create_index_sql(&s.table, idx));
+            }
+            stmts
+        }
+        SchemaOp::DropTable(s) => vec![format!("DROP TABLE {}", s.table)],
+        SchemaOp::AddColumn { table, column } => {
+            vec![format!(
+                "ALTER TABLE {} ADD COLUMN {}",
+                table,
+                column_sql(column, Dialect::Postgres)
+            )]
+        }
+        SchemaOp::DropColumn { table, column } => {
+            vec![format!("ALTER TABLE {} DROP COLUMN {}", table, column.name)]
+        }
+        SchemaOp::AlterColumn { table, from, to } => pg_alter_column(table, from, to),
+        SchemaOp::RenameColumn { table, from, to } => {
+            vec![format!("ALTER TABLE {table} RENAME COLUMN {from} TO {to}")]
+        }
+        SchemaOp::RenameTable { from, to } => {
+            vec![format!("ALTER TABLE {from} RENAME TO {to}")]
+        }
+        SchemaOp::CreateIndex { table, index } => vec![create_index_sql(table, index)],
+        SchemaOp::DropIndex { index, .. } => vec![format!("DROP INDEX {}", index.name)],
+        SchemaOp::AddForeignKey { table, fk } => {
+            let mut clause = format!(
+                "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({})",
+                table,
+                pg_fk_name(table, &fk.column),
+                fk.column,
+                fk.ref_table,
+                fk.ref_column
+            );
+            if fk.on_delete != FkAction::NoAction {
+                clause.push_str(" ON DELETE ");
+                clause.push_str(fk.on_delete.sql());
+            }
+            vec![clause]
+        }
+        SchemaOp::DropForeignKey { table, fk } => {
+            vec![format!(
+                "ALTER TABLE {} DROP CONSTRAINT {}",
+                table,
+                pg_fk_name(table, &fk.column)
+            )]
+        }
+    }
+}
+
+/// Postgres can alter a column in place — one statement per changed facet.
+fn pg_alter_column(table: &str, from: &Column, to: &Column) -> Vec<String> {
+    let mut stmts = Vec::new();
+    let col = &to.name;
+    if from.ty != to.ty {
+        stmts.push(format!(
+            "ALTER TABLE {} ALTER COLUMN {} TYPE {} USING {}::{}",
+            table,
+            col,
+            to.ty.storage(Dialect::Postgres),
+            col,
+            to.ty.storage(Dialect::Postgres)
+        ));
+    }
+    if from.nullable != to.nullable {
+        stmts.push(format!(
+            "ALTER TABLE {} ALTER COLUMN {} {} NOT NULL",
+            table,
+            col,
+            if to.nullable { "DROP" } else { "SET" }
+        ));
+    }
+    if from.default != to.default {
+        match &to.default {
+            Some(d) => stmts.push(format!(
+                "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {}",
+                table,
+                col,
+                default_sql(d)
+            )),
+            None => stmts.push(format!(
+                "ALTER TABLE {table} ALTER COLUMN {col} DROP DEFAULT"
+            )),
+        }
+    }
+    if from.unique != to.unique {
+        if to.unique {
+            stmts.push(format!(
+                "ALTER TABLE {} ADD CONSTRAINT {} UNIQUE ({})",
+                table,
+                pg_unique_name(table, col),
+                col
+            ));
+        } else {
+            stmts.push(format!(
+                "ALTER TABLE {} DROP CONSTRAINT {}",
+                table,
+                pg_unique_name(table, col)
+            ));
+        }
+    }
+    stmts
+}
+
+fn render_sqlite(op: &SchemaOp, before: &[TableSchema]) -> Result<Vec<String>, String> {
+    Ok(match op {
+        SchemaOp::CreateTable(s) => {
+            let mut stmts = vec![create_table_only(s, Dialect::Sqlite)];
+            for idx in &s.indexes {
+                stmts.push(create_index_sql(&s.table, idx));
+            }
+            stmts
+        }
+        SchemaOp::DropTable(s) => vec![format!("DROP TABLE {}", s.table)],
+        SchemaOp::AddColumn { table, column } => {
+            // SQLite forbids ADD COLUMN with an inline UNIQUE constraint, so
+            // add the column plain and back the uniqueness with an index.
+            let plain = Column {
+                unique: false,
+                ..column.clone()
+            };
+            let mut stmts = vec![format!(
+                "ALTER TABLE {} ADD COLUMN {}",
+                table,
+                column_sql(&plain, Dialect::Sqlite)
+            )];
+            if column.unique {
+                stmts.push(create_index_sql(
+                    table,
+                    &Index {
+                        name: format!("idx_{}_{}", table, column.name),
+                        columns: vec![column.name.clone()],
+                        unique: true,
+                    },
+                ));
+            }
+            stmts
+        }
+        SchemaOp::DropColumn { table, column } => {
+            vec![format!("ALTER TABLE {} DROP COLUMN {}", table, column.name)]
+        }
+        SchemaOp::RenameColumn { table, from, to } => {
+            vec![format!("ALTER TABLE {table} RENAME COLUMN {from} TO {to}")]
+        }
+        SchemaOp::RenameTable { from, to } => {
+            vec![format!("ALTER TABLE {from} RENAME TO {to}")]
+        }
+        SchemaOp::CreateIndex { table, index } => vec![create_index_sql(table, index)],
+        SchemaOp::DropIndex { index, .. } => vec![format!("DROP INDEX {}", index.name)],
+        // SQLite can't ALTER a column's type/nullability/uniqueness, nor add or
+        // drop a foreign key — all of these need a full table rebuild.
+        SchemaOp::AlterColumn { table, .. }
+        | SchemaOp::AddForeignKey { table, .. }
+        | SchemaOp::DropForeignKey { table, .. } => sqlite_rebuild(op, table, before)?,
+    })
+}
+
+/// The SQLite table-rebuild dance for changes it can't do in place: create a
+/// new table with the desired shape, copy the shared columns across, drop the
+/// old table, rename the new one into place, and recreate its indexes.
+///
+/// FK enforcement is off by default on sutegi's connections (no
+/// `PRAGMA foreign_keys=ON`), so the drop/rename is safe inside the migration's
+/// own transaction without toggling the pragma.
+fn sqlite_rebuild(
+    op: &SchemaOp,
+    table: &str,
+    before: &[TableSchema],
+) -> Result<Vec<String>, String> {
+    let before_table = before
+        .iter()
+        .find(|t| t.table == table)
+        .ok_or_else(|| format!("render: no such table `{table}` for SQLite rebuild"))?;
+
+    // The desired table = the current one with this single op applied.
+    let mut one = vec![before_table.clone()];
+    apply(&mut one, op)?;
+    let after = &one[0];
+
+    let tmp = format!("{table}__sutegi_new");
+    let mut tmp_schema = after.clone();
+    tmp_schema.table = tmp.clone();
+    tmp_schema.indexes.clear(); // indexes are (re)created after the rename
+
+    // Columns present in both shapes carry data across (by name, after order).
+    let shared: Vec<String> = after
+        .columns
+        .iter()
+        .filter(|c| before_table.col(&c.name).is_some())
+        .map(|c| c.name.clone())
+        .collect();
+    let cols = shared.join(", ");
+
+    let mut stmts = vec![
+        create_table_only(&tmp_schema, Dialect::Sqlite),
+        format!("INSERT INTO {tmp} ({cols}) SELECT {cols} FROM {table}"),
+        format!("DROP TABLE {table}"),
+        format!("ALTER TABLE {tmp} RENAME TO {table}"),
+    ];
+    for idx in &after.indexes {
+        stmts.push(create_index_sql(table, idx));
+    }
+    Ok(stmts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -699,5 +940,173 @@ mod tests {
             .unwrap();
         assert_eq!(add.safety(), Safety::NeedsData);
         assert!(plan.warnings.iter().any(|w| w.contains("NOT NULL")));
+    }
+
+    #[test]
+    fn pg_alter_column_emits_facet_statements() {
+        let from = Column::new("title", ColType::Text);
+        let to = Column::new("title", ColType::Integer)
+            .nullable()
+            .default(crate::Value::Int(0));
+        let stmts = render(
+            &SchemaOp::AlterColumn {
+                table: "posts".into(),
+                from,
+                to,
+            },
+            Dialect::Postgres,
+            &[],
+        )
+        .unwrap();
+        assert!(stmts.iter().any(|s| s.contains("TYPE BIGINT")));
+        assert!(stmts.iter().any(|s| s.contains("DROP NOT NULL")));
+        assert!(stmts.iter().any(|s| s.contains("SET DEFAULT 0")));
+    }
+}
+
+// Executable-DDL tests: run the emitted statements against a real SQLite
+// database and confirm they do what the ops say, preserving data through the
+// rebuild dance.
+#[cfg(all(test, feature = "sqlite"))]
+mod ddl_tests {
+    use super::*;
+    use crate::db::Db;
+    use crate::value::{ColType, FkAction};
+    use crate::{Backend, QueryBuilder, Value};
+
+    /// Execute a plan against a live backend, threading the shadow schema
+    /// forward so each op renders against the state that precedes it — the
+    /// same loop P5/P6 use.
+    fn run_plan(db: &Db, shadow: &mut Vec<TableSchema>, plan: &Plan, dialect: Dialect) {
+        for op in &plan.ops {
+            for sql in render(op, dialect, shadow).unwrap() {
+                db.execute(&sql, &[])
+                    .unwrap_or_else(|e| panic!("{sql}: {e}"));
+            }
+            apply(shadow, op).unwrap();
+        }
+    }
+
+    fn base() -> TableSchema {
+        TableSchema::new("items")
+            .column(Column::new("id", ColType::Integer).primary())
+            .column(Column::new("name", ColType::Text))
+            .column(Column::new("qty", ColType::Integer))
+    }
+
+    #[test]
+    fn create_add_drop_and_index_round_trip() {
+        let db = Db::memory().unwrap();
+        let mut shadow: Vec<TableSchema> = vec![];
+
+        // Create, then evolve: add a defaulted column, drop one, add an index.
+        run_plan(
+            &db,
+            &mut shadow,
+            &diff(&[], &[base()], Dialect::Sqlite),
+            Dialect::Sqlite,
+        );
+        db.execute(
+            "INSERT INTO items (name, qty) VALUES ('a', 1), ('b', 2)",
+            &[],
+        )
+        .unwrap();
+
+        let evolved = TableSchema::new("items")
+            .column(Column::new("id", ColType::Integer).primary())
+            .column(Column::new("name", ColType::Text))
+            .column(Column::new("note", ColType::Text).default(Value::Text("".into())))
+            .index(&["name"]);
+        let plan = diff(&shadow, std::slice::from_ref(&evolved), Dialect::Sqlite);
+        run_plan(&db, &mut shadow, &plan, Dialect::Sqlite);
+
+        // Data survived the (native) add/drop; the DB now matches the target.
+        assert_eq!(db.count(&QueryBuilder::table("items")).unwrap(), 2);
+        let reflected = db.introspect().unwrap();
+        assert_eq!(reflected[0], evolved.normalized());
+    }
+
+    #[test]
+    fn sqlite_rebuild_preserves_data_on_column_alter() {
+        let db = Db::memory().unwrap();
+        let mut shadow: Vec<TableSchema> = vec![];
+        run_plan(
+            &db,
+            &mut shadow,
+            &diff(&[], &[base()], Dialect::Sqlite),
+            Dialect::Sqlite,
+        );
+        db.execute("INSERT INTO items (name, qty) VALUES ('keep', 42)", &[])
+            .unwrap();
+
+        // Make `name` nullable and give `qty` a default — a change SQLite can't
+        // do in place, so this exercises the table rebuild.
+        let altered = TableSchema::new("items")
+            .column(Column::new("id", ColType::Integer).primary())
+            .column(Column::new("name", ColType::Text).nullable())
+            .column(Column::new("qty", ColType::Integer).default(Value::Int(7)));
+        let plan = diff(&shadow, std::slice::from_ref(&altered), Dialect::Sqlite);
+        assert!(plan
+            .ops
+            .iter()
+            .any(|o| matches!(o, SchemaOp::AlterColumn { .. })));
+        run_plan(&db, &mut shadow, &plan, Dialect::Sqlite);
+
+        // The row rode through the rebuild intact.
+        let rows = db.select(&QueryBuilder::table("items")).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get("name").unwrap(),
+            &sutegi_json::Json::str("keep")
+        );
+        assert_eq!(rows[0].get("qty").unwrap(), &sutegi_json::Json::int(42));
+        // And the schema is now the target.
+        assert_eq!(db.introspect().unwrap()[0], altered.normalized());
+    }
+
+    #[test]
+    fn sqlite_rebuild_adds_foreign_key_and_keeps_rows() {
+        let db = Db::memory().unwrap();
+        let mut shadow: Vec<TableSchema> = vec![];
+
+        let users = TableSchema::new("users")
+            .column(Column::new("id", ColType::Integer).primary())
+            .column(Column::new("email", ColType::Text));
+        let posts = TableSchema::new("posts")
+            .column(Column::new("id", ColType::Integer).primary())
+            .column(Column::new("user_id", ColType::Integer));
+        run_plan(
+            &db,
+            &mut shadow,
+            &diff(&[], &[users.clone(), posts.clone()], Dialect::Sqlite),
+            Dialect::Sqlite,
+        );
+        db.execute("INSERT INTO users (email) VALUES ('x@y.z')", &[])
+            .unwrap();
+        db.execute("INSERT INTO posts (user_id) VALUES (1)", &[])
+            .unwrap();
+
+        // Adding a foreign key needs a rebuild on SQLite.
+        let posts_fk = TableSchema::new("posts")
+            .column(Column::new("id", ColType::Integer).primary())
+            .column(Column::new("user_id", ColType::Integer))
+            .foreign_key("user_id", "users", "id", FkAction::Cascade);
+        let plan = diff(
+            std::slice::from_ref(&posts),
+            std::slice::from_ref(&posts_fk),
+            Dialect::Sqlite,
+        );
+        assert!(plan
+            .ops
+            .iter()
+            .any(|o| matches!(o, SchemaOp::AddForeignKey { .. })));
+        // Thread only the posts table through the rebuild.
+        let mut posts_shadow = vec![posts.clone()];
+        run_plan(&db, &mut posts_shadow, &plan, Dialect::Sqlite);
+
+        assert_eq!(db.count(&QueryBuilder::table("posts")).unwrap(), 1);
+        let reflected = db.introspect().unwrap();
+        let got = reflected.iter().find(|t| t.table == "posts").unwrap();
+        assert_eq!(got, &posts_fk.normalized());
     }
 }
