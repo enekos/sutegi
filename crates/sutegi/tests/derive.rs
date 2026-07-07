@@ -40,7 +40,7 @@ fn schema_reflects_attributes() {
     let schema = Todo::schema();
     assert_eq!(schema.table, "todos");
     // The skipped field is not a column.
-    let names: Vec<&str> = schema.columns.iter().map(|c| c.name).collect();
+    let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, vec!["id", "title", "done", "note_text"]);
     // The primary key is detected from the attribute.
     assert_eq!(Todo::primary_key(), "id");
@@ -65,6 +65,62 @@ fn schema_reflects_attributes() {
 fn default_table_name_is_snake_pluralized() {
     assert_eq!(Category::schema().table, "categories");
     assert_eq!(Category::table(), "categories");
+}
+
+// Exercises the P1 schema-IR attributes: unique, index, default, and a
+// belongs_to relation projected into a foreign key with an ON DELETE action.
+#[derive(Model, Default)]
+#[allow(dead_code)]
+struct Article {
+    #[model(primary)]
+    id: i64,
+    #[model(unique)]
+    slug: String,
+    #[model(index)]
+    author_id: i64,
+    #[model(default = 0)]
+    views: i64,
+    #[model(default = "draft")]
+    status: String,
+    #[model(default = true)]
+    public: bool,
+    #[model(belongs_to(Category, foreign_key = "author_id", on_delete = "cascade"))]
+    author: Option<Category>,
+}
+
+#[test]
+fn schema_reflects_unique_default_index_and_fk() {
+    let schema = Article::schema();
+
+    let slug = schema.col("slug").unwrap();
+    assert!(slug.unique);
+
+    assert_eq!(schema.col("views").unwrap().default, Some(Value::Int(0)));
+    assert_eq!(
+        schema.col("status").unwrap().default,
+        Some(Value::Text("draft".into()))
+    );
+    assert_eq!(
+        schema.col("public").unwrap().default,
+        Some(Value::Bool(true))
+    );
+
+    // #[model(index)] emits a conventional single-column index.
+    let idx = schema
+        .indexes
+        .iter()
+        .find(|i| i.columns == vec!["author_id".to_string()])
+        .unwrap();
+    assert!(!idx.unique);
+    assert_eq!(idx.name, "idx_articles_author_id");
+
+    // belongs_to → a foreign key on this table's column, resolving the related
+    // model's table + primary key, carrying the ON DELETE action.
+    let fk = &schema.foreign_keys[0];
+    assert_eq!(fk.column, "author_id");
+    assert_eq!(fk.ref_table, "categories");
+    assert_eq!(fk.ref_column, "id");
+    assert_eq!(fk.on_delete, FkAction::Cascade);
 }
 
 #[test]

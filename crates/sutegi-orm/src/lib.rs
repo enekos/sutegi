@@ -27,7 +27,10 @@ mod value;
 
 pub use backend::{row, Backend, FromInput, FromRow, Model, Transactional};
 pub use builder::{DeleteBuilder, Page, QueryBuilder, UpdateBuilder};
-pub use value::{create_table_sql, schema_json, ColType, Column, TableSchema, Value};
+pub use value::{
+    create_table_sql, default_sql, schema_json, ColType, Column, Dialect, FkAction, ForeignKey,
+    Index, TableSchema, Value,
+};
 
 /// Versioned, up/down migrations with a `_sutegi_migrations` history table,
 /// over any [`Backend`].

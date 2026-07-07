@@ -68,9 +68,19 @@ fn seeded() -> Db {
 
 #[test]
 fn relation_fields_are_not_columns() {
-    let cols: Vec<&str> = User::schema().columns.iter().map(|c| c.name).collect();
+    let user_schema = User::schema();
+    let cols: Vec<&str> = user_schema
+        .columns
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
     assert_eq!(cols, vec!["id", "name"]); // posts / profile excluded
-    let pcols: Vec<&str> = Post::schema().columns.iter().map(|c| c.name).collect();
+    let post_schema = Post::schema();
+    let pcols: Vec<&str> = post_schema
+        .columns
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
     assert_eq!(pcols, vec!["id", "user_id", "title"]); // author excluded
 }
 

@@ -17,29 +17,14 @@ struct Todo {
 
 impl Model for Todo {
     fn schema() -> TableSchema {
-        TableSchema {
-            table: "orm_pg_todos",
-            columns: vec![
-                Column {
-                    name: "id",
-                    ty: ColType::Integer,
-                    nullable: false,
-                    primary: true,
-                },
-                Column {
-                    name: "title",
-                    ty: ColType::Text,
-                    nullable: false,
-                    primary: false,
-                },
-                Column {
-                    name: "done",
-                    ty: ColType::Boolean,
-                    nullable: false,
-                    primary: false,
-                },
-            ],
-        }
+        TableSchema::new("orm_pg_todos")
+            .column(Column::new("id", ColType::Integer).primary())
+            .column(Column::new("title", ColType::Text))
+            .column(Column::new("done", ColType::Boolean))
+    }
+
+    fn table() -> &'static str {
+        "orm_pg_todos"
     }
 }
 

@@ -70,6 +70,15 @@ pub fn vector_from_text(s: &str) -> Result<Vec<f32>, String> {
         .collect()
 }
 
+/// The SQL dialect a schema is rendered into. Everything schema-shaped —
+/// storage types, DDL emission, diffing — is parameterized by this so the same
+/// [`TableSchema`] runs on both backends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dialect {
+    Sqlite,
+    Postgres,
+}
+
 /// A column's storage type.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ColType {
@@ -87,17 +96,25 @@ pub enum ColType {
 }
 
 impl ColType {
-    /// SQL type keyword (SQLite-flavored, the common denominator). JSON and
-    /// vectors both fall back to `TEXT` on SQLite (which has no native type for
-    /// either); the Postgres emitter maps them to richer types.
-    pub fn sql(&self) -> &'static str {
-        match self {
-            ColType::Integer => "INTEGER",
-            ColType::Real => "REAL",
-            ColType::Text => "TEXT",
-            ColType::Boolean => "BOOLEAN",
-            ColType::Json => "TEXT",
-            ColType::Vector { .. } => "TEXT",
+    /// The SQL type this column occupies in `dialect`. JSON and vectors both
+    /// fall back to `TEXT` on SQLite (which has native types for neither).
+    ///
+    /// This is also the **comparison key for schema diffing**: two `ColType`s
+    /// that share a storage type in a dialect (e.g. `Text` vs `Json` on SQLite)
+    /// are indistinguishable in that database and must not diff.
+    pub fn storage(&self, dialect: Dialect) -> String {
+        match (self, dialect) {
+            (ColType::Integer, Dialect::Sqlite) => "INTEGER".into(),
+            (ColType::Integer, Dialect::Postgres) => "BIGINT".into(),
+            (ColType::Real, Dialect::Sqlite) => "REAL".into(),
+            (ColType::Real, Dialect::Postgres) => "DOUBLE PRECISION".into(),
+            (ColType::Text, _) => "TEXT".into(),
+            (ColType::Boolean, _) => "BOOLEAN".into(),
+            (ColType::Json, Dialect::Sqlite) => "TEXT".into(),
+            (ColType::Json, Dialect::Postgres) => "JSONB".into(),
+            (ColType::Vector { .. }, Dialect::Sqlite) => "TEXT".into(),
+            (ColType::Vector { dim: Some(d) }, Dialect::Postgres) => format!("vector({d})"),
+            (ColType::Vector { dim: None }, Dialect::Postgres) => "vector".into(),
         }
     }
 
@@ -111,36 +128,226 @@ impl ColType {
             ColType::Vector { .. } => "vector",
         }
     }
+
+    /// Inverse of [`name`](ColType::name), for deserializing schema files.
+    /// A vector's dimension travels separately (see `schema_json`'s `dim`).
+    pub fn from_name(name: &str, dim: Option<usize>) -> Option<ColType> {
+        match name {
+            "integer" => Some(ColType::Integer),
+            "real" => Some(ColType::Real),
+            "text" => Some(ColType::Text),
+            "boolean" => Some(ColType::Boolean),
+            "json" => Some(ColType::Json),
+            "vector" => Some(ColType::Vector { dim }),
+            _ => None,
+        }
+    }
 }
 
-/// A single column definition.
-#[derive(Clone, Debug)]
+/// A single column definition. Build with [`Column::new`] and chain the
+/// modifiers: `Column::new("email", ColType::Text).unique()`.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Column {
-    pub name: &'static str,
+    pub name: String,
     pub ty: ColType,
     pub nullable: bool,
     pub primary: bool,
+    pub unique: bool,
+    /// Rendered as `DEFAULT <literal>` in DDL — and required before a
+    /// `NOT NULL` column can be added to a table that already has rows.
+    pub default: Option<Value>,
 }
 
-/// A table's full schema.
-#[derive(Clone, Debug)]
+impl Column {
+    /// A `NOT NULL`, non-primary, non-unique column with no default.
+    pub fn new(name: impl Into<String>, ty: ColType) -> Column {
+        Column {
+            name: name.into(),
+            ty,
+            nullable: false,
+            primary: false,
+            unique: false,
+            default: None,
+        }
+    }
+
+    pub fn primary(mut self) -> Column {
+        self.primary = true;
+        self
+    }
+
+    pub fn nullable(mut self) -> Column {
+        self.nullable = true;
+        self
+    }
+
+    pub fn unique(mut self) -> Column {
+        self.unique = true;
+        self
+    }
+
+    pub fn default(mut self, value: Value) -> Column {
+        self.default = Some(value);
+        self
+    }
+}
+
+/// A secondary index over one or more columns.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Index {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub unique: bool,
+}
+
+impl Index {
+    /// The conventional index name: `idx_<table>_<col1>_<col2>`.
+    pub fn conventional_name(table: &str, columns: &[&str]) -> String {
+        format!("idx_{}_{}", table, columns.join("_"))
+    }
+}
+
+/// What happens to referencing rows when the referenced row is deleted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FkAction {
+    #[default]
+    NoAction,
+    Cascade,
+    SetNull,
+    Restrict,
+}
+
+impl FkAction {
+    pub fn sql(&self) -> &'static str {
+        match self {
+            FkAction::NoAction => "NO ACTION",
+            FkAction::Cascade => "CASCADE",
+            FkAction::SetNull => "SET NULL",
+            FkAction::Restrict => "RESTRICT",
+        }
+    }
+
+    pub fn from_sql(s: &str) -> FkAction {
+        match s.to_ascii_uppercase().as_str() {
+            "CASCADE" => FkAction::Cascade,
+            "SET NULL" => FkAction::SetNull,
+            "RESTRICT" => FkAction::Restrict,
+            _ => FkAction::NoAction,
+        }
+    }
+}
+
+/// A foreign-key constraint: `column` references `ref_table.ref_column`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ForeignKey {
+    pub column: String,
+    pub ref_table: String,
+    pub ref_column: String,
+    pub on_delete: FkAction,
+}
+
+/// A table's full schema. Build with [`TableSchema::new`] and chain
+/// `.column(…)`, `.index(…)`, `.foreign_key(…)`.
+#[derive(Clone, Debug, PartialEq)]
 pub struct TableSchema {
-    pub table: &'static str,
+    pub table: String,
     pub columns: Vec<Column>,
+    pub indexes: Vec<Index>,
+    pub foreign_keys: Vec<ForeignKey>,
 }
 
-/// Describe a table schema as JSON, for `/__introspect`.
+impl TableSchema {
+    pub fn new(table: impl Into<String>) -> TableSchema {
+        TableSchema {
+            table: table.into(),
+            columns: Vec::new(),
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        }
+    }
+
+    pub fn column(mut self, column: Column) -> TableSchema {
+        self.columns.push(column);
+        self
+    }
+
+    /// Add a conventionally-named (`idx_<table>_<cols>`) non-unique index.
+    pub fn index(mut self, columns: &[&str]) -> TableSchema {
+        self.indexes.push(Index {
+            name: Index::conventional_name(&self.table, columns),
+            columns: columns.iter().map(|c| c.to_string()).collect(),
+            unique: false,
+        });
+        self
+    }
+
+    /// Add a conventionally-named unique index.
+    pub fn unique_index(mut self, columns: &[&str]) -> TableSchema {
+        self.indexes.push(Index {
+            name: Index::conventional_name(&self.table, columns),
+            columns: columns.iter().map(|c| c.to_string()).collect(),
+            unique: true,
+        });
+        self
+    }
+
+    pub fn foreign_key(
+        mut self,
+        column: &str,
+        ref_table: &str,
+        ref_column: &str,
+        on_delete: FkAction,
+    ) -> TableSchema {
+        self.foreign_keys.push(ForeignKey {
+            column: column.into(),
+            ref_table: ref_table.into(),
+            ref_column: ref_column.into(),
+            on_delete,
+        });
+        self
+    }
+
+    /// Look a column up by name.
+    pub fn col(&self, name: &str) -> Option<&Column> {
+        self.columns.iter().find(|c| c.name == name)
+    }
+}
+
+/// Render a [`Value`] as a SQL DDL literal, for `DEFAULT` clauses. Text (and
+/// text-stored JSON/vectors) is single-quoted with `'` doubled.
+pub fn default_sql(value: &Value) -> String {
+    fn quote(s: &str) -> String {
+        format!("'{}'", s.replace('\'', "''"))
+    }
+    match value {
+        Value::Null => "NULL".into(),
+        Value::Int(i) => i.to_string(),
+        Value::Real(r) => r.to_string(),
+        Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.into(),
+        Value::Text(s) => quote(s),
+        Value::Json(j) => quote(&j.to_string()),
+        Value::Vector(v) => quote(&vector_to_text(v)),
+    }
+}
+
+/// Describe a table schema as JSON, for `/__introspect` and schema files.
 pub fn schema_json(schema: &TableSchema) -> Json {
     let cols = schema
         .columns
         .iter()
         .map(|c| {
             let mut fields = vec![
-                ("name", Json::str(c.name)),
+                ("name", Json::str(c.name.clone())),
                 ("type", Json::str(c.ty.name())),
                 ("nullable", Json::Bool(c.nullable)),
                 ("primary", Json::Bool(c.primary)),
             ];
+            if c.unique {
+                fields.push(("unique", Json::Bool(true)));
+            }
+            if let Some(d) = &c.default {
+                fields.push(("default", d.to_json()));
+            }
             // Expose the vector dimension so an agent knows the embedding shape.
             if let ColType::Vector { dim: Some(d) } = c.ty {
                 fields.push(("dim", Json::int(d as i64)));
@@ -148,31 +355,118 @@ pub fn schema_json(schema: &TableSchema) -> Json {
             Json::obj(fields)
         })
         .collect();
-    Json::obj(vec![
-        ("table", Json::str(schema.table)),
+    let mut fields = vec![
+        ("table", Json::str(schema.table.clone())),
         ("columns", Json::arr(cols)),
-    ])
+    ];
+    if !schema.indexes.is_empty() {
+        fields.push((
+            "indexes",
+            Json::arr(
+                schema
+                    .indexes
+                    .iter()
+                    .map(|i| {
+                        Json::obj(vec![
+                            ("name", Json::str(i.name.clone())),
+                            (
+                                "columns",
+                                Json::arr(i.columns.iter().map(|c| Json::str(c.clone())).collect()),
+                            ),
+                            ("unique", Json::Bool(i.unique)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ));
+    }
+    if !schema.foreign_keys.is_empty() {
+        fields.push((
+            "foreign_keys",
+            Json::arr(
+                schema
+                    .foreign_keys
+                    .iter()
+                    .map(|f| {
+                        Json::obj(vec![
+                            ("column", Json::str(f.column.clone())),
+                            ("ref_table", Json::str(f.ref_table.clone())),
+                            ("ref_column", Json::str(f.ref_column.clone())),
+                            ("on_delete", Json::str(f.on_delete.sql())),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ));
+    }
+    Json::obj(fields)
 }
 
-/// Emit a `CREATE TABLE IF NOT EXISTS` statement from a schema (SQLite dialect;
-/// the Postgres backend has its own [`crate::pg::create_table_pg`]).
-pub fn create_table_sql(schema: &TableSchema) -> String {
+/// Render one column definition line (shared by both dialects; the Postgres
+/// identity-primary-key special case is handled by the caller).
+fn column_def(c: &Column, dialect: Dialect) -> String {
+    let mut def = format!("  {} {}", c.name, c.ty.storage(dialect));
+    if c.primary {
+        def.push_str(" PRIMARY KEY");
+    }
+    if !c.nullable && !c.primary {
+        def.push_str(" NOT NULL");
+    }
+    if c.unique && !c.primary {
+        def.push_str(" UNIQUE");
+    }
+    if let Some(d) = &c.default {
+        def.push_str(" DEFAULT ");
+        def.push_str(&default_sql(d));
+    }
+    def
+}
+
+/// Emit the `CREATE TABLE IF NOT EXISTS` batch for a schema in `dialect`:
+/// the table (with inline uniques, defaults, and foreign keys) followed by one
+/// `CREATE INDEX IF NOT EXISTS` per secondary index. Statements are
+/// `;`-separated so both backends can run the batch in one call.
+pub fn create_table_sql(schema: &TableSchema, dialect: Dialect) -> String {
     let mut cols = Vec::new();
     for c in &schema.columns {
-        let mut def = format!("  {} {}", c.name, c.ty.sql());
-        if c.primary {
-            def.push_str(" PRIMARY KEY");
+        if dialect == Dialect::Postgres && c.primary && c.ty == ColType::Integer {
+            // BY DEFAULT (not ALWAYS) mirrors SQLite's `INTEGER PRIMARY KEY`:
+            // auto-generated when omitted, but explicit values are allowed
+            // (needed for upsert-by-id and seeding).
+            cols.push(format!(
+                "  {} BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY",
+                c.name
+            ));
+            continue;
         }
-        if !c.nullable && !c.primary {
-            def.push_str(" NOT NULL");
-        }
-        cols.push(def);
+        cols.push(column_def(c, dialect));
     }
-    format!(
+    for fk in &schema.foreign_keys {
+        let mut clause = format!(
+            "  FOREIGN KEY ({}) REFERENCES {} ({})",
+            fk.column, fk.ref_table, fk.ref_column
+        );
+        if fk.on_delete != FkAction::NoAction {
+            clause.push_str(" ON DELETE ");
+            clause.push_str(fk.on_delete.sql());
+        }
+        cols.push(clause);
+    }
+    let mut sql = format!(
         "CREATE TABLE IF NOT EXISTS {} (\n{}\n);",
         schema.table,
         cols.join(",\n")
-    )
+    );
+    for index in &schema.indexes {
+        sql.push_str(&format!(
+            "\nCREATE {}INDEX IF NOT EXISTS {} ON {} ({});",
+            if index.unique { "UNIQUE " } else { "" },
+            index.name,
+            schema.table,
+            index.columns.join(", ")
+        ));
+    }
+    sql
 }
 
 #[cfg(test)]
@@ -180,44 +474,60 @@ mod tests {
     use super::*;
 
     fn todos() -> TableSchema {
-        TableSchema {
-            table: "todos",
-            columns: vec![
-                Column {
-                    name: "id",
-                    ty: ColType::Integer,
-                    nullable: false,
-                    primary: true,
-                },
-                Column {
-                    name: "title",
-                    ty: ColType::Text,
-                    nullable: false,
-                    primary: false,
-                },
-                Column {
-                    name: "done",
-                    ty: ColType::Boolean,
-                    nullable: false,
-                    primary: false,
-                },
-            ],
-        }
+        TableSchema::new("todos")
+            .column(Column::new("id", ColType::Integer).primary())
+            .column(Column::new("title", ColType::Text))
+            .column(Column::new("done", ColType::Boolean))
     }
 
     #[test]
     fn emits_create_table() {
-        let sql = create_table_sql(&todos());
+        let sql = create_table_sql(&todos(), Dialect::Sqlite);
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS todos"));
         assert!(sql.contains("id INTEGER PRIMARY KEY"));
         assert!(sql.contains("title TEXT NOT NULL"));
     }
 
     #[test]
+    fn emits_unique_default_fk_and_indexes() {
+        let schema = TableSchema::new("posts")
+            .column(Column::new("id", ColType::Integer).primary())
+            .column(Column::new("slug", ColType::Text).unique())
+            .column(Column::new("views", ColType::Integer).default(Value::Int(0)))
+            .column(Column::new("note", ColType::Text).default(Value::Text("it's".into())))
+            .column(Column::new("user_id", ColType::Integer))
+            .foreign_key("user_id", "users", "id", FkAction::Cascade)
+            .index(&["user_id"])
+            .unique_index(&["slug", "user_id"]);
+
+        let sql = create_table_sql(&schema, Dialect::Sqlite);
+        assert!(sql.contains("slug TEXT NOT NULL UNIQUE"));
+        assert!(sql.contains("views INTEGER NOT NULL DEFAULT 0"));
+        // Quote-escaped text default.
+        assert!(sql.contains("DEFAULT 'it''s'"));
+        assert!(sql.contains("FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE"));
+        assert!(sql.contains("CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts (user_id);"));
+        assert!(sql.contains(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_posts_slug_user_id ON posts (slug, user_id);"
+        ));
+
+        // Postgres flavor: identity pk + BIGINT.
+        let pg = create_table_sql(&schema, Dialect::Postgres);
+        assert!(pg.contains("id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY"));
+        assert!(pg.contains("user_id BIGINT NOT NULL"));
+    }
+
+    #[test]
     fn coltype_and_value_mappings() {
-        assert_eq!(ColType::Integer.sql(), "INTEGER");
-        assert_eq!(ColType::Boolean.sql(), "BOOLEAN");
+        assert_eq!(ColType::Integer.storage(Dialect::Sqlite), "INTEGER");
+        assert_eq!(ColType::Integer.storage(Dialect::Postgres), "BIGINT");
+        assert_eq!(ColType::Boolean.storage(Dialect::Sqlite), "BOOLEAN");
         assert_eq!(ColType::Real.name(), "real");
+        assert_eq!(ColType::from_name("real", None), Some(ColType::Real));
+        assert_eq!(
+            ColType::from_name("vector", Some(3)),
+            Some(ColType::Vector { dim: Some(3) })
+        );
         assert_eq!(Value::Bool(true).to_json(), Json::Bool(true));
         assert_eq!(Value::Int(5).to_json(), Json::Num(5.0));
         assert_eq!(Value::Null.to_json(), Json::Null);
@@ -227,9 +537,17 @@ mod tests {
     #[test]
     fn json_and_vector_types_and_values() {
         // Both fall back to TEXT on SQLite; names surface for introspection.
-        assert_eq!(ColType::Json.sql(), "TEXT");
+        assert_eq!(ColType::Json.storage(Dialect::Sqlite), "TEXT");
+        assert_eq!(ColType::Json.storage(Dialect::Postgres), "JSONB");
         assert_eq!(ColType::Json.name(), "json");
-        assert_eq!(ColType::Vector { dim: Some(3) }.sql(), "TEXT");
+        assert_eq!(
+            ColType::Vector { dim: Some(3) }.storage(Dialect::Sqlite),
+            "TEXT"
+        );
+        assert_eq!(
+            ColType::Vector { dim: Some(3) }.storage(Dialect::Postgres),
+            "vector(3)"
+        );
         assert_eq!(ColType::Vector { dim: None }.name(), "vector");
 
         // Value introspection: JSON is itself; a vector is a number array.
@@ -253,15 +571,8 @@ mod tests {
 
     #[test]
     fn schema_json_exposes_vector_dim() {
-        let schema = TableSchema {
-            table: "docs",
-            columns: vec![Column {
-                name: "embedding",
-                ty: ColType::Vector { dim: Some(384) },
-                nullable: false,
-                primary: false,
-            }],
-        };
+        let schema = TableSchema::new("docs")
+            .column(Column::new("embedding", ColType::Vector { dim: Some(384) }));
         let j = schema_json(&schema);
         let col = &j.get("columns").and_then(Json::as_array).unwrap()[0];
         assert_eq!(col.get("type").and_then(Json::as_str), Some("vector"));

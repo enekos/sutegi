@@ -17,7 +17,7 @@
 //! database), so [`Db::memory`] pins the pool to size 1.
 
 use crate::backend::Backend;
-use crate::value::{create_table_sql, TableSchema, Value};
+use crate::value::{create_table_sql, Dialect, TableSchema, Value};
 use rusqlite::{params_from_iter, types::Value as SqlValue, Connection};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -304,7 +304,7 @@ impl Backend for Db {
 
     fn migrate(&self, schema: &TableSchema) -> Result<(), String> {
         self.pool.with(|conn| {
-            conn.execute_batch(&create_table_sql(schema))
+            conn.execute_batch(&create_table_sql(schema, Dialect::Sqlite))
                 .map_err(|e| e.to_string())
         })
     }
@@ -356,7 +356,7 @@ impl Backend for Tx<'_> {
     fn migrate(&self, schema: &TableSchema) -> Result<(), String> {
         self.conn
             .borrow()
-            .execute_batch(&create_table_sql(schema))
+            .execute_batch(&create_table_sql(schema, Dialect::Sqlite))
             .map_err(|e| e.to_string())
     }
 }
@@ -392,29 +392,10 @@ mod tests {
     use crate::{DeleteBuilder, QueryBuilder, UpdateBuilder};
 
     fn todos_schema() -> TableSchema {
-        TableSchema {
-            table: "todos",
-            columns: vec![
-                Column {
-                    name: "id",
-                    ty: ColType::Integer,
-                    nullable: false,
-                    primary: true,
-                },
-                Column {
-                    name: "title",
-                    ty: ColType::Text,
-                    nullable: false,
-                    primary: false,
-                },
-                Column {
-                    name: "done",
-                    ty: ColType::Boolean,
-                    nullable: false,
-                    primary: false,
-                },
-            ],
-        }
+        TableSchema::new("todos")
+            .column(Column::new("id", ColType::Integer).primary())
+            .column(Column::new("title", ColType::Text))
+            .column(Column::new("done", ColType::Boolean))
     }
 
     #[test]

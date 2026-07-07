@@ -257,8 +257,9 @@ pub mod prelude {
     pub use sutegi_orm::row::FromRow;
     #[cfg(feature = "orm")]
     pub use sutegi_orm::{
-        Backend, ColType, Column, DeleteBuilder, FromInput, Metric, Model, Page, QueryBuilder,
-        TableSchema, Transactional, UpdateBuilder, Value, Vector,
+        Backend, ColType, Column, DeleteBuilder, Dialect, FkAction, ForeignKey, FromInput, Index,
+        Metric, Model, Page, QueryBuilder, TableSchema, Transactional, UpdateBuilder, Value,
+        Vector,
     };
     #[cfg(feature = "queue")]
     pub use sutegi_queue::{Queue, Workers};

@@ -84,29 +84,14 @@ impl<B: Backend> Users<B> {
     }
 
     fn schema() -> TableSchema {
-        let col = |name, ty| Column {
-            name,
-            ty,
-            nullable: false,
-            primary: false,
-        };
-        TableSchema {
-            table: "users",
-            columns: vec![
-                Column {
-                    name: "id",
-                    ty: ColType::Integer,
-                    nullable: false,
-                    primary: true,
-                },
-                col("email", ColType::Text),
-                col("password_hash", ColType::Text),
-                col("name", ColType::Text),
-                col("role", ColType::Text),
-                col("created_at", ColType::Integer),
-                col("verified_at", ColType::Integer),
-            ],
-        }
+        TableSchema::new("users")
+            .column(Column::new("id", ColType::Integer).primary())
+            .column(Column::new("email", ColType::Text))
+            .column(Column::new("password_hash", ColType::Text))
+            .column(Column::new("name", ColType::Text))
+            .column(Column::new("role", ColType::Text))
+            .column(Column::new("created_at", ColType::Integer))
+            .column(Column::new("verified_at", ColType::Integer))
     }
 
     /// Create the `users` table and its unique email index if absent.

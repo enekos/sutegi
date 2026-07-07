@@ -49,27 +49,14 @@ impl<B: Backend> Tokens<B> {
 
     /// Create the `api_tokens` table and its lookup index if absent.
     pub fn migrate(&self) -> Result<(), String> {
-        let col = |name, ty| Column {
-            name,
-            ty,
-            nullable: false,
-            primary: false,
-        };
-        self.backend.migrate(&TableSchema {
-            table: "api_tokens",
-            columns: vec![
-                Column {
-                    name: "id",
-                    ty: ColType::Integer,
-                    nullable: false,
-                    primary: true,
-                },
-                col("user_id", ColType::Integer),
-                col("name", ColType::Text),
-                col("token_hash", ColType::Text),
-                col("created_at", ColType::Integer),
-            ],
-        })?;
+        self.backend.migrate(
+            &TableSchema::new("api_tokens")
+                .column(Column::new("id", ColType::Integer).primary())
+                .column(Column::new("user_id", ColType::Integer))
+                .column(Column::new("name", ColType::Text))
+                .column(Column::new("token_hash", ColType::Text))
+                .column(Column::new("created_at", ColType::Integer)),
+        )?;
         self.backend
             .execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS api_tokens_hash_unique ON api_tokens (token_hash)",

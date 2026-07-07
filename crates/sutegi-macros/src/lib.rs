@@ -61,6 +61,9 @@ struct RelationInfo {
     /// this model's primary key), or the owner key column for belongs_to
     /// (defaults to the related model's primary key).
     key: Option<String>,
+    /// `belongs_to` only: the FK's ON DELETE action (`cascade`, `set_null`,
+    /// `restrict`; defaults to no action).
+    on_delete: Option<syn::Ident>,
 }
 
 struct FieldInfo {
@@ -69,6 +72,13 @@ struct FieldInfo {
     scalar: Scalar,
     optional: bool,
     primary: bool,
+    /// `#[model(unique)]` — a UNIQUE column constraint.
+    unique: bool,
+    /// `#[model(index)]` — a conventional single-column secondary index.
+    index: bool,
+    /// `#[model(default = <lit>)]` — the DDL default, pre-rendered as a
+    /// `Value` constructor.
+    default: Option<proc_macro2::TokenStream>,
     /// Not a column: excluded from schema/persistence, default-initialized on load.
     skip: bool,
     /// Set when the field is an eager-loadable relation rather than a column.
@@ -167,6 +177,9 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         let ident = field.ident.clone().unwrap();
         let mut column = ident.to_string();
         let mut primary = false;
+        let mut unique = false;
+        let mut index = false;
+        let mut default: Option<proc_macro2::TokenStream> = None;
         let mut skip = false;
         let mut relation: Option<RelationInfo> = None;
         let mut is_vector = false;
@@ -177,6 +190,18 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 attr.parse_nested_meta(|meta| {
                     if meta.path.is_ident("primary") {
                         primary = true;
+                        Ok(())
+                    } else if meta.path.is_ident("unique") {
+                        unique = true;
+                        Ok(())
+                    } else if meta.path.is_ident("index") {
+                        index = true;
+                        Ok(())
+                    } else if meta.path.is_ident("default") {
+                        let lit: syn::Lit = meta.value()?.parse()?;
+                        default = Some(default_value_expr(&lit).ok_or_else(|| {
+                            meta.error("unsupported default literal (use int, float, bool, or string)")
+                        })?);
                         Ok(())
                     } else if meta.path.is_ident("skip") {
                         skip = true;
@@ -202,10 +227,11 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                         Ok(())
                     } else if let Some(kind) = rel_kind(&meta.path) {
                         // has_many(Post, foreign_key = "user_id"[, local_key = "..."])
-                        // belongs_to(Team, foreign_key = "team_id"[, owner_key = "..."])
+                        // belongs_to(Team, foreign_key = "team_id"[, owner_key = "...", on_delete = "cascade"])
                         let mut related: Option<syn::Path> = None;
                         let mut fk: Option<String> = None;
                         let mut key: Option<String> = None;
+                        let mut on_delete: Option<syn::Ident> = None;
                         meta.parse_nested_meta(|nested| {
                             if nested.path.is_ident("foreign_key") {
                                 fk = Some(nested.value()?.parse::<syn::LitStr>()?.value());
@@ -214,6 +240,21 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                                 || nested.path.is_ident("owner_key")
                             {
                                 key = Some(nested.value()?.parse::<syn::LitStr>()?.value());
+                                Ok(())
+                            } else if nested.path.is_ident("on_delete") {
+                                let lit: syn::LitStr = nested.value()?.parse()?;
+                                let variant = match lit.value().as_str() {
+                                    "cascade" => "Cascade",
+                                    "set_null" => "SetNull",
+                                    "restrict" => "Restrict",
+                                    "no_action" => "NoAction",
+                                    _ => {
+                                        return Err(nested.error(
+                                            "on_delete must be \"cascade\", \"set_null\", \"restrict\", or \"no_action\"",
+                                        ))
+                                    }
+                                };
+                                on_delete = Some(syn::Ident::new(variant, lit.span()));
                                 Ok(())
                             } else if related.is_none() {
                                 // The first bare item is the related model type.
@@ -229,10 +270,10 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                         let foreign_key = fk.ok_or_else(|| {
                             meta.error("relation needs foreign_key = \"<column>\"")
                         })?;
-                        relation = Some(RelationInfo { kind, related, foreign_key, key });
+                        relation = Some(RelationInfo { kind, related, foreign_key, key, on_delete });
                         Ok(())
                     } else {
-                        Err(meta.error("unknown #[model(...)] key on field (expected `primary`, `skip`, `column`, `vector`, `has_many`, `has_one`, or `belongs_to`)"))
+                        Err(meta.error("unknown #[model(...)] key on field (expected `primary`, `unique`, `index`, `default`, `skip`, `column`, `vector`, `has_many`, `has_one`, or `belongs_to`)"))
                     }
                 })?;
             }
@@ -247,6 +288,9 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 scalar: Scalar::Text,
                 optional: false,
                 primary: false,
+                unique: false,
+                index: false,
+                default: None,
                 skip,
                 relation,
                 vector_dim: None,
@@ -264,6 +308,9 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 scalar: Scalar::Vector,
                 optional,
                 primary: false,
+                unique,
+                index,
+                default,
                 skip: false,
                 relation: None,
                 vector_dim,
@@ -284,6 +331,9 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             scalar,
             optional,
             primary,
+            unique,
+            index,
+            default,
             skip: false,
             relation: None,
             vector_dim: None,
@@ -307,12 +357,51 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 quote!(::sutegi::orm::ColType::Vector { dim: #dim })
             }
         };
-        let nullable = f.optional;
-        let primary = f.primary;
-        quote! {
-            ::sutegi::orm::Column { name: #col, ty: #ty, nullable: #nullable, primary: #primary }
+        let mut def = quote! { ::sutegi::orm::Column::new(#col, #ty) };
+        if f.primary {
+            def = quote! { #def.primary() };
         }
+        if f.optional {
+            def = quote! { #def.nullable() };
+        }
+        if f.unique {
+            def = quote! { #def.unique() };
+        }
+        if let Some(value) = &f.default {
+            def = quote! { #def.default(#value) };
+        }
+        def
     });
+
+    // ---- schema() indexes + foreign keys ----
+    let index_defs = infos.iter().filter(|f| f.is_column() && f.index).map(|f| {
+        let col = &f.column;
+        quote! { .index(&[#col]) }
+    });
+    let fk_defs = infos
+        .iter()
+        .filter_map(|f| f.relation.as_ref())
+        .filter(|r| r.kind == RelKind::BelongsTo)
+        .map(|r| {
+            let related = &r.related;
+            let fk_col = &r.foreign_key;
+            let ref_col = match &r.key {
+                Some(k) => quote! { #k },
+                None => quote! { <#related as ::sutegi::orm::Model>::primary_key() },
+            };
+            let action = match &r.on_delete {
+                Some(v) => quote! { ::sutegi::orm::FkAction::#v },
+                None => quote! { ::sutegi::orm::FkAction::NoAction },
+            };
+            quote! {
+                .foreign_key(
+                    #fk_col,
+                    <#related as ::sutegi::orm::Model>::table(),
+                    #ref_col,
+                    #action,
+                )
+            }
+        });
 
     // ---- from_row() field initializers ----
     let from_row_inits = infos.iter().map(|f| {
@@ -460,13 +549,28 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 
     let relation_loaders = relation_loaders(&infos)?;
 
+    // The primary-key column literal (falls back to `id`, matching the trait).
+    let pk_column = infos
+        .iter()
+        .find(|f| f.primary)
+        .map(|f| f.column.clone())
+        .unwrap_or_else(|| "id".to_string());
+
     Ok(quote! {
         impl ::sutegi::orm::Model for #name {
             fn schema() -> ::sutegi::orm::TableSchema {
-                ::sutegi::orm::TableSchema {
-                    table: #table,
-                    columns: ::std::vec![ #( #column_defs ),* ],
-                }
+                ::sutegi::orm::TableSchema::new(#table)
+                    #( .column(#column_defs) )*
+                    #( #index_defs )*
+                    #( #fk_defs )*
+            }
+
+            fn table() -> &'static str {
+                #table
+            }
+
+            fn primary_key() -> &'static str {
+                #pk_column
             }
         }
 
@@ -644,6 +748,29 @@ fn relation_loaders(infos: &[FieldInfo]) -> syn::Result<Vec<proc_macro2::TokenSt
 }
 
 /// Map a Rust field type to (scalar kind, is_option). Returns None if unsupported.
+/// Render a `#[model(default = <lit>)]` literal as a `Value` constructor.
+fn default_value_expr(lit: &syn::Lit) -> Option<proc_macro2::TokenStream> {
+    match lit {
+        syn::Lit::Int(i) => {
+            let v = i.base10_parse::<i64>().ok()?;
+            Some(quote!(::sutegi::orm::Value::Int(#v)))
+        }
+        syn::Lit::Float(f) => {
+            let v = f.base10_parse::<f64>().ok()?;
+            Some(quote!(::sutegi::orm::Value::Real(#v)))
+        }
+        syn::Lit::Bool(b) => {
+            let v = b.value;
+            Some(quote!(::sutegi::orm::Value::Bool(#v)))
+        }
+        syn::Lit::Str(s) => {
+            let v = s.value();
+            Some(quote!(::sutegi::orm::Value::Text(::std::string::String::from(#v))))
+        }
+        _ => None,
+    }
+}
+
 fn classify(ty: &Type) -> Option<(Scalar, bool)> {
     let seg = last_segment(ty)?;
     if seg == "Option" {

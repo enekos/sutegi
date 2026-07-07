@@ -174,23 +174,19 @@ pub trait Transactional: Backend {
 pub trait Model {
     fn schema() -> TableSchema;
 
-    fn table() -> &'static str {
-        Self::schema().table
-    }
+    /// The table name. `#[derive(Model)]` implements this as a literal; a
+    /// hand-written impl must keep it in sync with [`schema`](Model::schema).
+    fn table() -> &'static str;
 
-    /// The primary-key column name (falls back to `id`).
+    /// The primary-key column name (defaults to `id`; the derive overrides it
+    /// when a different column is marked `#[model(primary)]`).
     fn primary_key() -> &'static str {
-        Self::schema()
-            .columns
-            .iter()
-            .find(|c| c.primary)
-            .map(|c| c.name)
-            .unwrap_or("id")
+        "id"
     }
 
     /// Start a query builder scoped to this model's table.
     fn query() -> QueryBuilder {
-        QueryBuilder::table(Self::schema().table)
+        QueryBuilder::table(Self::table())
     }
 
     /// Create this model's table if it does not exist.
@@ -413,29 +409,10 @@ mod tests {
     use crate::value::{ColType, Column};
 
     fn todos() -> TableSchema {
-        TableSchema {
-            table: "todos",
-            columns: vec![
-                Column {
-                    name: "id",
-                    ty: ColType::Integer,
-                    nullable: false,
-                    primary: true,
-                },
-                Column {
-                    name: "title",
-                    ty: ColType::Text,
-                    nullable: false,
-                    primary: false,
-                },
-                Column {
-                    name: "done",
-                    ty: ColType::Boolean,
-                    nullable: false,
-                    primary: false,
-                },
-            ],
-        }
+        TableSchema::new("todos")
+            .column(Column::new("id", ColType::Integer).primary())
+            .column(Column::new("title", ColType::Text))
+            .column(Column::new("done", ColType::Boolean))
     }
 
     #[test]
@@ -444,6 +421,9 @@ mod tests {
         impl Model for T {
             fn schema() -> TableSchema {
                 todos()
+            }
+            fn table() -> &'static str {
+                "todos"
             }
         }
         assert_eq!(T::primary_key(), "id");
