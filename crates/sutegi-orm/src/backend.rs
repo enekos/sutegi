@@ -208,9 +208,14 @@ pub trait Model {
         QueryBuilder::table(Self::table())
     }
 
-    /// Create this model's table if it does not exist.
+    /// Dev-mode schema sync for this model: create the table if missing, and
+    /// **add any columns/indexes/foreign keys the model gained** — the fix for
+    /// the old create-if-missing behaviour that silently ignored new fields.
+    /// Additive and non-destructive; it errors (pointing at `migrate gen`) on a
+    /// change that needs a real migration. Use a [`Migrator`](crate::migrate)
+    /// for production.
     fn migrate<B: Backend>(conn: &B) -> Result<(), String> {
-        conn.migrate(&Self::schema())
+        crate::migrate::sync_table(conn, &Self::schema())
     }
 
     /// Active-record-style: fetch every row as a JSON object.

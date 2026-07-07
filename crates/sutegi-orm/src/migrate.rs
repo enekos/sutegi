@@ -617,6 +617,148 @@ pub fn generate_via<B: Backend>(
     ))
 }
 
+/// A [`SchemaOp`] is a drop — the ops dev-mode [`sync`] refuses to run so it can
+/// never destroy data (extra columns/tables in the database are left alone).
+fn is_drop(op: &SchemaOp) -> bool {
+    matches!(
+        op,
+        SchemaOp::DropTable(_)
+            | SchemaOp::DropColumn { .. }
+            | SchemaOp::DropIndex { .. }
+            | SchemaOp::DropForeignKey { .. }
+    )
+}
+
+/// **Dev-mode schema sync**: bring the database's `desired` tables up to date
+/// with *additive, non-destructive* changes only — create missing tables, add
+/// columns/indexes/foreign keys, apply safe column widenings. Returns the
+/// summaries of what it applied.
+///
+/// It never drops anything (extra columns and tables are left untouched), and it
+/// refuses — with an error pointing at `migrate gen` — any change that could
+/// lose data or fail on existing rows (a `NOT NULL` column with no default, a
+/// lossy type change). This is the honest replacement for the old
+/// create-if-missing [`Model::migrate`](crate::Model::migrate): a convenience
+/// for local iteration, not a substitute for reviewed migrations in production.
+pub fn sync<B: Backend>(conn: &B, desired: &[TableSchema]) -> Result<Vec<String>, String> {
+    let dialect = conn.dialect();
+    let live = conn.introspect()?;
+
+    // Only diff the tables the caller cares about — never propose dropping a
+    // table that simply isn't in this model set.
+    let wanted: std::collections::BTreeSet<&str> =
+        desired.iter().map(|t| t.table.as_str()).collect();
+    let current: Vec<TableSchema> = live
+        .iter()
+        .filter(|t| wanted.contains(t.table.as_str()))
+        .cloned()
+        .collect();
+
+    let plan = diff(&current, &normalize_all(desired.to_vec()), dialect);
+
+    // Anything unsafe that isn't a (skipped) drop blocks the sync.
+    let blocked: Vec<String> = plan
+        .ops
+        .iter()
+        .filter(|op| !is_drop(op) && op.safety() != crate::schema_diff::Safety::Safe)
+        .map(|op| format!("  - {}", op.summary()))
+        .collect();
+    if !blocked.is_empty() {
+        return Err(format!(
+            "sync can only apply safe additive changes; these need a real migration \
+             (run `migrate gen`):\n{}",
+            blocked.join("\n")
+        ));
+    }
+
+    // Apply the safe, non-drop ops, threading the live schema as rebuild context.
+    let mut shadow = live;
+    let mut applied = Vec::new();
+    for op in &plan.ops {
+        if is_drop(op) || op.safety() != crate::schema_diff::Safety::Safe {
+            continue;
+        }
+        for sql in render(op, dialect, &shadow)? {
+            conn.execute(&sql, &[])?;
+        }
+        apply(&mut shadow, op)?;
+        applied.push(op.summary());
+    }
+    Ok(applied)
+}
+
+/// Single-table [`sync`] — the engine behind the reimplemented
+/// [`Model::migrate`](crate::Model::migrate).
+pub fn sync_table<B: Backend>(conn: &B, schema: &TableSchema) -> Result<(), String> {
+    sync(conn, std::slice::from_ref(schema)).map(|_| ())
+}
+
+/// A three-way drift report comparing the models, the migration history's
+/// shadow schema, and the live database.
+#[derive(Clone, Debug)]
+pub struct DriftReport {
+    /// The DB diverges from what the migrations say it should be (a hand-edit,
+    /// or migrations not fully applied). Empty ⇒ in sync.
+    pub db_vs_migrations: Plan,
+    /// The models have changes the migrations don't capture yet — you need to
+    /// `migrate gen`. Empty ⇒ no pending model changes.
+    pub models_vs_migrations: Plan,
+}
+
+impl DriftReport {
+    /// True when everything agrees: DB matches migrations and models match too.
+    pub fn is_clean(&self) -> bool {
+        self.db_vs_migrations.is_empty() && self.models_vs_migrations.is_empty()
+    }
+
+    /// A machine-readable summary, for `/__migrations` and `migrate drift`.
+    pub fn to_json(&self) -> Json {
+        let ops = |p: &Plan| Json::arr(p.ops.iter().map(|o| Json::str(o.summary())).collect());
+        Json::obj(vec![
+            ("clean", Json::Bool(self.is_clean())),
+            ("db_vs_migrations", ops(&self.db_vs_migrations)),
+            ("models_vs_migrations", ops(&self.models_vs_migrations)),
+        ])
+    }
+}
+
+/// Compute drift: diff the shadow schema (migration history) against both the
+/// live database and the models. The shadow is folded purely from ops
+/// migrations; pass a scratch backend via [`Migrator::shadow_via`] first if you
+/// have closures (then call [`drift_with_shadow`]).
+pub fn drift<B: Backend>(
+    conn: &B,
+    migrator: &Migrator,
+    models: &[TableSchema],
+) -> Result<DriftReport, String> {
+    let shadow = migrator.shadow()?;
+    drift_with_shadow(conn, &shadow, models)
+}
+
+/// Drift against a precomputed shadow (so callers with closure migrations can
+/// supply a replayed one).
+pub fn drift_with_shadow<B: Backend>(
+    conn: &B,
+    shadow: &[TableSchema],
+    models: &[TableSchema],
+) -> Result<DriftReport, String> {
+    let dialect = conn.dialect();
+    let live = normalize_all(conn.introspect()?);
+    // Compare only the tables the migrations manage, so unrelated tables (a KV
+    // store, the events log) don't read as drift.
+    let managed: std::collections::BTreeSet<&str> =
+        shadow.iter().map(|t| t.table.as_str()).collect();
+    let live_managed: Vec<TableSchema> = live
+        .iter()
+        .filter(|t| managed.contains(t.table.as_str()))
+        .cloned()
+        .collect();
+    Ok(DriftReport {
+        db_vs_migrations: diff(shadow, &live_managed, dialect),
+        models_vs_migrations: diff(shadow, &normalize_all(models.to_vec()), dialect),
+    })
+}
+
 /// Write a declarative migration to `<dir>/<version>_<name>.json` (creating the
 /// directory if needed) and return the path. Errors for a closure migration.
 pub fn write_migration_file(dir: &str, migration: &Migration) -> Result<String, String> {
@@ -987,5 +1129,72 @@ mod tests {
         assert_eq!(db.introspect().unwrap()[0], todos_v1().normalized());
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ---- P6: dev-mode sync + drift ----
+
+    #[test]
+    fn sync_creates_then_adds_columns_additively() {
+        let db = Db::memory().unwrap();
+
+        // First sync creates the table.
+        let applied = sync(&db, &[todos_v1()]).unwrap();
+        assert_eq!(applied.len(), 1);
+        Backend::execute(&db, "INSERT INTO todos (title) VALUES ('x')", &[]).unwrap();
+
+        // Second sync adds the new (defaulted) column — the old silent-noop bug.
+        let applied = sync(&db, &[todos_v2()]).unwrap();
+        assert_eq!(applied.len(), 1);
+        assert!(applied[0].contains("add column todos.done"));
+        assert_eq!(db.introspect().unwrap()[0], todos_v2().normalized());
+        // Idempotent: a third sync does nothing.
+        assert!(sync(&db, &[todos_v2()]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sync_refuses_a_not_null_column_without_default() {
+        let db = Db::memory().unwrap();
+        sync(&db, &[todos_v1()]).unwrap();
+        Backend::execute(&db, "INSERT INTO todos (title) VALUES ('x')", &[]).unwrap();
+
+        // A required column with no default can't be synced onto a populated table.
+        let needs_migration = TableSchema::new("todos")
+            .column(Column::new("id", ColType::Integer).primary())
+            .column(Column::new("title", ColType::Text))
+            .column(Column::new("owner", ColType::Text));
+        let err = sync(&db, &[needs_migration]).unwrap_err();
+        assert!(err.contains("migrate gen"), "got: {err}");
+    }
+
+    #[test]
+    fn sync_leaves_extra_db_columns_alone() {
+        let db = Db::memory().unwrap();
+        sync(&db, &[todos_v2()]).unwrap();
+        // The model is now a subset (no `done`) — sync must not drop the column.
+        let applied = sync(&db, &[todos_v1()]).unwrap();
+        assert!(applied.is_empty());
+        assert!(db.introspect().unwrap()[0].col("done").is_some());
+    }
+
+    #[test]
+    fn drift_flags_pending_model_changes_and_hand_edits() {
+        let db = Db::memory().unwrap();
+        let v1 = crate::schema_diff::diff(&[], &[todos_v1()], Dialect::Sqlite);
+        let migrator = Migrator::new().add(Migration::ops("0001_todos", "create_todos", v1.ops));
+        migrator.run(&db).unwrap();
+
+        // DB matches migrations, models match migrations → clean.
+        let report = drift(&db, &migrator, &[todos_v1()]).unwrap();
+        assert!(report.is_clean(), "{:?}", report);
+
+        // Model gained a field but no migration generated → models-vs-migrations drift.
+        let report = drift(&db, &migrator, &[todos_v2()]).unwrap();
+        assert!(report.db_vs_migrations.is_empty());
+        assert!(!report.models_vs_migrations.is_empty());
+
+        // Someone hand-edits the DB → db-vs-migrations drift.
+        Backend::execute(&db, "ALTER TABLE todos ADD COLUMN sneaky TEXT", &[]).unwrap();
+        let report = drift(&db, &migrator, &[todos_v1()]).unwrap();
+        assert!(!report.db_vs_migrations.is_empty());
     }
 }

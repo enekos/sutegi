@@ -71,6 +71,20 @@ pub use sutegi_ws as ws;
 #[cfg(feature = "derive")]
 pub use sutegi_macros::{Model, Validate};
 
+/// Collect a set of models' schemas into a `Vec<TableSchema>` — the desired
+/// state passed to `migrate:gen` / `migrate:drift` / [`migrate::report_json`].
+///
+/// ```ignore
+/// let models = sutegi::schemas![Todo, User, Post];
+/// ```
+#[cfg(feature = "orm")]
+#[macro_export]
+macro_rules! schemas {
+    ($($model:ty),* $(,)?) => {
+        ::std::vec![ $( <$model as $crate::orm::Model>::schema() ),* ]
+    };
+}
+
 /// Route-model binding: hydrate a typed model straight from a path parameter,
 /// or return a ready-made error response. Works over any runnable backend
 /// (`sqlite` or `postgres`).
@@ -133,12 +147,16 @@ pub mod config;
 /// prints the ledger. Same binary serves and migrates — the Rails/Laravel shape.
 #[cfg(feature = "orm")]
 pub mod migrate {
+    use sutegi_json::Json;
     pub use sutegi_orm::migrate::{
-        generate, generate_via, status_json, write_migration_file, Migration, MigrationOps,
-        MigrationStatus, Migrator,
+        drift, generate, generate_via, status_json, write_migration_file, DriftReport, Migration,
+        MigrationOps, MigrationStatus, Migrator,
     };
     pub use sutegi_orm::schema_diff::{self, Plan, SchemaOp};
-    use sutegi_orm::Backend;
+    use sutegi_orm::{Backend, TableSchema};
+
+    /// The conventional directory for generated migration files.
+    pub const MIGRATIONS_DIR: &str = "migrations";
 
     /// Inspect `std::env::args()` for a `migrate*` subcommand and run it against
     /// `conn`. Returns `true` if a subcommand was handled (the caller should
@@ -165,6 +183,164 @@ pub mod migrate {
             _ => return false,
         }
         true
+    }
+
+    /// The full CLI runner: everything [`dispatch`] handles plus the diff-driven
+    /// verbs that need the model set and a migrations directory —
+    /// `migrate:gen <name>` (write a migration from the model↔shadow diff),
+    /// `migrate:plan` (show it without writing), `migrate:drift` (three-way
+    /// report), and `migrate:fresh` (roll everything back and re-run; dev only).
+    ///
+    /// ```ignore
+    /// let models = vec![Todo::schema(), User::schema()];
+    /// if sutegi::migrate::dispatch_full(&migrations(), &db, &models, sutegi::migrate::MIGRATIONS_DIR) {
+    ///     return Ok(());
+    /// }
+    /// ```
+    pub fn dispatch_full<B: Backend>(
+        migrator: &Migrator,
+        conn: &B,
+        models: &[TableSchema],
+        dir: &str,
+    ) -> bool {
+        let args: Vec<String> = std::env::args().collect();
+        match args.get(1).map(String::as_str) {
+            Some("migrate:gen") => {
+                let name = args
+                    .get(2)
+                    .cloned()
+                    .unwrap_or_else(|| "changes".to_string());
+                finish("migrate:gen", run_gen(migrator, conn, models, dir, &name));
+            }
+            Some("migrate:plan") => finish("migrate:plan", run_plan(migrator, conn, models)),
+            Some("migrate:drift") => finish("migrate:drift", run_drift(migrator, conn, models)),
+            Some("migrate:fresh") => finish(
+                "migrate:fresh",
+                run_fresh(migrator, conn).map(report_applied),
+            ),
+            // Fall through to the base verbs (migrate / :rollback / :status).
+            _ => return dispatch(migrator, conn),
+        }
+        true
+    }
+
+    fn run_gen<B: Backend>(
+        migrator: &Migrator,
+        conn: &B,
+        models: &[TableSchema],
+        dir: &str,
+        name: &str,
+    ) -> Result<(), String> {
+        let plan = generate(migrator, models, conn.dialect())?;
+        if plan.is_empty() {
+            println!("migrate:gen: no changes — models match the migration history");
+            return Ok(());
+        }
+        let migration = Migration::ops(timestamp_version(), name, plan.ops.clone());
+        let path = write_migration_file(dir, &migration)?;
+        println!("migrate:gen: wrote {path}");
+        for op in &plan.ops {
+            println!("  + {}", op.summary());
+        }
+        print_warnings(&plan);
+        Ok(())
+    }
+
+    fn run_plan<B: Backend>(
+        migrator: &Migrator,
+        conn: &B,
+        models: &[TableSchema],
+    ) -> Result<(), String> {
+        let plan = generate(migrator, models, conn.dialect())?;
+        if plan.is_empty() {
+            println!("migrate:plan: no pending changes");
+        } else {
+            println!("migrate:plan: {} op(s) would be generated:", plan.ops.len());
+            for op in &plan.ops {
+                println!("  + {}", op.summary());
+            }
+            print_warnings(&plan);
+        }
+        Ok(())
+    }
+
+    fn run_drift<B: Backend>(
+        migrator: &Migrator,
+        conn: &B,
+        models: &[TableSchema],
+    ) -> Result<(), String> {
+        let report = drift(conn, migrator, models)?;
+        if report.is_clean() {
+            println!("migrate:drift: clean — database, migrations, and models agree");
+            return Ok(());
+        }
+        if !report.db_vs_migrations.is_empty() {
+            println!("database has drifted from the migration history:");
+            for op in &report.db_vs_migrations.ops {
+                println!("  ! {}", op.summary());
+            }
+        }
+        if !report.models_vs_migrations.is_empty() {
+            println!("models have changes not yet captured in a migration (run migrate:gen):");
+            for op in &report.models_vs_migrations.ops {
+                println!("  + {}", op.summary());
+            }
+        }
+        Ok(())
+    }
+
+    /// Roll back every batch, then re-run — a clean rebuild for local dev.
+    fn run_fresh<B: Backend>(migrator: &Migrator, conn: &B) -> Result<Vec<String>, String> {
+        // Roll back until nothing remains (each call undoes one batch).
+        while !migrator.rollback(conn, 1)?.is_empty() {}
+        migrator.run(conn)
+    }
+
+    fn print_warnings(plan: &Plan) {
+        for w in &plan.warnings {
+            println!("  ⚠ {w}");
+        }
+    }
+
+    /// A machine-readable migration report for a read-only `/__migrations`
+    /// endpoint: applied/pending status, the pending model diff, and drift.
+    /// Mount it as `app.get("/__migrations", move |_| json(200, &report))`.
+    pub fn report_json<B: Backend>(migrator: &Migrator, conn: &B, models: &[TableSchema]) -> Json {
+        let status = migrator
+            .status(conn)
+            .map(|s| status_json(&s))
+            .unwrap_or(Json::Null);
+        let pending = generate(migrator, models, conn.dialect())
+            .map(|p| Json::arr(p.ops.iter().map(|o| Json::str(o.summary())).collect()))
+            .unwrap_or(Json::Null);
+        let drift_report = drift(conn, migrator, models)
+            .map(|d| d.to_json())
+            .unwrap_or(Json::Null);
+        Json::obj(vec![
+            ("migrations", status),
+            ("pending", pending),
+            ("drift", drift_report),
+        ])
+    }
+
+    /// A sortable `YYYYMMDD_HHMMSS` version id from the current UTC time, for a
+    /// freshly generated migration.
+    fn timestamp_version() -> String {
+        let secs = sutegi_crypto::now_secs().max(0);
+        let (days, rem) = (secs / 86_400, secs % 86_400);
+        let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+        // Civil date from days-since-epoch (Howard Hinnant's algorithm).
+        let z = days + 719_468;
+        let era = z / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if m <= 2 { y + 1 } else { y };
+        format!("{y:04}{m:02}{d:02}_{hh:02}{mm:02}{ss:02}")
     }
 
     fn finish(cmd: &str, result: Result<(), String>) {
