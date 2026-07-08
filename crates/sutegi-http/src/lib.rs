@@ -285,6 +285,15 @@ fn strip_crlf(s: &str) -> Cow<'_, str> {
 }
 
 /// Server resource limits — the difference between "demo" and "won't fall over".
+
+fn strip_crlf(s: &str) -> Cow<'_, str> {
+    if s.as_bytes().iter().any(|&b| b == b'\r' || b == b'\n') {
+        Cow::Owned(s.replace(['\r', '\n'], ""))
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     /// Reject request bodies larger than this (HTTP 413). Default 2 MiB.
@@ -366,6 +375,9 @@ fn read_line_capped<R: BufRead>(
     deadline: Instant,
 ) -> io::Result<Line> {
     buf.clear();
+    if Instant::now() > deadline {
+        return Ok(Line::Timeout);
+    }
     loop {
         let chunk = match reader.fill_buf() {
             Ok(c) => c,
@@ -460,6 +472,22 @@ fn parse_request_impl<R: BufRead>(
     limits: &Limits,
     deadline: Instant,
 ) -> io::Result<Option<Incoming>> {
+||||||| parent of 9c93e92 (Security hardening, performance fixes, and pre-commit hook)
+=======
+    let deadline = Instant::now() + limits.header_timeout;
+    parse_request_deadline(reader, limits, deadline)
+}
+
+/// Like [`parse_request`], but with an explicit wall-clock `deadline` spanning
+/// the request line, headers, and body. `handle_connection` computes one
+/// deadline per request and threads it here, so a slow drip is bounded in
+/// total, not merely per recv (slowloris, CWE-400).
+pub fn parse_request_deadline<R: BufRead>(
+    reader: &mut R,
+    limits: &Limits,
+    deadline: Instant,
+) -> io::Result<Option<Incoming>> {
+>>>>>>> 9c93e92 (Security hardening, performance fixes, and pre-commit hook)
     // One byte buffer, reused for the request line and every header line —
     // this function runs per request, so allocation churn is latency.
     let mut buf: Vec<u8> = Vec::with_capacity(128);
@@ -693,8 +721,8 @@ fn write_upgrade_head<W: Write>(
     for (k, v) in headers {
         // Strip CR/LF (CWE-113): upgrade handshakes echo caller-supplied header
         // values (e.g. `Sec-WebSocket-Protocol`), so sanitize here too.
-        let k_clean = strip_crlf(k);
-        let v_clean = strip_crlf(v);
+        let k_clean = strip_crlf(&k);
+        let v_clean = strip_crlf(&v);
         head.push_str(&k_clean);
         head.push_str(": ");
         head.push_str(&v_clean);
