@@ -5,12 +5,12 @@
 //! and the request lifecycle trivial to reason about — for a human reading
 //! the source, or an agent reasoning about the running app.
 
+use std::borrow::Cow;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
 /// HTTP request methods sutegi recognizes.
@@ -276,8 +276,6 @@ impl<'a> SseSink<'a> {
     }
 }
 
-/// Server resource limits — the difference between "demo" and "won't fall over".
-
 fn strip_crlf(s: &str) -> Cow<'_, str> {
     if s.as_bytes().iter().any(|&b| b == b'\r' || b == b'\n') {
         Cow::Owned(s.replace(['\r', '\n'], ""))
@@ -286,6 +284,7 @@ fn strip_crlf(s: &str) -> Cow<'_, str> {
     }
 }
 
+/// Server resource limits — the difference between "demo" and "won't fall over".
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     /// Reject request bodies larger than this (HTTP 413). Default 2 MiB.
@@ -367,9 +366,6 @@ fn read_line_capped<R: BufRead>(
     deadline: Instant,
 ) -> io::Result<Line> {
     buf.clear();
-    if Instant::now() > deadline {
-        return Ok(Line::Timeout);
-    }
     loop {
         let chunk = match reader.fill_buf() {
             Ok(c) => c,
@@ -390,6 +386,14 @@ fn read_line_capped<R: BufRead>(
         reader.consume(take);
         if done {
             break;
+        }
+        // The line isn't complete yet, so we're about to loop and block on the
+        // next recv — the only moment a slow drip can burn wall-clock. Check
+        // the deadline here (mirroring the body-read loop below), not on entry:
+        // a line already served whole from the buffer never reads the clock,
+        // keeping the parse hot path syscall-free.
+        if Instant::now() > deadline {
+            return Ok(Line::Timeout);
         }
     }
     if buf.is_empty() {
@@ -433,6 +437,16 @@ pub fn parse_request_deadline<R: BufRead>(
     limits: &Limits,
     deadline: Instant,
 ) -> io::Result<Option<Incoming>> {
+    // Reject up front if we're already past the wall-clock budget, so a caller
+    // handing us a stale deadline bails before touching the socket (and a
+    // dripping peer can't slip one buffered line past an expired deadline).
+    // This is the single unconditional clock read on the parse path; the
+    // per-line and per-body loops below only read the clock when they must
+    // actually wait for more input.
+    if Instant::now() > deadline {
+        return Ok(Some(Incoming::Reject { status: 408 }));
+    }
+
     // One byte buffer, reused for the request line and every header line —
     // this function runs per request, so allocation churn is latency.
     let mut buf: Vec<u8> = Vec::with_capacity(128);
@@ -666,8 +680,8 @@ fn write_upgrade_head<W: Write>(
     for (k, v) in headers {
         // Strip CR/LF (CWE-113): upgrade handshakes echo caller-supplied header
         // values (e.g. `Sec-WebSocket-Protocol`), so sanitize here too.
-        let k_clean = strip_crlf(&k);
-        let v_clean = strip_crlf(&v);
+        let k_clean = strip_crlf(k);
+        let v_clean = strip_crlf(v);
         head.push_str(&k_clean);
         head.push_str(": ");
         head.push_str(&v_clean);
