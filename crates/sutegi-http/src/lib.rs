@@ -424,8 +424,10 @@ fn decode_line(buf: &[u8]) -> io::Result<&str> {
 /// deadline derived from `limits.header_timeout`; see [`parse_request_deadline`]
 /// for the deadline-threaded form the server loop uses.
 pub fn parse_request<R: BufRead>(reader: &mut R, limits: &Limits) -> io::Result<Option<Incoming>> {
+    // The deadline is freshly derived from `now`, so it can't already be past:
+    // skip straight to the parse without the redundant guard clock read.
     let deadline = Instant::now() + limits.header_timeout;
-    parse_request_deadline(reader, limits, deadline)
+    parse_request_impl(reader, limits, deadline)
 }
 
 /// Like [`parse_request`], but with an explicit wall-clock `deadline` spanning
@@ -437,16 +439,27 @@ pub fn parse_request_deadline<R: BufRead>(
     limits: &Limits,
     deadline: Instant,
 ) -> io::Result<Option<Incoming>> {
-    // Reject up front if we're already past the wall-clock budget, so a caller
-    // handing us a stale deadline bails before touching the socket (and a
-    // dripping peer can't slip one buffered line past an expired deadline).
-    // This is the single unconditional clock read on the parse path; the
-    // per-line and per-body loops below only read the clock when they must
-    // actually wait for more input.
+    // Public entry for a caller-supplied deadline that may already be stale
+    // (unlike the freshly-derived one `parse_request`/`handle_connection` pass):
+    // reject up front so such a caller bails before touching the socket, and a
+    // dripping peer can't slip one buffered line past an expired deadline.
     if Instant::now() > deadline {
         return Ok(Some(Incoming::Reject { status: 408 }));
     }
+    parse_request_impl(reader, limits, deadline)
+}
 
+/// Shared parse body. Callers that derive `deadline` from `now` immediately
+/// beforehand (`parse_request`, `handle_connection`) reach it directly, skipping
+/// the redundant up-front deadline check — the per-line and per-body loops read
+/// the clock only when they must actually wait for more input, so the hot path
+/// (a request already buffered) is syscall-free apart from the one `now` used to
+/// derive the deadline.
+fn parse_request_impl<R: BufRead>(
+    reader: &mut R,
+    limits: &Limits,
+    deadline: Instant,
+) -> io::Result<Option<Incoming>> {
     // One byte buffer, reused for the request line and every header line —
     // this function runs per request, so allocation churn is latency.
     let mut buf: Vec<u8> = Vec::with_capacity(128);
@@ -847,7 +860,8 @@ where
         // client dripping one byte per interval would otherwise pin this worker
         // forever (slowloris, CWE-400). Recomputed per request.
         let deadline = Instant::now() + limits.header_timeout;
-        match parse_request_deadline(&mut reader, limits, deadline) {
+        // Deadline is fresh from `now`, so skip the redundant up-front guard.
+        match parse_request_impl(&mut reader, limits, deadline) {
             Ok(Some(Incoming::Request(mut req))) => {
                 req.peer = peer.clone();
                 let keep = wants_keep_alive(&req);
