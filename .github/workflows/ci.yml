@@ -120,7 +120,13 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Bench HEAD
-        run: cd sutegi && make -s bench > /tmp/head.json
+        run: |
+          cd sutegi
+          # Stash the accepted-regressions list now, while the PR tree is
+          # checked out — the "Bench base" step below checks out master, which
+          # may not carry this file. Absent file => empty (nothing accepted).
+          cp benches/perf-accepted.txt /tmp/perf-accepted.txt 2>/dev/null || : > /tmp/perf-accepted.txt
+          make -s bench > /tmp/head.json
 
       - name: Bench base
         if: github.event_name == 'pull_request'
@@ -132,15 +138,34 @@ jobs:
       - name: Compare (fail on regression)
         if: github.event_name == 'pull_request'
         run: |
-          set +e
+          set -euo pipefail
+          # Produce the report without --fail-on-regression; we decide the exit
+          # code ourselves so accepted regressions (benches/perf-accepted.txt)
+          # don't fail the gate while everything else still does.
           aatxe compare --base /tmp/base.json --head /tmp/head.json \
             --out /tmp/compare.json --markdown /tmp/compare.md \
-            --threshold 0.10 --fail-on-regression
-          status=$?
+            --threshold 0.10
           # Print to the job log *and* the step summary, so a regression is
           # visible in the run output (not only the summary tab).
           cat /tmp/compare.md | tee -a "$GITHUB_STEP_SUMMARY"
-          exit $status
+          # Accepted list (captured from the PR tree in "Bench HEAD"): strip
+          # comments/blank lines to bare bench names.
+          sed -E 's/#.*//; s/[[:space:]]+//g' /tmp/perf-accepted.txt \
+            | { grep -v '^$' || true; } | sort -u > /tmp/accepted.txt
+          # Regressions aatxe flagged, minus the accepted ones.
+          jq -r '.diffs[] | select(.verdict == "regression") | .name' \
+            /tmp/compare.json | sort -u > /tmp/regressions.txt
+          unexpected=$(comm -23 /tmp/regressions.txt /tmp/accepted.txt)
+          if [ -n "$unexpected" ]; then
+            echo "::error::Unaccepted perf regression(s):"
+            echo "$unexpected"
+            echo "If one is intended, add it (with a rationale) to benches/perf-accepted.txt."
+            exit 1
+          fi
+          accepted=$(comm -12 /tmp/regressions.txt /tmp/accepted.txt)
+          if [ -n "$accepted" ]; then
+            echo "Accepted (non-failing) regression(s): $(echo "$accepted" | tr '\n' ' ')"
+          fi
 
       - name: Publish report (push)
         if: github.event_name != 'pull_request'
