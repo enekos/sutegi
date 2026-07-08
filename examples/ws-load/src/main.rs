@@ -78,6 +78,9 @@ fn server(base_port: u16, ports: u16) -> std::io::Result<()> {
             // client fleet doesn't answer pings promptly while it scans.
             ping_interval: Duration::from_secs(120),
             idle_timeout: Duration::from_secs(600),
+            // The fleet comes from loopback; disable the per-IP cap so the
+            // harness can actually reach six-figure connection counts.
+            max_connections_per_ip: 0,
             ..WsConfig::default()
         })
         .ws(

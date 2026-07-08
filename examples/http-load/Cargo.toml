@@ -1,0 +1,17 @@
+[package]
+name = "http-load-example"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "HTTP/1.1 keep-alive stress harness: drive a sutegi server with configurable concurrency and measure throughput + tail latency."
+publish = false
+
+[[bin]]
+name = "http-load"
+path = "src/main.rs"
+
+[dependencies]
+sutegi = { path = "../../crates/sutegi", default-features = false, features = ["sqlite"] }

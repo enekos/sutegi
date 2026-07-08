@@ -10,7 +10,8 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::borrow::Cow;
+use std::time::{Duration, Instant};
 
 /// HTTP request methods sutegi recognizes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -160,7 +161,15 @@ impl Response {
     }
 
     pub fn with_header(mut self, name: &str, value: &str) -> Response {
-        self.headers.push((name.to_string(), value.to_string()));
+        // Defensively strip CR/LF so a value derived from user input (e.g.
+        // `redirect(user_input)`) can't inject header lines / split the
+        // response (CWE-113). The authoritative choke point is
+        // `write_head_and_body`; this is defense in depth for any code that
+        // inspects `headers` before they are serialized.
+        self.headers.push((
+            strip_crlf(name).into_owned(),
+            strip_crlf(value).into_owned(),
+        ));
         self
     }
 
@@ -268,6 +277,15 @@ impl<'a> SseSink<'a> {
 }
 
 /// Server resource limits — the difference between "demo" and "won't fall over".
+
+fn strip_crlf(s: &str) -> Cow<'_, str> {
+    if s.as_bytes().iter().any(|&b| b == b'\r' || b == b'\n') {
+        Cow::Owned(s.replace(['\r', '\n'], ""))
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     /// Reject request bodies larger than this (HTTP 413). Default 2 MiB.
@@ -276,6 +294,12 @@ pub struct Limits {
     pub max_header_bytes: usize,
     /// Per-socket read/write timeout (slowloris protection). Default 30s.
     pub timeout: Option<Duration>,
+    /// Wall-clock deadline for reading one whole request (request line +
+    /// headers + body). Unlike `timeout`, which only bounds a single stalled
+    /// recv, this bounds the *total* time a client may take to deliver a
+    /// request, so a peer dripping one byte per interval can't pin a worker
+    /// indefinitely (slowloris, CWE-400). Default 15s.
+    pub header_timeout: Duration,
     /// How long a kept-alive connection may sit idle between requests before
     /// the worker hangs up. Deliberately much shorter than `timeout`: in the
     /// blocking thread-per-connection model an idle keep-alive connection
@@ -292,16 +316,27 @@ impl Default for Limits {
             max_body: 2 * 1024 * 1024,
             max_header_bytes: 64 * 1024,
             timeout: Some(Duration::from_secs(30)),
+            header_timeout: Duration::from_secs(15),
             keep_alive_idle: Duration::from_secs(5),
             keep_alive_max: 100,
         }
     }
 }
 
-/// The outcome of parsing: a request, or a refusal the server turns into 413.
+/// The outcome of parsing one request off the connection.
 pub enum Incoming {
+    /// A well-formed request, ready to hand to the handler.
     Request(Request),
+    /// Headers or body exceeded the configured size limits: the server replies
+    /// 413 and closes the connection.
     TooLarge,
+    /// The request is refused outright: the server writes `status`, then closes
+    /// the connection (never keep-alive). Used for unsupported
+    /// `Transfer-Encoding` (501), a malformed/conflicting `Content-Length`
+    /// (400), and the request-read wall-clock deadline (408). Closing is
+    /// mandatory — leaving the socket open would risk re-parsing leftover bytes
+    /// as a smuggled next request (CWE-444).
+    Reject { status: u16 },
 }
 
 /// Outcome of a single capped line read.
@@ -312,14 +347,29 @@ enum Line {
     Eof,
     /// The line would exceed the remaining header budget.
     TooLarge,
+    /// The wall-clock deadline elapsed before the line was fully read.
+    Timeout,
 }
 
 /// Read one `\n`-terminated line into `buf` (cleared first) without ever
 /// buffering more than `max` bytes. A plain [`BufRead::read_line`] on a stream
 /// that never sends a newline allocates without bound — a memory DoS reachable
 /// before any post-read length check can fire — so the read itself is capped.
-fn read_line_capped<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>, max: usize) -> io::Result<Line> {
+///
+/// `deadline` bounds the wall-clock time this may spend on a slow drip: the
+/// check runs at the top of each iteration, so a client feeding one byte per
+/// interval is cut off with [`Line::Timeout`] once the deadline passes, rather
+/// than pinning the worker under the (larger) per-recv timeout indefinitely.
+fn read_line_capped<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max: usize,
+    deadline: Instant,
+) -> io::Result<Line> {
     buf.clear();
+    if Instant::now() > deadline {
+        return Ok(Line::Timeout);
+    }
     loop {
         let chunk = match reader.fill_buf() {
             Ok(c) => c,
@@ -361,10 +411,28 @@ fn decode_line(buf: &[u8]) -> io::Result<&str> {
 }
 
 /// Parse a single request off a buffered stream, enforcing `limits`. Returns
-/// `Ok(None)` if the peer closed before sending anything, or
-/// `Ok(Some(Incoming::TooLarge))` if headers/body exceed the limits (so the
-/// server can reply 413 without allocating an attacker-chosen buffer).
+/// `Ok(None)` if the peer closed before sending anything, `Ok(Some(..))` with a
+/// [`Request`] on success, or an [`Incoming::TooLarge`]/[`Incoming::Reject`]
+/// refusal (so the server can reply without allocating an attacker-chosen
+/// buffer or accepting ambiguous / unsupported framing).
+///
+/// The whole read (request line + headers + body) is bounded by a wall-clock
+/// deadline derived from `limits.header_timeout`; see [`parse_request_deadline`]
+/// for the deadline-threaded form the server loop uses.
 pub fn parse_request<R: BufRead>(reader: &mut R, limits: &Limits) -> io::Result<Option<Incoming>> {
+    let deadline = Instant::now() + limits.header_timeout;
+    parse_request_deadline(reader, limits, deadline)
+}
+
+/// Like [`parse_request`], but with an explicit wall-clock `deadline` spanning
+/// the request line, headers, and body. `handle_connection` computes one
+/// deadline per request and threads it here, so a slow drip is bounded in
+/// total, not merely per recv (slowloris, CWE-400).
+pub fn parse_request_deadline<R: BufRead>(
+    reader: &mut R,
+    limits: &Limits,
+    deadline: Instant,
+) -> io::Result<Option<Incoming>> {
     // One byte buffer, reused for the request line and every header line —
     // this function runs per request, so allocation churn is latency.
     let mut buf: Vec<u8> = Vec::with_capacity(128);
@@ -373,9 +441,10 @@ pub fn parse_request<R: BufRead>(reader: &mut R, limits: &Limits) -> io::Result<
     // stream that never sends a newline would buffer without limit (a memory
     // DoS), so the request line and each header line are read through a
     // capped reader that stops at `max_header_bytes`.
-    match read_line_capped(reader, &mut buf, limits.max_header_bytes)? {
+    match read_line_capped(reader, &mut buf, limits.max_header_bytes, deadline)? {
         Line::Eof => return Ok(None),
         Line::TooLarge => return Ok(Some(Incoming::TooLarge)),
+        Line::Timeout => return Ok(Some(Incoming::Reject { status: 408 })),
         Line::Read(_) => {}
     }
     // Parse the request line into owned pieces before `buf` is reused below.
@@ -394,12 +463,15 @@ pub fn parse_request<R: BufRead>(reader: &mut R, limits: &Limits) -> io::Result<
     };
 
     let mut headers = Vec::with_capacity(8);
-    let mut content_length = 0usize;
+    // `None` until a Content-Length is seen, so a second, differing value can
+    // be detected (request smuggling, CWE-444) instead of silently winning.
+    let mut content_length: Option<usize> = None;
     loop {
         let remaining = limits.max_header_bytes.saturating_sub(header_bytes);
-        let n = match read_line_capped(reader, &mut buf, remaining)? {
+        let n = match read_line_capped(reader, &mut buf, remaining, deadline)? {
             Line::Eof => break,
             Line::TooLarge => return Ok(Some(Incoming::TooLarge)),
+            Line::Timeout => return Ok(Some(Incoming::Reject { status: 408 })),
             Line::Read(n) => n,
         };
         header_bytes += n;
@@ -411,20 +483,57 @@ pub fn parse_request<R: BufRead>(reader: &mut R, limits: &Limits) -> io::Result<
         if let Some((k, v)) = l.split_once(':') {
             let k = k.trim().to_string();
             let v = v.trim().to_string();
+            // Transfer-Encoding framing (chunked, …) is not implemented. We
+            // must NOT fall through to Content-Length framing: that treats a
+            // chunked body as a 0-length body and leaves the chunk data in the
+            // buffer to be re-parsed as the next request (CWE-444). Refuse it.
+            if k.eq_ignore_ascii_case("transfer-encoding") {
+                return Ok(Some(Incoming::Reject { status: 501 }));
+            }
+            // Content-Length must be exactly 1*DIGIT that fits in usize, and
+            // consistent if repeated. A malformed or conflicting value used to
+            // coerce to 0, desynchronizing body framing (CWE-444) — reject it.
             if k.eq_ignore_ascii_case("content-length") {
-                content_length = v.parse().unwrap_or(0);
+                let parsed = match parse_content_length(&v) {
+                    Some(n) => n,
+                    None => return Ok(Some(Incoming::Reject { status: 400 })),
+                };
+                match content_length {
+                    Some(prev) if prev != parsed => {
+                        return Ok(Some(Incoming::Reject { status: 400 }));
+                    }
+                    _ => content_length = Some(parsed),
+                }
             }
             headers.push((k, v));
         }
     }
 
     // Refuse oversized bodies before allocating an attacker-controlled buffer.
+    let content_length = content_length.unwrap_or(0);
     if content_length > limits.max_body {
         return Ok(Some(Incoming::TooLarge));
     }
+    // Read the body in chunks, re-checking the deadline each iteration so a
+    // slow body drip is bounded exactly like the header phase — a single
+    // `read_exact` has no total-time bound.
     let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        reader.read_exact(&mut body)?;
+    let mut filled = 0;
+    while filled < content_length {
+        match reader.read(&mut body[filled..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed before the request body was fully read",
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+        if filled < content_length && Instant::now() > deadline {
+            return Ok(Some(Incoming::Reject { status: 408 }));
+        }
     }
 
     Ok(Some(Incoming::Request(Request {
@@ -438,12 +547,36 @@ pub fn parse_request<R: BufRead>(reader: &mut R, limits: &Limits) -> io::Result<
     })))
 }
 
+/// Parse a `Content-Length` field value: exactly `1*DIGIT` that fits in
+/// `usize`. Empty, signed (`+5`/`-5`), non-digit, or overflowing values return
+/// `None` so the caller can reject them, rather than `parse().unwrap_or(0)`
+/// silently framing a 0-length body (request smuggling, CWE-444).
+fn parse_content_length(v: &str) -> Option<usize> {
+    if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    v.parse::<usize>().ok()
+}
+
 /// Write a response to the stream. `keep_alive` controls the `Connection`
 /// header on fully-buffered bodies (framed by `Content-Length`); streaming
 /// bodies always announce `Connection: close`, because their framing IS the
 /// close. Takes the response by value so a streaming body's `FnOnce` producer
 /// can be invoked.
 pub fn write_response<W: Write>(w: &mut W, resp: Response, keep_alive: bool) -> io::Result<()> {
+    write_head_and_body(w, resp, keep_alive, false)
+}
+
+/// Like [`write_response`], but when `head_only` is set (a `HEAD` request) the
+/// status line and headers — including the exact `Content-Length` a `GET` would
+/// have produced — are written and the body bytes (or stream producer) are
+/// omitted.
+fn write_head_and_body<W: Write>(
+    w: &mut W,
+    resp: Response,
+    keep_alive: bool,
+    head_only: bool,
+) -> io::Result<()> {
     use std::fmt::Write as _;
 
     let reason = status_reason(resp.status);
@@ -452,12 +585,18 @@ pub fn write_response<W: Write>(w: &mut W, resp: Response, keep_alive: bool) -> 
     let _ = write!(head, "HTTP/1.1 {} {}\r\n", resp.status, reason);
     let mut has_content_type = false;
     for (k, v) in &resp.headers {
-        if k.eq_ignore_ascii_case("content-type") {
+        // The single output choke point for CRLF-injection defense (CWE-113):
+        // a `\r`/`\n` in a name or value would otherwise split the response
+        // into attacker-controlled header lines. Strip them here regardless of
+        // how the header entered `resp.headers`.
+        let k_clean = strip_crlf(k);
+        let v_clean = strip_crlf(v);
+        if k_clean.eq_ignore_ascii_case("content-type") {
             has_content_type = true;
         }
-        head.push_str(k);
+        head.push_str(&k_clean);
         head.push_str(": ");
-        head.push_str(v);
+        head.push_str(&v_clean);
         head.push_str("\r\n");
     }
     if !has_content_type {
@@ -472,11 +611,15 @@ pub fn write_response<W: Write>(w: &mut W, resp: Response, keep_alive: bool) -> 
             } else {
                 "connection: close\r\n\r\n"
             });
-            // One write per response when the body is small (the common API
-            // case): a single TCP segment instead of a head segment + a body
-            // segment, which interacts badly with Nagle + delayed ACK. Large
-            // bodies aren't worth the extra copy.
-            if bytes.len() <= 16 * 1024 {
+            if head_only {
+                // HEAD: the Content-Length above still reports the body a GET
+                // would return, but no body bytes follow.
+                w.write_all(head.as_bytes())?;
+            } else if bytes.len() <= 16 * 1024 {
+                // One write per response when the body is small (the common API
+                // case): a single TCP segment instead of a head segment + a body
+                // segment, which interacts badly with Nagle + delayed ACK. Large
+                // bodies aren't worth the extra copy.
                 let mut out = head.into_bytes();
                 out.extend_from_slice(&bytes);
                 w.write_all(&out)?;
@@ -491,7 +634,12 @@ pub fn write_response<W: Write>(w: &mut W, resp: Response, keep_alive: bool) -> 
             head.push_str("connection: close\r\n\r\n");
             w.write_all(head.as_bytes())?;
             w.flush()?;
-            producer(w)
+            // HEAD on a streaming endpoint: emit the head, run no producer.
+            if head_only {
+                Ok(())
+            } else {
+                producer(w)
+            }
         }
         // Upgrades need the raw `TcpStream`, which only the server loop has:
         // `handle_connection` intercepts them before ever calling this
@@ -516,9 +664,13 @@ fn write_upgrade_head<W: Write>(
 ) -> io::Result<()> {
     let mut head = format!("HTTP/1.1 {} {}\r\n", status, status_reason(status));
     for (k, v) in headers {
-        head.push_str(k);
+        // Strip CR/LF (CWE-113): upgrade handshakes echo caller-supplied header
+        // values (e.g. `Sec-WebSocket-Protocol`), so sanitize here too.
+        let k_clean = strip_crlf(&k);
+        let v_clean = strip_crlf(&v);
+        head.push_str(&k_clean);
         head.push_str(": ");
-        head.push_str(v);
+        head.push_str(&v_clean);
         head.push_str("\r\n");
     }
     head.push_str("\r\n");
@@ -676,10 +828,16 @@ where
             // wait for the next request under the (much shorter) idle timeout.
             let _ = writer.set_read_timeout(Some(limits.keep_alive_idle));
         }
-        match parse_request(&mut reader, limits) {
+        // Wall-clock deadline for this whole request (line + headers + body).
+        // The per-op read timeout above only bounds a single stalled recv; a
+        // client dripping one byte per interval would otherwise pin this worker
+        // forever (slowloris, CWE-400). Recomputed per request.
+        let deadline = Instant::now() + limits.header_timeout;
+        match parse_request_deadline(&mut reader, limits, deadline) {
             Ok(Some(Incoming::Request(mut req))) => {
                 req.peer = peer.clone();
                 let keep = wants_keep_alive(&req);
+                let is_head = req.method == Method::Head;
                 // Panic isolation: a panicking handler returns 500 instead of
                 // silently killing this worker thread.
                 let resp = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(req)))
@@ -702,7 +860,9 @@ where
                     return Ok(());
                 }
                 let persist = keep && !resp.is_stream() && served + 1 < limits.keep_alive_max;
-                write_response(&mut writer, resp, persist)?;
+                // HEAD: emit exactly the headers a GET would (incl. its
+                // Content-Length), but never the body bytes.
+                write_head_and_body(&mut writer, resp, persist, is_head)?;
                 if !persist {
                     return Ok(());
                 }
@@ -711,6 +871,21 @@ where
                 return write_response(
                     &mut writer,
                     Response::new(413).with_body(&b"413 Payload Too Large"[..]),
+                    false,
+                );
+            }
+            // A request refused outright (unsupported/ambiguous framing, or the
+            // read deadline): write the status and close. Never fall through to
+            // the keep-alive loop — leftover bytes could otherwise be re-parsed
+            // as a smuggled next request (CWE-444).
+            Ok(Some(Incoming::Reject { status })) => {
+                return write_response(
+                    &mut writer,
+                    Response::new(status).with_body(format!(
+                        "{} {}",
+                        status,
+                        status_reason(status)
+                    )),
                     false,
                 );
             }
@@ -797,6 +972,7 @@ mod tests {
         {
             Incoming::Request(r) => r,
             Incoming::TooLarge => panic!("unexpected 413"),
+            Incoming::Reject { status } => panic!("unexpected reject {status}"),
         };
         assert_eq!(req.method, Method::Post);
         assert_eq!(req.path, "/todos");
@@ -840,6 +1016,7 @@ mod tests {
         {
             Incoming::Request(r) => r,
             Incoming::TooLarge => panic!("unexpected 413"),
+            Incoming::Reject { status } => panic!("unexpected reject {status}"),
         };
         assert!(req.is_json());
         assert_eq!(req.cookie("sid").as_deref(), Some("abc"));
@@ -1146,5 +1323,204 @@ mod tests {
             // Dropping the pool joins all workers, so every job has run.
         }
         assert_eq!(count.load(Ordering::Relaxed), 30);
+    }
+
+    // ---- security regressions -------------------------------------------
+
+    #[test]
+    fn transfer_encoding_is_rejected_not_framed_as_empty_body() {
+        // A chunked request with no Content-Length must be refused (501), never
+        // parsed as a 0-length-body request whose chunk data leaks into the
+        // next request on keep-alive (request smuggling, CWE-444). Chunked
+        // decoding is intentionally not implemented.
+        let raw =
+            "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let mut reader = BufReader::new(raw.as_bytes());
+        match parse_request(&mut reader, &Limits::default()).unwrap() {
+            Some(Incoming::Reject { status }) => assert_eq!(status, 501),
+            Some(Incoming::Request(_)) => panic!("chunked request must not parse as a request"),
+            Some(Incoming::TooLarge) => panic!("expected 501 Reject, got TooLarge"),
+            None => panic!("expected 501 Reject, got None"),
+        }
+    }
+
+    #[test]
+    fn conflicting_content_length_is_rejected() {
+        let raw =
+            "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello";
+        let mut reader = BufReader::new(raw.as_bytes());
+        match parse_request(&mut reader, &Limits::default()).unwrap() {
+            Some(Incoming::Reject { status }) => assert_eq!(status, 400),
+            _ => panic!("duplicate differing Content-Length must be rejected 400, not framed"),
+        }
+    }
+
+    #[test]
+    fn non_numeric_content_length_is_rejected() {
+        let raw = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: not-a-number\r\n\r\n";
+        let mut reader = BufReader::new(raw.as_bytes());
+        match parse_request(&mut reader, &Limits::default()).unwrap() {
+            Some(Incoming::Reject { status }) => assert_eq!(status, 400),
+            _ => panic!("non-numeric Content-Length must be rejected 400, not coerced to 0"),
+        }
+    }
+
+    #[test]
+    fn duplicate_identical_content_length_is_accepted() {
+        // A repeated *identical* value is unambiguous, so we collapse rather
+        // than reject (the spec allows either).
+        let raw =
+            "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello";
+        let mut reader = BufReader::new(raw.as_bytes());
+        match parse_request(&mut reader, &Limits::default()).unwrap() {
+            Some(Incoming::Request(r)) => assert_eq!(r.body, b"hello"),
+            _ => panic!("identical duplicate Content-Length should collapse, not reject"),
+        }
+    }
+
+    #[test]
+    fn request_read_past_deadline_is_rejected_408() {
+        // A deadline already in the past forces the wall-clock check to fire on
+        // the first read: the parser returns 408 rather than pinning the worker
+        // on a slow drip (slowloris, CWE-400).
+        let raw = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        let mut reader = BufReader::new(raw.as_bytes());
+        let past = Instant::now() - Duration::from_secs(1);
+        match parse_request_deadline(&mut reader, &Limits::default(), past).unwrap() {
+            Some(Incoming::Reject { status }) => assert_eq!(status, 408),
+            _ => panic!("a past deadline must yield a 408 reject"),
+        }
+    }
+
+    #[test]
+    fn write_response_strips_crlf_preventing_response_splitting() {
+        // Push a raw header (bypassing with_header's own sanitizing) so this
+        // exercises write_response's choke-point stripping directly (CWE-113).
+        let mut resp = Response::new(200).with_body("ok");
+        resp.headers
+            .push(("x-evil".to_string(), "a\r\nInjected: yes".to_string()));
+        let mut buf = Vec::new();
+        write_response(&mut buf, resp, false).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        // No attacker-inserted header line survives the serialization.
+        assert!(!s.contains("\r\nInjected: yes"), "response splitting: {s}");
+        // The CR/LF are stripped, collapsing the value onto one line.
+        assert!(s.contains("x-evil: aInjected: yes\r\n"), "got: {s}");
+    }
+
+    #[test]
+    fn with_header_strips_crlf_defensively() {
+        let resp = Response::new(302).with_header("location", "/a\r\nSet-Cookie: sid=evil");
+        assert_eq!(resp.headers[0].0, "location");
+        assert_eq!(resp.headers[0].1, "/aSet-Cookie: sid=evil");
+    }
+
+    #[test]
+    fn head_only_writes_content_length_but_no_body() {
+        let resp = Response::new(200).with_body("hello");
+        let mut buf = Vec::new();
+        write_head_and_body(&mut buf, resp, false, true).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        // The Content-Length a GET would produce is still present...
+        assert!(s.contains("content-length: 5\r\n"), "got: {s}");
+        // ...but the body bytes are omitted.
+        assert!(s.ends_with("\r\n\r\n"), "HEAD must send no body: {s:?}");
+        assert!(!s.contains("hello"));
+    }
+
+    #[test]
+    fn chunked_request_closes_connection_without_smuggling() {
+        use std::io::Read;
+        use std::sync::atomic::AtomicU32;
+        let addr = "127.0.0.1:18463";
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&shutdown);
+        let hits = Arc::new(AtomicU32::new(0));
+        let hits_h = Arc::clone(&hits);
+        let server = thread::spawn(move || {
+            serve_until(
+                addr,
+                2,
+                Limits::default(),
+                move |_req| {
+                    hits_h.fetch_add(1, Ordering::Relaxed);
+                    Response::new(200).with_body("ok")
+                },
+                flag,
+            )
+        });
+        for _ in 0..100 {
+            if TcpStream::connect(addr).is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        // A chunked request with a whole second request pipelined as its
+        // "body". Old behavior framed a 0-length body and re-parsed
+        // GET /smuggled as a second request; the fix rejects 501 and closes.
+        stream
+            .write_all(
+                b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n\
+                  0\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: x\r\n\r\n",
+            )
+            .unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).unwrap();
+        let s = String::from_utf8_lossy(&buf);
+        assert!(s.starts_with("HTTP/1.1 501 "), "expected 501, got: {s}");
+        assert!(!s.contains("/smuggled"));
+        // The handler must never run: the chunked request is rejected before
+        // dispatch, and the pipelined request is discarded when the socket
+        // closes — it is NOT interpreted as a second request.
+        assert_eq!(hits.load(Ordering::Relaxed), 0);
+
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn head_request_over_socket_sends_no_body() {
+        use std::io::Read;
+        let addr = "127.0.0.1:18464";
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&shutdown);
+        let server = thread::spawn(move || {
+            serve_until(
+                addr,
+                2,
+                Limits::default(),
+                |_req| Response::new(200).with_body("hello"),
+                flag,
+            )
+        });
+        for _ in 0..100 {
+            if TcpStream::connect(addr).is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .write_all(b"HEAD / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).unwrap();
+        let s = String::from_utf8_lossy(&buf).into_owned();
+        assert!(s.starts_with("HTTP/1.1 200 "), "got: {s}");
+        // Reports the length a GET would return...
+        assert!(s.contains("content-length: 5\r\n"), "got: {s}");
+        // ...but sends no body bytes.
+        let head_end = s.find("\r\n\r\n").expect("header terminator present");
+        assert_eq!(
+            &s[head_end + 4..],
+            "",
+            "HEAD response must have an empty body: {s}"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap().unwrap();
     }
 }

@@ -289,6 +289,7 @@ pub struct App {
     name: String,
     routes: Vec<Route>,
     middleware: Vec<Middleware>,
+    ops_guard: Option<Middleware>,
     models: Vec<Json>,
     tools: Vec<Json>,
     tool_defs: Vec<ToolDef>,
@@ -358,6 +359,7 @@ impl App {
             name: name.to_string(),
             routes: Vec::new(),
             middleware: Vec::new(),
+            ops_guard: None,
             models: Vec::new(),
             tools: Vec::new(),
             tool_defs: Vec::new(),
@@ -593,6 +595,32 @@ impl App {
         self
     }
 
+    /// Guard the agent/ops surface. The closure runs for every `/__`-prefixed
+    /// request *except* the `/__health`/`/__ready` probes — i.e. for
+    /// `/__introspect`, `/__metrics`, `/__tools*` (tool invocation) and any
+    /// `/__`-mounted route such as `/__migrations`. Returning `Some(resp)`
+    /// denies the request with that response; `None` lets it through.
+    ///
+    /// Introspection and tool invocation are **open by default** (that's the
+    /// agent-native contract). In any deployment where the agent surface must
+    /// not be public, set a guard here — e.g. require a shared token or an
+    /// internal network. This runs ahead of the global [`middleware`](Self::middleware)
+    /// chain, and unlike the probes and pre-`0.5.2` behaviour, it *can* gate
+    /// `/__introspect` and `/__metrics`.
+    /// ```ignore
+    /// app.ops_guard(|req| match req.header("authorization") {
+    ///     Some(tok) if tok == expected => None,             // allow
+    ///     _ => Some(Response::new(401).with_body(&b"unauthorized"[..])),
+    /// })
+    /// ```
+    pub fn ops_guard(
+        mut self,
+        guard: impl Fn(&Request) -> Option<Response> + Send + Sync + 'static,
+    ) -> App {
+        self.ops_guard = Some(Box::new(guard));
+        self
+    }
+
     /// Record a model schema (see `sutegi_orm::schema_json`) for introspection.
     pub fn register_model(mut self, schema: Json) -> App {
         self.models.push(schema);
@@ -653,6 +681,7 @@ impl App {
         let introspect = self.introspection();
         let routes = Arc::new(self.routes);
         let middleware = Arc::new(self.middleware);
+        let ops_guard = Arc::new(self.ops_guard);
         let after = Arc::new(self.after);
         let readiness = Arc::new(self.readiness);
         let state = Arc::new(self.state);
@@ -664,7 +693,9 @@ impl App {
 
             // Inner closure so we can post-process (record metrics) on every path.
             let resp = (|| {
-                // Operational endpoints first — pods hit these constantly.
+                // Liveness/readiness probes: always open and matched before any
+                // guard — orchestrator probes must not need app credentials and
+                // they disclose nothing sensitive.
                 match req.path.as_str() {
                     "/__health" => return json(200, &Json::obj(vec![("status", Json::str("ok"))])),
                     "/__ready" => {
@@ -675,6 +706,38 @@ impl App {
                         )]);
                         return json(if ready { 200 } else { 503 }, &body);
                     }
+                    _ => {}
+                }
+
+                // Agent/ops surface guard. Gates every other `/__`-prefixed
+                // endpoint — `/__introspect`, `/__metrics`, `/__tools*` (tool
+                // invocation) and any `/__`-mounted route like `/__migrations`.
+                // Runs before the global middleware chain AND before routing, so
+                // it protects the internal surface (tool routes live in the
+                // route table; introspect/metrics are matched below). Unset =
+                // open, the historical default.
+                if req.path.starts_with("/__") {
+                    if let Some(guard) = &*ops_guard {
+                        if let Some(resp) = guard(&req) {
+                            return resp;
+                        }
+                    }
+                }
+
+                // Global middleware chain — first responder wins. Now runs
+                // ahead of `/__metrics` and `/__introspect` (matched just
+                // below), so an app-wide auth / rate-limit guard covers them —
+                // previously they were dispatched before this loop and could
+                // not be protected by middleware at all.
+                for mw in middleware.iter() {
+                    if let Some(resp) = mw(&req) {
+                        return resp;
+                    }
+                }
+
+                // Sensitive operational endpoints: reachable only past the ops
+                // guard and the global middleware chain above.
+                match req.path.as_str() {
                     "/__metrics" => {
                         return Response::new(200)
                             .with_header("content-type", "text/plain; version=0.0.4")
@@ -682,13 +745,6 @@ impl App {
                     }
                     "/__introspect" => return json(200, &introspect),
                     _ => {}
-                }
-
-                // Global middleware chain — first responder wins.
-                for mw in middleware.iter() {
-                    if let Some(resp) = mw(&req) {
-                        return resp;
-                    }
                 }
 
                 // Route table (run group-scoped middleware before the handler).
@@ -1571,6 +1627,43 @@ mod tests {
             .collect();
         assert!(patterns.contains(&"/api/users"));
         assert!(patterns.contains(&"/api/users/:id"));
+    }
+
+    #[test]
+    fn ops_guard_gates_internal_surface_but_not_probes() {
+        // A guard that denies everything it is asked about.
+        let app = App::new("t")
+            .get("/", "home", |_c| text(200, "ok"))
+            .ops_guard(|_req| Some(text(401, "nope")));
+        let svc = app.service();
+        let call = |path: &str, method: Method| {
+            svc(Request {
+                path: path.into(),
+                ..req(method, b"")
+            })
+        };
+        // Liveness/readiness probes must stay open regardless of the guard.
+        assert_eq!(call("/__health", Method::Get).status, 200);
+        // Introspection + metrics are now gated (were previously un-gatable).
+        assert_eq!(call("/__introspect", Method::Get).status, 401);
+        assert_eq!(call("/__metrics", Method::Get).status, 401);
+        // Tool invocation is gated even for a name that isn't a mounted route.
+        assert_eq!(call("/__tools/anything", Method::Post).status, 401);
+        // Ordinary routes are untouched by the ops guard.
+        assert_eq!(call("/", Method::Get).status, 200);
+    }
+
+    #[test]
+    fn introspect_is_open_without_an_ops_guard() {
+        // Unchanged default: no guard => the agent surface is served.
+        let svc = App::new("t")
+            .get("/", "home", |_c| text(200, "ok"))
+            .service();
+        let resp = svc(Request {
+            path: "/__introspect".into(),
+            ..req(Method::Get, b"")
+        });
+        assert_eq!(resp.status, 200);
     }
 
     #[test]

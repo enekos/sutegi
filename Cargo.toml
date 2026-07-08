@@ -33,6 +33,7 @@ members = [
     "examples/redactor",
     "examples/ws-chat",
     "examples/ws-load",
+    "examples/http-load",
 ]
 # Standalone tooling workspaces, each excluded so normal builds / tests /
 # publish never touch them and no third-party dep enters the shipped tree:

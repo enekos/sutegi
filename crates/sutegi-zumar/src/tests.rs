@@ -274,7 +274,13 @@ fn http_post_completion_flows_into_the_model() {
                     M::Result,
                 )]
             }
-            M::Result(r) => m.status = if r.ok { r.body } else { format!("error {}", r.status) },
+            M::Result(r) => {
+                m.status = if r.ok {
+                    r.body
+                } else {
+                    format!("error {}", r.status)
+                }
+            }
         }
         Vec::new()
     }

@@ -16,6 +16,12 @@ pub struct Address {
 impl Address {
     /// `a@b.co` or `Name <a@b.co>` (parsed loosely).
     pub fn parse(s: &str) -> Result<Address, String> {
+        // Reject control characters that would let an address smuggle a header
+        // or SMTP command (CRLF injection). Guarding the raw input keeps both
+        // `email` and `name` clean for `render` and the envelope writes.
+        if s.contains(['\r', '\n', '\0']) {
+            return Err("invalid email address: control character".to_string());
+        }
         let s = s.trim();
         let (name, email) = match (s.rfind('<'), s.ends_with('>')) {
             (Some(i), true) => (
@@ -179,7 +185,9 @@ impl Email {
         push("MIME-Version", "1.0");
         for (k, v) in &self.headers {
             if !k.starts_with("X-Sutegi-Invalid") {
-                push(k, &v.replace(['\r', '\n'], " "));
+                // Strip CRLF from the name too — a smuggled newline in the
+                // header name would otherwise inject a whole extra header.
+                push(&k.replace(['\r', '\n'], " "), &v.replace(['\r', '\n'], " "));
             }
         }
 
@@ -305,6 +313,19 @@ mod tests {
     }
 
     #[test]
+    fn address_parse_rejects_control_chars() {
+        // CRLF injection PoC: a recipient smuggling a header / SMTP command.
+        assert!(Address::parse("a@b.co\r\nBcc: attacker@evil.com").is_err());
+        assert!(Address::parse("a@b.co\nBcc: attacker@evil.com").is_err());
+        assert!(Address::parse("victim@x.co\0").is_err());
+        // Injection via the display name is rejected too.
+        assert!(Address::parse("N\r\nBcc: e@x.co <a@b.co>").is_err());
+        // Valid forms still parse.
+        assert!(Address::parse("a@b.co").is_ok());
+        assert!(Address::parse("Name <a@b.co>").is_ok());
+    }
+
+    #[test]
     fn render_single_part() {
         let msg = Email::new()
             .from("app@example.com")
@@ -374,6 +395,20 @@ mod tests {
         // Neither smuggled name may appear at the start of a header line.
         assert!(!msg.contains("\r\nX-Evil:"));
         assert!(!msg.contains("\r\nX-Evil2:"));
+    }
+
+    #[test]
+    fn header_name_injection_is_neutralized() {
+        let msg = Email::new()
+            .from("a@b.co")
+            .to("to@b.co")
+            .header("X-Evil\r\nBcc: attacker@evil.com", "v")
+            .subject("s")
+            .text("x")
+            .render("mid-6@test", 0);
+        // The smuggled name must not open a new header line.
+        assert!(!msg.contains("\r\nBcc: attacker@evil.com"));
+        assert!(!msg.contains("X-Evil\r\n"));
     }
 
     #[test]

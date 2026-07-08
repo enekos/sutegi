@@ -1,0 +1,51 @@
+#!/bin/sh
+# Pre-commit hook: run the aatxe bench suite against the committed baseline and
+# block the commit if any benchmark regresses past the statistical noise gate.
+#
+# Install / enable:
+#   make install-hooks
+#
+# Bypass for a single commit:
+#   SKIP_BENCH=1 git commit ...
+
+set -eu
+
+# Escape hatch: SKIP_BENCH=1 skips the perf gate for this commit.
+if [ -n "${SKIP_BENCH:-}" ]; then
+    echo "bench hook: SKIP_BENCH set; skipping perf gate"
+    exit 0
+fi
+
+# Only gate commits that touch performance-sensitive paths.
+staged=$(git diff --cached --name-only)
+if ! printf '%s\n' "$staged" | grep -qE '^(Cargo\.(toml|lock)|crates/|benches/|examples/)'; then
+    echo "bench hook: no performance-sensitive files staged; skipping perf gate"
+    exit 0
+fi
+
+# Locate the aatxe CLI. Prefer PATH, fall back to a sibling checkout build.
+aatxe_bin="${AATXE_BIN:-}"
+if [ -z "$aatxe_bin" ]; then
+    aatxe_bin=$(command -v aatxe 2>/dev/null || true)
+fi
+if [ -z "$aatxe_bin" ] && [ -x "../aatxe/target/release/aatxe" ]; then
+    aatxe_bin="../aatxe/target/release/aatxe"
+fi
+
+if [ -z "$aatxe_bin" ]; then
+    cat <<'EOF' >&2
+Error: aatxe CLI not found. The pre-commit perf hook needs it to compare
+against benches/baselines/local.json.
+
+Install one of:
+  - curl -fsSL https://raw.githubusercontent.com/enekos/aatxe/master/scripts/install.sh | bash
+  - (cd ../aatxe && make build-rust)    # uses the sibling checkout
+
+To bypass this hook for this commit:
+  SKIP_BENCH=1 git commit ...
+EOF
+    exit 1
+fi
+
+echo "bench hook: running aatxe bench-compare (AATXE_BIN=$aatxe_bin)"
+AATXE_BIN="$aatxe_bin" make bench-compare

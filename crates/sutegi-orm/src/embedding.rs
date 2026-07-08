@@ -25,7 +25,7 @@
 //! ```
 
 use crate::backend::{Backend, FromRow};
-use crate::builder::QueryBuilder;
+use crate::builder::{valid_identifier, QueryBuilder};
 use crate::value::{vector_from_text, vector_to_text, Value};
 use sutegi_json::Json;
 
@@ -239,6 +239,15 @@ pub fn nearest_pushdown_typed<T: FromRow, B: Backend>(
     k: usize,
     metric: Metric,
 ) -> Result<Vec<(T, f32)>, String> {
+    // `table`/`column` are interpolated directly (identifiers can't be bound),
+    // so they must clear the same guard the builder uses or they are an
+    // injection vector. `k` is a `usize` and `op` is a fixed allowlist.
+    if !valid_identifier(table) {
+        return Err(format!("invalid identifier: {table:?}"));
+    }
+    if !valid_identifier(column) {
+        return Err(format!("invalid identifier: {column:?}"));
+    }
     let sql = format!(
         "SELECT *, ({column} {op} ?) AS _distance FROM {table} ORDER BY _distance LIMIT {k}",
         op = metric.pg_operator(),
@@ -255,12 +264,20 @@ pub fn nearest_pushdown_typed<T: FromRow, B: Backend>(
 /// The SQL to create a pgvector **HNSW** index for `metric` over `table.column`
 /// — run it in a migration (Postgres + pgvector only) to accelerate
 /// [`nearest_pushdown_typed`].
-pub fn create_hnsw_index_sql(table: &str, column: &str, metric: Metric) -> String {
-    format!(
+pub fn create_hnsw_index_sql(table: &str, column: &str, metric: Metric) -> Result<String, String> {
+    // Both names are interpolated into DDL, so they must clear the identifier
+    // guard before we build the statement (see `nearest_pushdown_typed`).
+    if !valid_identifier(table) {
+        return Err(format!("invalid identifier: {table:?}"));
+    }
+    if !valid_identifier(column) {
+        return Err(format!("invalid identifier: {column:?}"));
+    }
+    Ok(format!(
         "CREATE INDEX IF NOT EXISTS {table}_{column}_hnsw ON {table} \
          USING hnsw ({column} {})",
         metric.pg_ops_class()
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -313,7 +330,34 @@ mod tests {
 
     #[test]
     fn index_sql_uses_ops_class() {
-        let sql = create_hnsw_index_sql("docs", "embedding", Metric::Cosine);
+        let sql = create_hnsw_index_sql("docs", "embedding", Metric::Cosine).unwrap();
+        assert!(sql.contains("CREATE INDEX IF NOT EXISTS docs_embedding_hnsw ON docs"));
         assert!(sql.contains("USING hnsw (embedding vector_cosine_ops)"));
+    }
+
+    #[test]
+    fn index_sql_rejects_injection_identifiers() {
+        // Payloads that would escape the identifier slots if interpolated
+        // unchecked — each must be refused, in either the table or column slot.
+        for bad in [
+            "1)) UNION SELECT password, 0 FROM users --",
+            "docs; DROP TABLE users",
+            "col\"; --",
+        ] {
+            let via_table = create_hnsw_index_sql(bad, "embedding", Metric::Cosine);
+            let via_column = create_hnsw_index_sql("docs", bad, Metric::Cosine);
+            assert!(via_table.is_err(), "table {bad:?} should be rejected");
+            assert!(via_column.is_err(), "column {bad:?} should be rejected");
+            assert!(via_table.unwrap_err().contains("invalid identifier"));
+            assert!(via_column.unwrap_err().contains("invalid identifier"));
+        }
+    }
+
+    #[test]
+    fn index_sql_accepts_legitimate_identifiers() {
+        // The guard is `valid_identifier`, which `nearest_pushdown_typed` shares;
+        // ordinary names pass and produce the expected DDL.
+        assert!(create_hnsw_index_sql("docs", "embedding", Metric::Cosine).is_ok());
+        assert!(create_hnsw_index_sql("user_docs", "vec_col", Metric::L2).is_ok());
     }
 }
