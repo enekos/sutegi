@@ -100,6 +100,28 @@ impl<T> Collection<T> {
         collect(self.items.into_iter().map(f))
     }
 
+    /// Extract a single field from each item.
+    ///
+    /// Convenience alias for `map` when pulling one key/property out of a
+    /// collection of records. The closure borrows the item, so non-Copy fields
+    /// can be cloned out without dropping the source value.
+    ///
+    /// ```
+    /// use sutegi::collect;
+    ///
+    /// #[derive(Clone)]
+    /// struct User { name: String }
+    ///
+    /// let users = collect(vec![
+    ///     User { name: "Ada".into() },
+    ///     User { name: "Bob".into() },
+    /// ]);
+    /// assert_eq!(users.pluck(|u| u.name.clone()).implode(", "), "Ada, Bob");
+    /// ```
+    pub fn pluck<K, F: FnMut(&T) -> K>(self, mut f: F) -> Collection<K> {
+        collect(self.items.into_iter().map(|x| f(&x)))
+    }
+
     /// Keep only items for which `pred` returns `true`.
     pub fn filter<F: FnMut(&T) -> bool>(self, mut pred: F) -> Collection<T> {
         collect(self.items.into_iter().filter(|x| pred(x)))
@@ -379,6 +401,30 @@ mod tests {
             .map(|n| n * 10)
             .into_vec();
         assert_eq!(out, vec![20, 40, 60]);
+    }
+
+    #[test]
+    fn pluck_extracts_field() {
+        #[derive(Clone)]
+        struct User {
+            name: String,
+            age: u32,
+        }
+        let users = collect(vec![
+            User {
+                name: "Ada".into(),
+                age: 30,
+            },
+            User {
+                name: "Bob".into(),
+                age: 25,
+            },
+        ]);
+        assert_eq!(
+            users.clone().pluck(|u| u.name.clone()).implode(", "),
+            "Ada, Bob"
+        );
+        assert_eq!(users.pluck(|u| u.age).sum(), 55);
     }
 
     #[test]
