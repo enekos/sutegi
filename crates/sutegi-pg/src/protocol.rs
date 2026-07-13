@@ -354,6 +354,12 @@ impl Client {
 
     // --- raw I/O -----------------------------------------------------------
 
+    /// The read-side socket, for the LISTEN/NOTIFY [`crate::Listener`] to tune
+    /// (clearing the read timeout, cloning a shutdown handle).
+    pub(crate) fn read_stream(&self) -> &TcpStream {
+        self.read.get_ref()
+    }
+
     fn send_raw(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.write.write_all(bytes).map_err(|e| {
             self.broken = true;
@@ -366,7 +372,7 @@ impl Client {
     }
 
     /// Write a tagged message: 1 type byte + i32 length (self-inclusive) + body.
-    fn send_msg(&mut self, tag: u8, body: &[u8]) -> Result<(), String> {
+    pub(crate) fn send_msg(&mut self, tag: u8, body: &[u8]) -> Result<(), String> {
         let mut packet = Vec::with_capacity(body.len() + 5);
         packet.push(tag);
         packet.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
@@ -375,7 +381,7 @@ impl Client {
     }
 
     /// Read one tagged message: returns `(type, body)`.
-    fn recv(&mut self) -> Result<(u8, Vec<u8>), String> {
+    pub(crate) fn recv(&mut self) -> Result<(u8, Vec<u8>), String> {
         let mut header = [0u8; 5];
         self.read.read_exact(&mut header).map_err(|e| {
             self.broken = true;
@@ -448,7 +454,7 @@ fn encode_param(p: &PgValue) -> Option<Vec<u8>> {
 // with no TLS on the wire (yet), a MITM or a buggy server could send a
 // truncated message, and an index panic there is a client-side DoS. The
 // message parsers below also bounds-check every slice for the same reason.
-fn be_i32(buf: &[u8], at: usize) -> i32 {
+pub(crate) fn be_i32(buf: &[u8], at: usize) -> i32 {
     match buf.get(at..at + 4) {
         Some(b) => i32::from_be_bytes([b[0], b[1], b[2], b[3]]),
         None => 0,
@@ -559,7 +565,7 @@ fn command_tag_count(body: &[u8]) -> u64 {
 
 /// ErrorResponse → a `code: message` string. Fields are `type byte + cstr`,
 /// terminated by a zero type byte.
-fn parse_error(body: &[u8]) -> String {
+pub(crate) fn parse_error(body: &[u8]) -> String {
     let mut message = String::new();
     let mut code = String::new();
     let mut pos = 0;

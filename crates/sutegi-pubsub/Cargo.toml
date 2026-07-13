@@ -6,8 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "sutegi's in-process publish/subscribe broker: topic fan-out over a Broker seam, zero third-party dependencies. Powers realtime subscriptions (zumar live mode, Channels); a Postgres LISTEN/NOTIFY broker slots in behind the same trait for cross-pod fan-out."
+description = "sutegi's publish/subscribe broker: topic fan-out over a Broker seam, zero third-party dependencies. In-process by default; the `postgres` feature adds a LISTEN/NOTIFY broker for cross-pod fan-out behind the same trait. Powers realtime subscriptions (zumar live mode, Channels)."
 keywords = ["pubsub", "broker", "realtime", "zero-dependency"]
 categories = ["web-programming", "concurrency"]
 
 [dependencies]
+sutegi-pg = { path = "../sutegi-pg", version = "0.5.1", optional = true }
+sutegi-json = { path = "../sutegi-json", version = "0.5.1", optional = true }
+
+[features]
+# Cross-pod fan-out over PostgreSQL LISTEN/NOTIFY (PgPubSub). Off by default
+# so the in-process broker stays dependency-free.
+postgres = ["dep:sutegi-pg", "dep:sutegi-json"]

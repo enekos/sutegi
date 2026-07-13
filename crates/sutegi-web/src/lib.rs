@@ -484,6 +484,42 @@ impl App {
         })
     }
 
+    /// Mount a channel hub: `GET pattern` becomes the WebSocket endpoint
+    /// speaking the channel protocol, and `GET /__channels` serves the
+    /// agent manifest (protocol description + every channel's patterns,
+    /// docs, and schemas — gated by [`App::ops_guard`] like the rest of the
+    /// `/__` surface).
+    ///
+    /// The hub's [`check_origin`](sutegi_channels::Channels::check_origin) /
+    /// [`authorize`](sutegi_channels::Channels::authorize) gates are applied
+    /// to the handshake. Keep a `hub.clone()` to broadcast from HTTP
+    /// handlers or background threads.
+    #[cfg(feature = "channels")]
+    pub fn channels(mut self, pattern: &str, doc: &str, hub: sutegi_channels::ChannelHub) -> App {
+        let manifest = hub.manifest(pattern);
+        self = self.get(
+            "/__channels",
+            "The channel manifest: envelope protocol, topics, event schemas.",
+            move |_c: &Ctx| json(200, &manifest),
+        );
+        let (origins, authorize) = hub.upgrade_gates();
+        let mut ws = Ws::new();
+        if let Some(origins) = origins {
+            ws = ws.check_origin(origins);
+        }
+        if let Some(gate) = authorize {
+            ws = ws.authorize(move |req: &Request| gate(req));
+        }
+        let (open, message, close) = (hub.clone(), hub.clone(), hub);
+        self.ws(
+            pattern,
+            doc,
+            ws.on_open(move |conn, req| open.on_open(conn, req))
+                .on_message(move |conn, msg| message.on_message(conn, msg))
+                .on_close(move |conn, code| close.on_close(conn, code)),
+        )
+    }
+
     /// Register a non-streaming AI tool: a `name`, a `description`, its JSON
     /// Schema `parameters` (build with [`schema`]), and a closure that receives
     /// the shared state via [`ToolCtx`] and the validated JSON `args`. Mounted

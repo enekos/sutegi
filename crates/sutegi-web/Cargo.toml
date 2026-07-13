@@ -21,6 +21,8 @@ sutegi-validate = { path = "../sutegi-validate", version = "0.5.1", optional = t
 libc = { version = "0.2", optional = true }
 # Only pulled in by the `ws` feature: RFC 6455 codec + the connection reactor.
 sutegi-ws = { path = "../sutegi-ws", version = "0.5.1", optional = true }
+# Only pulled in by the `channels` feature: the channel protocol + hub.
+sutegi-channels = { path = "../sutegi-channels", version = "0.5.1", optional = true }
 
 [features]
 # Install OS signal handlers (SIGTERM/SIGINT) for graceful shutdown in pods.
@@ -31,3 +33,5 @@ orm = ["dep:sutegi-orm"]
 validate = ["dep:sutegi-validate"]
 # `App::ws` — WebSocket endpoints on the sharded kqueue/epoll reactor.
 ws = ["dep:sutegi-ws"]
+# `App::channels` — Phoenix-style channels mounted on a ws endpoint + /__channels.
+channels = ["ws", "dep:sutegi-channels"]
