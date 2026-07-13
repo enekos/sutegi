@@ -31,6 +31,10 @@
 mod pg;
 #[cfg(feature = "postgres")]
 pub use pg::PgPubSub;
+/// The underlying PostgreSQL client (re-exported so `PgPubSub` users can
+/// build a [`sutegi_pg::Config`] without depending on the ORM stack).
+#[cfg(feature = "postgres")]
+pub use sutegi_pg;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

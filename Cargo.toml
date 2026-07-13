@@ -33,6 +33,7 @@ members = [
     "examples/events",
     "examples/redactor",
     "examples/ws-chat",
+    "examples/chat",
     "examples/ws-load",
     "examples/http-load",
 ]

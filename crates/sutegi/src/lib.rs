@@ -21,6 +21,11 @@
 //! | `auth-mail` | + sutegi-auth/mail | email-verification + password-reset flows |
 //! | `storage`  | sutegi-storage (pure std) | file storage: local fs + S3 presigned URLs |
 //! | `storage-db` | + sutegi-orm  | blobs in SQLite/Postgres over the `Backend` seam |
+//! | `ws`       | sutegi-ws       | WebSockets: `App::ws` on the sharded kqueue/epoll reactor |
+//! | `pubsub`   | sutegi-pubsub   | in-process topic fan-out behind the `Broker` seam |
+//! | `pubsub-postgres` | + sutegi-pg | cross-pod pubsub over PG `LISTEN`/`NOTIFY` (`PgPubSub`) |
+//! | `channels` | sutegi-channels (+ ws/pubsub) | Phoenix-style channels: `App::channels` + `/__channels` manifest |
+//! | `presence` | + sutegi-channels/presence | who's-online per topic, cross-pod, heartbeat-expired |
 //! | `graceful` | libc            | SIGTERM/SIGINT draining for pods |
 //!
 //! `default = ["derive", "orm", "validate", "ai"]`. For a minimal
