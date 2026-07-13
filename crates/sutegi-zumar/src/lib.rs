@@ -29,6 +29,7 @@ mod journal;
 mod scheduler;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub use frames::Frame;
@@ -53,10 +54,13 @@ pub struct Live<M, Ms> {
     http_base: Option<String>,
     pubsub: Option<Arc<dyn Broker>>,
     guard: Option<Guard>,
+    allowed_origins: Option<Vec<String>>,
+    identify: Option<Identify>,
 }
 
 type Factory<M, Ms> = Arc<dyn Fn(&Request) -> Program<M, Ms> + Send + Sync>;
 type Guard = Arc<dyn Fn(&Request) -> bool + Send + Sync>;
+type Identify = Arc<dyn Fn(&Request) -> Option<String> + Send + Sync>;
 
 /// One live endpoint: `Live::new(factory).ws()`, or [`live`] for defaults.
 impl<M: Send + 'static, Ms: Clone + Send + 'static> Live<M, Ms> {
@@ -67,21 +71,61 @@ impl<M: Send + 'static, Ms: Clone + Send + 'static> Live<M, Ms> {
             http_base: None,
             pubsub: None,
             guard: None,
+            allowed_origins: None,
+            identify: None,
         }
     }
 
-    /// Gate the live socket: `guard(req)` runs on the WS upgrade (which
-    /// carries the browser's cookies, same-origin), and a `false` closes the
-    /// connection before any program is mounted. This is how a live page is
-    /// made private — pair it with [`sutegi_auth`] by capturing an `Auth` and
-    /// returning `auth.user_id(req).is_some()`. Because state then lives in
-    /// the server, form submits are ordinary dispatches over an already-
-    /// authenticated, same-origin socket: there is no cross-origin POST to
-    /// forge, so live forms are **CSRF-free by construction** — no token to
-    /// mint, embed, or verify. The factory sees the same `Request`, so it can
-    /// read the user and render per-session state.
+    /// Gate the live socket: `guard(req)` runs on the WS upgrade and a
+    /// `false` closes the connection (1008) before any program is mounted.
+    /// This is how a live page is made private — pair it with [`sutegi_auth`]
+    /// by capturing an `Auth` and returning `auth.user_id(req).is_some()`.
+    /// The factory sees the same `Request`, so it can read the user and
+    /// render per-session state.
+    ///
+    /// **A guarded socket also enforces `Origin`.** A WebSocket upgrade is
+    /// NOT subject to the same-origin policy, and the browser attaches
+    /// first-party cookies to a *cross-site* upgrade — so a cookie-based
+    /// guard alone would let `evil.com` open a socket that mounts as a
+    /// logged-in victim and drive it (cross-site WebSocket hijacking, CWE-1385).
+    /// Therefore, whenever a guard is set you should scope the permitted
+    /// origins with [`check_origin`](Self::check_origin); if you don't, the
+    /// bridge falls back to a strict **same-origin** check (the `Origin`
+    /// header's host must equal the `Host` header, and a missing `Origin` is
+    /// rejected). Only with that origin gate in place are live form submits —
+    /// ordinary dispatches over the authenticated socket — free of cross-site
+    /// request forgery.
     pub fn guard(mut self, guard: impl Fn(&Request) -> bool + Send + Sync + 'static) -> Self {
         self.guard = Some(Arc::new(guard));
+        self
+    }
+
+    /// Restrict which `Origin`s may open this socket (matched exactly, before
+    /// the 101 upgrade). Required in practice for any [`guard`](Self::guard)ed
+    /// socket to stop cross-site WebSocket hijacking. If omitted on a guarded
+    /// socket, the bridge enforces a strict same-origin fallback instead of
+    /// silently accepting cross-origin upgrades.
+    pub fn check_origin<I, S>(mut self, origins: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allowed_origins = Some(origins.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Bind journaled sessions to an authenticated principal. When set, the
+    /// per-connection journal stream is namespaced by `identify(req)` (e.g. the
+    /// logged-in user id), so a client's `?session=` id can only ever address
+    /// its own journals — it cannot load or append to another user's stream
+    /// (CWE-639, IDOR). Return `None` to skip journaling for that request. A
+    /// guarded socket that journals but has no `identify` disables journaling
+    /// per connection (a fresh mount) rather than trust the client-chosen key.
+    pub fn identify(
+        mut self,
+        identify: impl Fn(&Request) -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        self.identify = Some(Arc::new(identify));
         self
     }
 
@@ -97,7 +141,9 @@ impl<M: Send + 'static, Ms: Clone + Send + 'static> Live<M, Ms> {
 
     /// Journal program inputs per session (`?session=<id>` on the socket
     /// URL) and replay them on reconnect. Without a journal, a reconnect is
-    /// a fresh mount.
+    /// a fresh mount. For an authenticated endpoint, pair with
+    /// [`identify`](Self::identify) so each user's journal is isolated — the
+    /// client-supplied `?session=` alone is NOT an authorization boundary.
     pub fn journal(mut self, journal: impl Journal) -> Self {
         self.journal = Some(Arc::new(journal));
         self
@@ -117,6 +163,23 @@ impl<M: Send + 'static, Ms: Clone + Send + 'static> Live<M, Ms> {
             let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
             format!("http://127.0.0.1:{port}")
         });
+        // A guarded socket must validate Origin (a WS upgrade ignores the
+        // same-origin policy but still carries first-party cookies). With an
+        // explicit allowlist, `check_origin` rejects foreign origins before
+        // the 101; without one, `on_open` enforces a strict same-origin
+        // fallback so a guarded socket is never silently cross-origin-open.
+        let require_same_origin = self.guard.is_some() && self.allowed_origins.is_none();
+        let allowed_origins = self.allowed_origins;
+        // A guarded, journaling endpoint with no principal binding cannot
+        // safely reuse a client-supplied `?session=` key (cross-session
+        // replay, CWE-639); `on_open` disables journaling for such connections.
+        if self.journal.is_some() && self.guard.is_some() && self.identify.is_none() {
+            eprintln!(
+                "sutegi-zumar: `Live` has a guard + journal but no `identify(...)`; \
+                 journaling is disabled per connection to avoid cross-session replay. \
+                 Call `.identify(|req| ...)` to namespace journals per authenticated user."
+            );
+        }
         let shared = Arc::new(Shared {
             sessions: Mutex::new(HashMap::new()),
             factory: self.factory,
@@ -124,6 +187,9 @@ impl<M: Send + 'static, Ms: Clone + Send + 'static> Live<M, Ms> {
             http_base,
             pubsub: self.pubsub.unwrap_or_else(|| Arc::new(PubSub::new())),
             guard: self.guard,
+            require_same_origin,
+            identify: self.identify,
+            in_flight_effects: AtomicUsize::new(0),
             scheduler: OnceLock::new(),
         });
         // The scheduler thread holds a Weak so a dropped endpoint can wind
@@ -138,10 +204,14 @@ impl<M: Send + 'static, Ms: Clone + Send + 'static> Live<M, Ms> {
         let open = Arc::clone(&shared);
         let message = Arc::clone(&shared);
         let close = Arc::clone(&shared);
-        Ws::new()
+        let ws = Ws::new()
             .on_open(move |conn: &Conn, req: &Request| open.on_open(conn, req))
             .on_message(move |conn: &Conn, msg: Msg| message.on_message(conn, msg))
-            .on_close(move |conn: &Conn, _code| close.on_close(conn.id()))
+            .on_close(move |conn: &Conn, _code| close.on_close(conn.id()));
+        match allowed_origins {
+            Some(origins) => ws.check_origin(origins),
+            None => ws,
+        }
     }
 }
 
@@ -150,6 +220,116 @@ pub fn live<M: Send + 'static, Ms: Clone + Send + 'static>(
     factory: impl Fn(&Request) -> Program<M, Ms> + Send + Sync + 'static,
 ) -> Ws {
     Live::new(factory).ws()
+}
+
+/// Strict same-origin check for a WS upgrade: the `Origin` header's authority
+/// (host[:port]) must equal the `Host` header. A missing or scheme-less
+/// `Origin` fails closed — a browser always sends a well-formed `Origin` on a
+/// WebSocket handshake.
+fn origin_matches_host(req: &Request) -> bool {
+    origin_authority_matches(req.header("origin"), req.header("host"))
+}
+
+fn origin_authority_matches(origin: Option<&str>, host: Option<&str>) -> bool {
+    let (Some(origin), Some(host)) = (origin, host) else {
+        return false;
+    };
+    let authority = match origin.split_once("://") {
+        Some((_scheme, rest)) => rest.split('/').next().unwrap_or(""),
+        None => return false,
+    };
+    !authority.is_empty() && authority.eq_ignore_ascii_case(host)
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::origin_authority_matches as matches;
+
+    #[test]
+    fn same_origin_is_allowed() {
+        assert!(matches(Some("https://app.com"), Some("app.com")));
+        assert!(matches(Some("http://app.com:8080"), Some("app.com:8080")));
+        assert!(matches(Some("https://APP.com"), Some("app.com"))); // host case-insensitive
+    }
+
+    #[test]
+    fn cross_origin_or_malformed_is_rejected() {
+        assert!(!matches(Some("https://evil.com"), Some("app.com")));
+        assert!(!matches(None, Some("app.com"))); // missing Origin fails closed
+        assert!(!matches(Some("https://app.com"), None));
+        assert!(!matches(Some("app.com"), Some("app.com"))); // no scheme => not an Origin
+        assert!(!matches(Some("https://app.com:443"), Some("app.com"))); // strict: port differs
+    }
+}
+
+/// Choose the per-connection journal stream key. When the app supplies a
+/// principal (via [`Live::identify`]) the client's `?session=` id is scoped
+/// under it, so one client can never load or append to another principal's
+/// journal (CWE-639). Anonymous journaling (no guard) keeps the client key —
+/// there is no cross-user secret to protect. A guarded socket with no
+/// principal returns `None` (no journaling) rather than trust the client key.
+fn journal_stream(guarded: bool, principal: Option<&str>, client: Option<&str>) -> Option<String> {
+    let client = client?;
+    match principal {
+        Some(p) => Some(format!("{}:{}", sanitize_principal(p), client)),
+        None if !guarded => Some(client.to_string()),
+        None => None,
+    }
+}
+
+/// Keep an app-supplied principal safe to embed in a journal stream name:
+/// ASCII alphanumerics, `_` and `-` survive, everything else becomes `_`,
+/// capped so a pathological id can't blow up the key.
+fn sanitize_principal(p: &str) -> String {
+    p.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(128)
+        .collect()
+}
+
+#[cfg(test)]
+mod journal_stream_tests {
+    use super::{journal_stream, sanitize_principal};
+
+    #[test]
+    fn principal_scopes_the_client_key() {
+        // Two users sending the SAME client session id get distinct streams.
+        let a = journal_stream(true, Some("user-1"), Some("abc"));
+        let b = journal_stream(true, Some("user-2"), Some("abc"));
+        assert_eq!(a.as_deref(), Some("user-1:abc"));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn guarded_without_principal_refuses_to_journal() {
+        assert_eq!(journal_stream(true, None, Some("abc")), None);
+    }
+
+    #[test]
+    fn anonymous_journaling_keeps_the_client_key() {
+        assert_eq!(
+            journal_stream(false, None, Some("abc")).as_deref(),
+            Some("abc")
+        );
+    }
+
+    #[test]
+    fn no_client_id_means_no_journal() {
+        assert_eq!(journal_stream(false, None, None), None);
+        assert_eq!(journal_stream(true, Some("u"), None), None);
+    }
+
+    #[test]
+    fn principal_is_sanitized_for_stream_safety() {
+        assert_eq!(sanitize_principal("a/b:c d"), "a_b_c_d");
+        assert_eq!(sanitize_principal("ok-1_2"), "ok-1_2");
+    }
 }
 
 struct Session<M, Ms> {
@@ -169,6 +349,9 @@ struct Shared<M, Ms> {
     http_base: String,
     pubsub: Arc<dyn Broker>,
     guard: Option<Guard>,
+    require_same_origin: bool,
+    identify: Option<Identify>,
+    in_flight_effects: AtomicUsize,
     scheduler: OnceLock<Scheduler>,
 }
 
@@ -192,14 +375,29 @@ impl<M: Send + 'static, Ms: Clone + Send + 'static> Shared<M, Ms> {
             }
         }
 
+        // Cross-site WebSocket hijacking backstop: a guarded socket with no
+        // explicit Origin allowlist requires the upgrade to be same-origin.
+        // (With an allowlist, `check_origin` already rejected foreign origins
+        // before the 101, so `require_same_origin` is false here.)
+        if self.require_same_origin && !origin_matches_host(req) {
+            conn.close(1008, "origin not allowed");
+            return;
+        }
+
         let mut program = (self.factory)(req);
 
+        // Select the journal stream. Namespaced by the authenticated principal
+        // when `identify` is set, so a client's `?session=` can only ever
+        // address its own journals (CWE-639); a guarded socket without a
+        // principal refuses to journal rather than trust the client-chosen key.
         let stream = self.journal.as_ref().and_then(|_| {
-            req.query
+            let client = req
+                .query
                 .split('&')
                 .find_map(|kv| kv.strip_prefix("session="))
-                .filter(|s| journal::valid_session(s))
-                .map(str::to_string)
+                .filter(|s| journal::valid_session(s));
+            let principal = self.identify.as_ref().and_then(|id| id(req));
+            journal_stream(self.guard.is_some(), principal.as_deref(), client)
         });
 
         // Reconnect: fast-forward a fresh program through the journal, then
@@ -325,32 +523,12 @@ impl<M: Send + 'static, Ms: Clone + Send + 'static> Shared<M, Ms> {
             match cmd.spec {
                 CmdSpec::Delay { ms } => self.scheduler().delay(conn, cmd.id, ms),
                 CmdSpec::HttpGet { url } => {
-                    let shared = Arc::clone(self);
                     let base = self.http_base.clone();
-                    std::thread::spawn(move || {
-                        let (ok, status, body) = http::get(&base, &url);
-                        let frame = Frame::Resolve {
-                            id: cmd.id,
-                            ok,
-                            status,
-                            body,
-                        };
-                        shared.feed(conn, &frame, &frames::encode(&frame));
-                    });
+                    self.spawn_effect(conn, cmd.id, move || http::get(&base, &url));
                 }
                 CmdSpec::HttpPost { url, body } => {
-                    let shared = Arc::clone(self);
                     let base = self.http_base.clone();
-                    std::thread::spawn(move || {
-                        let (ok, status, resp) = http::post(&base, &url, &body);
-                        let frame = Frame::Resolve {
-                            id: cmd.id,
-                            ok,
-                            status,
-                            body: resp,
-                        };
-                        shared.feed(conn, &frame, &frames::encode(&frame));
-                    });
+                    self.spawn_effect(conn, cmd.id, move || http::post(&base, &url, &body));
                 }
                 // Fire-and-forget: fan out to every subscriber (this
                 // connection's own topic sub included, and every *other*
@@ -374,6 +552,49 @@ impl<M: Send + 'static, Ms: Clone + Send + 'static> Shared<M, Ms> {
                 }
             }
         }
+    }
+
+    /// Run a server-side fetch on its own thread, bounded so a dispatch flood
+    /// (or an `every` sub firing fetches) can't spawn unbounded threads and
+    /// exhaust memory/FDs. Over the cap the effect resolves immediately as a
+    /// transport error instead of spawning.
+    fn spawn_effect(
+        self: &Arc<Self>,
+        conn: u64,
+        id: u32,
+        fetch: impl FnOnce() -> (bool, u16, String) + Send + 'static,
+    ) {
+        const MAX_INFLIGHT: usize = 64;
+        if self.in_flight_effects.fetch_add(1, Ordering::Relaxed) >= MAX_INFLIGHT {
+            self.in_flight_effects.fetch_sub(1, Ordering::Relaxed);
+            let frame = Frame::Resolve {
+                id,
+                ok: false,
+                status: 0,
+                body: "effect rejected: too many concurrent server-side requests".into(),
+            };
+            self.feed(conn, &frame, &frames::encode(&frame));
+            return;
+        }
+        let shared = Arc::clone(self);
+        std::thread::spawn(move || {
+            // Decrement the in-flight count even if the fetch or feed panics.
+            struct Guard<'a>(&'a AtomicUsize);
+            impl Drop for Guard<'_> {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+            let _guard = Guard(&shared.in_flight_effects);
+            let (ok, status, body) = fetch();
+            let frame = Frame::Resolve {
+                id,
+                ok,
+                status,
+                body,
+            };
+            shared.feed(conn, &frame, &frames::encode(&frame));
+        });
     }
 
     /// Subscribe a connection's `topic(...)` sub to the pubsub broker. Each

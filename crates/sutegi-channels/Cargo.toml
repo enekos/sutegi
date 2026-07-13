@@ -1,0 +1,22 @@
+[package]
+name = "sutegi-channels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Phoenix-style channels for sutegi: topic join/leave with auth, push/broadcast/reply over WebSockets, cross-pod via the pubsub Broker seam, agent-introspectable at /__channels. Zero third-party dependencies."
+keywords = ["channels", "websocket", "realtime", "pubsub", "zero-dependency"]
+categories = ["web-programming", "web-programming::websocket"]
+
+[dependencies]
+sutegi-json = { path = "../sutegi-json", version = "0.5.1" }
+sutegi-http = { path = "../sutegi-http", version = "0.5.1" }
+sutegi-ws = { path = "../sutegi-ws", version = "0.5.1" }
+sutegi-pubsub = { path = "../sutegi-pubsub", version = "0.5.1" }
+
+[features]
+# Presence: a per-pod tracker over the Broker seam with cross-pod state sync
+# and heartbeat expiry (see src/presence.rs for the honest caveats).
+presence = []

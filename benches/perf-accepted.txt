@@ -1,0 +1,24 @@
+# Perf gate: accepted regressions.
+#
+# The aatxe perf gate compares a PR against master and fails on any regression
+# past the noise gate. This file lists benches whose regression is *accepted* —
+# either an intended cost we've decided to pay, or a bench whose inter-run
+# variance the two-run comparison can't separate from signal. CI still reports
+# their delta; it just doesn't fail on them. Everything not listed here still
+# hard-fails, so the gate keeps its teeth on the stable micro-benches.
+#
+# Format: one bench name per line. `#` starts a comment. Keep a rationale.
+
+# +~13% and intended: the security hardening adds per-request work master never
+# did — a wall-clock deadline (slowloris / CWE-400) and per-header framing
+# checks (Transfer-Encoding refusal + strict/consistent Content-Length parsing,
+# CWE-444). Removing the redundant clock read got it back to within noise of
+# that irreducible cost; the rest is the feature. Accepted as the new baseline.
+http_parse_request
+
+# Structurally noisy, not a real regression: a full-socket WS round-trip
+# (connect -> reactor shard -> decode -> handler -> encode -> read echo). Its
+# inter-run drift on shared CI runners is ±20% — it swung -17% (improvement) to
+# +20% (regression) across consecutive CI runs on effectively identical code,
+# so a single base-vs-head pair can't tell its noise from signal.
+e2e_ws_echo

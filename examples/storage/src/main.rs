@@ -64,6 +64,10 @@ fn main() -> std::io::Result<()> {
     let store = FsStorage::new(root).expect("open storage root");
     let s3_up = s3_from_env();
     let s3_down = s3_up.clone();
+    // Gate the agent surface: presigning mints URLs for arbitrary object keys,
+    // so it must not be world-invocable. `Authorization: Bearer $OPS_TOKEN`;
+    // with no token set the surface is closed rather than open.
+    let ops_token = std::env::var("OPS_TOKEN").ok();
 
     let presign_args = || {
         schema::object(
@@ -128,5 +132,18 @@ fn main() -> std::io::Result<()> {
             presign_args(),
             move |_c, args| presign(&s3_down, &args, false),
         )
+        .ops_guard(move |req| {
+            let authorized = match &ops_token {
+                Some(tok) => {
+                    req.header("authorization").map(|h| h == format!("Bearer {tok}")) == Some(true)
+                }
+                None => false,
+            };
+            if authorized {
+                None
+            } else {
+                Some(Response::new(401).with_body(b"unauthorized (set OPS_TOKEN)".to_vec()))
+            }
+        })
         .serve()
 }

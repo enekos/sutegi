@@ -33,6 +33,7 @@ sutegi-template = { path = "../sutegi-template", version = "0.5.1", optional = t
 sutegi-repl = { path = "../sutegi-repl", version = "0.5.1", optional = true }
 sutegi-ws = { path = "../sutegi-ws", version = "0.5.1", optional = true }
 sutegi-pubsub = { path = "../sutegi-pubsub", version = "0.5.1", optional = true }
+sutegi-channels = { path = "../sutegi-channels", version = "0.5.1", optional = true }
 
 [features]
 # Batteries-included by default; opt out with `default-features = false` and
@@ -53,6 +54,9 @@ postgres = ["orm", "sutegi-orm/postgres"]                 # pure-std Postgres dr
 graceful = ["sutegi-web/graceful"]                        # SIGTERM/SIGINT draining
 ws = ["dep:sutegi-ws", "sutegi-web/ws"]                   # WebSockets: App::ws on the sharded kqueue/epoll reactor
 pubsub = ["dep:sutegi-pubsub"]                            # in-process publish/subscribe broker (topic fan-out)
+pubsub-postgres = ["pubsub", "sutegi-pubsub/postgres"] # cross-pod pubsub over PG LISTEN/NOTIFY (PgPubSub)
+channels = ["ws", "pubsub", "dep:sutegi-channels", "sutegi-web/channels"] # Phoenix-style channels: App::channels + /__channels
+presence = ["channels", "sutegi-channels/presence"]       # who-is-online tracking on channels, cross-pod via the broker
 hexagon = ["dep:sutegi-hexagon"]                                  # hexagonal-architecture primitives
 session = ["dep:sutegi-session"]                          # signed-cookie sessions (HMAC-SHA256)
 auth = ["session", "orm", "dep:sutegi-auth"]              # the user system: passwords, Users, guards, API tokens

@@ -739,6 +739,15 @@ sequential client (sutegi is connection-per-request); real throughput scales
 with concurrency across the worker pool. Numbers are machine-dependent — run
 `make bench` for yours.
 
+### Pre-commit perf gate
+
+`make install-hooks` enables a pre-commit hook that re-runs the aatxe bench
+suite against `benches/baselines/local.json` and blocks the commit if any
+hot-path benchmark regresses past the statistical noise gate. It only runs
+when staged changes touch performance-sensitive paths (`Cargo.*`, `crates/`,
+`benches/`, `examples/`). To bypass for a single commit, use
+`SKIP_BENCH=1 git commit ...`.
+
 ## Status
 
 Early but increasingly capable. Typed models (`#[derive(Model)]`), a query

@@ -1,0 +1,21 @@
+[package]
+name = "chat-example"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The canonical channels demo: rooms, presence, and cross-pod fan-out over PostgreSQL LISTEN/NOTIFY."
+publish = false
+
+[[bin]]
+name = "chat"
+path = "src/main.rs"
+
+[dependencies]
+sutegi = { path = "../../crates/sutegi", default-features = false, features = [
+    "channels",
+    "presence",
+    "pubsub-postgres",
+] }

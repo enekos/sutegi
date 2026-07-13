@@ -1,4 +1,6 @@
-.PHONY: build test run release size bench bench-baseline bench-compare clean
+AATXE_BIN ?= aatxe
+
+.PHONY: build test run release size install-hooks bench bench-baseline bench-compare clean
 
 build:
 	cargo build
@@ -30,15 +32,20 @@ bench-baseline:
 	cd benches && cargo run --release --bin sutegi-bench > baselines/local.json
 	@echo "baseline written to benches/baselines/local.json"
 
-# Bench the working tree and statistically compare it against the committed
-# baseline via the aatxe CLI (median Δ + Mann-Whitney U + noise gate).
-# Exits 2 if anything regressed. Requires `aatxe` on PATH.
+# Statistical perf gate: bench the working tree and compare it against the
+# committed baseline via the aatxe CLI (median Δ + Mann-Whitney U + noise gate).
+# Exits 2 if anything regressed. AATXE_BIN selects the CLI (default: aatxe).
 bench-compare:
 	cd benches && cargo run --release --bin sutegi-bench > /tmp/sutegi-bench-head.json
-	aatxe compare --base benches/baselines/local.json --head /tmp/sutegi-bench-head.json \
+	$(AATXE_BIN) compare --base benches/baselines/local.json --head /tmp/sutegi-bench-head.json \
 		--out /tmp/sutegi-bench-compare.json --markdown /tmp/sutegi-bench-compare.md \
 		--fail-on-regression; \
 	status=$$?; cat /tmp/sutegi-bench-compare.md; exit $$status
+
+# Point git at the tracked hooks directory so pre-commit checks run on every commit.
+install-hooks:
+	git config core.hooksPath .githooks
+	@echo "git hooks installed from .githooks"
 
 clean:
 	cargo clean

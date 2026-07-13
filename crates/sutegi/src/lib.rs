@@ -21,6 +21,11 @@
 //! | `auth-mail` | + sutegi-auth/mail | email-verification + password-reset flows |
 //! | `storage`  | sutegi-storage (pure std) | file storage: local fs + S3 presigned URLs |
 //! | `storage-db` | + sutegi-orm  | blobs in SQLite/Postgres over the `Backend` seam |
+//! | `ws`       | sutegi-ws       | WebSockets: `App::ws` on the sharded kqueue/epoll reactor |
+//! | `pubsub`   | sutegi-pubsub   | in-process topic fan-out behind the `Broker` seam |
+//! | `pubsub-postgres` | + sutegi-pg | cross-pod pubsub over PG `LISTEN`/`NOTIFY` (`PgPubSub`) |
+//! | `channels` | sutegi-channels (+ ws/pubsub) | Phoenix-style channels: `App::channels` + `/__channels` manifest |
+//! | `presence` | + sutegi-channels/presence | who's-online per topic, cross-pod, heartbeat-expired |
 //! | `graceful` | libc            | SIGTERM/SIGINT draining for pods |
 //!
 //! `default = ["derive", "orm", "validate", "ai"]`. For a minimal
@@ -41,6 +46,8 @@ pub use sutegi_web as web;
 pub use sutegi_ai as ai;
 #[cfg(feature = "auth")]
 pub use sutegi_auth as auth;
+#[cfg(feature = "channels")]
+pub use sutegi_channels as channels;
 #[cfg(feature = "events")]
 pub use sutegi_events as events;
 #[cfg(feature = "hexagon")]
@@ -449,6 +456,12 @@ pub mod prelude {
     #[cfg(feature = "derive")]
     pub use sutegi_macros::{Model, Validate};
 
+    #[cfg(feature = "presence")]
+    pub use sutegi_channels::Presence;
+    #[cfg(feature = "channels")]
+    pub use sutegi_channels::{Channel, ChannelHub, Channels, LeaveReason, Reply, Socket};
+    #[cfg(feature = "pubsub-postgres")]
+    pub use sutegi_pubsub::PgPubSub;
     #[cfg(feature = "pubsub")]
     pub use sutegi_pubsub::{Broker, BrokerExt, PubSub};
     #[cfg(feature = "session")]
