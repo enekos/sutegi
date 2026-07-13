@@ -41,6 +41,8 @@ pub use sutegi_web as web;
 pub use sutegi_ai as ai;
 #[cfg(feature = "auth")]
 pub use sutegi_auth as auth;
+#[cfg(feature = "channels")]
+pub use sutegi_channels as channels;
 #[cfg(feature = "events")]
 pub use sutegi_events as events;
 #[cfg(feature = "hexagon")]
@@ -449,6 +451,12 @@ pub mod prelude {
     #[cfg(feature = "derive")]
     pub use sutegi_macros::{Model, Validate};
 
+    #[cfg(feature = "presence")]
+    pub use sutegi_channels::Presence;
+    #[cfg(feature = "channels")]
+    pub use sutegi_channels::{Channel, ChannelHub, Channels, LeaveReason, Reply, Socket};
+    #[cfg(feature = "pubsub-postgres")]
+    pub use sutegi_pubsub::PgPubSub;
     #[cfg(feature = "pubsub")]
     pub use sutegi_pubsub::{Broker, BrokerExt, PubSub};
     #[cfg(feature = "session")]
