@@ -1,14 +1,14 @@
 #![forbid(unsafe_code)]
-//! In-process publish/subscribe: topics with callback fan-out, zero
-//! third-party deps.
+//! Publish/subscribe: topics with callback fan-out, zero third-party deps.
 //!
 //! Everything rides the [`Broker`] seam — `subscribe(topic, callback) ->
 //! id`, `publish(topic, message)`, `unsubscribe(topic, id)`. [`PubSub`] is
-//! the in-process broker (one node); a Postgres `LISTEN/NOTIFY` broker can
-//! implement the same trait later for cross-pod fan-out without touching a
-//! caller. Callbacks are invoked *outside* the registry lock, so a
-//! subscriber may publish (or (un)subscribe) from inside its own callback
-//! without deadlocking.
+//! the in-process broker (one node); `PgPubSub` (feature `postgres`)
+//! speaks PostgreSQL `LISTEN`/`NOTIFY` for cross-pod fan-out behind the
+//! same trait, so swapping is a constructor change, not a rewrite.
+//! Callbacks are invoked *outside* the registry lock, so a subscriber may
+//! publish (or (un)subscribe) from inside its own callback without
+//! deadlocking.
 //!
 //! The design mirror to sutegi's ORM `Backend` trait: one seam, swappable
 //! implementations, so `subscribe`/`publish` code is written once.
@@ -26,6 +26,11 @@
 //! bus.publish("room:1", "unheard");
 //! assert_eq!(&*seen.lock().unwrap(), &["hello".to_string()]);
 //! ```
+
+#[cfg(feature = "postgres")]
+mod pg;
+#[cfg(feature = "postgres")]
+pub use pg::PgPubSub;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

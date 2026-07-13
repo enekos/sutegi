@@ -13,17 +13,23 @@
 //!   string is `Parse`d into a named statement once, then reused with only
 //!   `Bind`/`Execute` on repeat. Toggle with [`Config::statement_cache`].
 //!
+//! What it supports (continued):
+//! - **`LISTEN`/`NOTIFY`** via a dedicated [`Listener`] connection — the
+//!   primitive behind sutegi's cross-pod pubsub.
+//!
 //! What it does not (yet): TLS (terminate at the LB / mesh, or run inside the
-//! cluster network), binary result format, `COPY`, and `LISTEN/NOTIFY`.
+//! cluster network), binary result format, and `COPY`.
 
 /// The shared hand-rolled, known-answer-tested primitives (SHA-256, HMAC,
 /// PBKDF2, MD5, hex, Base64) — extracted to `sutegi-crypto` once storage,
 /// sessions, and auth started reusing them; re-exported here so
 /// `sutegi_pg::crypto::…` paths keep working.
 pub use sutegi_crypto as crypto;
+mod listen;
 mod pool;
 mod protocol;
 
+pub use listen::{Listener, ListenerShutdown, Notification};
 pub use pool::Pool;
 
 use std::time::Duration;
