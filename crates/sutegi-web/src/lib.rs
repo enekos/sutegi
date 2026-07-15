@@ -166,6 +166,52 @@ impl Ctx<'_> {
         }
         T::from_input(&body).map_err(Error::unprocessable)
     }
+
+    /// Parse **and** validate a URL-encoded form body into a typed model.
+    /// Arrays (e.g. `tags[]=a&tags[]=b`) and booleans/numbers are inferred
+    /// automatically so validation rules like `integer` and `bool` work correctly.
+    #[cfg(all(feature = "validate", feature = "orm"))]
+    pub fn validated_form<T>(&self) -> Result<T, Error>
+    where
+        T: sutegi_orm::FromInput + sutegi_validate::Validate,
+    {
+        let body_str = std::str::from_utf8(&self.req.body).map_err(|_| Error::bad_request("body is not valid UTF-8"))?;
+        let body = form_to_json(body_str);
+        if let Err(errs) = T::rules().validate(&body) {
+            return Err(Error::unprocessable("validation failed").with_fields(errs.to_json()));
+        }
+        T::from_input(&body).map_err(Error::unprocessable)
+    }
+
+    /// Parse **and** validate the query string into a typed model.
+    #[cfg(all(feature = "validate", feature = "orm"))]
+    pub fn validated_query<T>(&self) -> Result<T, Error>
+    where
+        T: sutegi_orm::FromInput + sutegi_validate::Validate,
+    {
+        let body = form_to_json(&self.req.query);
+        if let Err(errs) = T::rules().validate(&body) {
+            return Err(Error::unprocessable("validation failed").with_fields(errs.to_json()));
+        }
+        T::from_input(&body).map_err(Error::unprocessable)
+    }
+
+    /// Parse **and** validate the path parameters (e.g. `/users/:id`) into a typed model.
+    #[cfg(all(feature = "validate", feature = "orm"))]
+    pub fn validated_path<T>(&self) -> Result<T, Error>
+    where
+        T: sutegi_orm::FromInput + sutegi_validate::Validate,
+    {
+        let mut map = BTreeMap::new();
+        for (k, v) in &self.params {
+            map.insert(k.clone(), infer_json_type(v));
+        }
+        let body = Json::Obj(map);
+        if let Err(errs) = T::rules().validate(&body) {
+            return Err(Error::unprocessable("validation failed").with_fields(errs.to_json()));
+        }
+        T::from_input(&body).map_err(Error::unprocessable)
+    }
 }
 
 /// The owned context handed to AI tool closures ([`App::tool`] /
@@ -1412,6 +1458,51 @@ fn hex_val(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
+}
+
+/// Helper for form_to_json to infer scalar types from form strings.
+fn infer_json_type(s: &str) -> Json {
+    if s == "true" {
+        Json::Bool(true)
+    } else if s == "false" {
+        Json::Bool(false)
+    } else if let Ok(n) = s.parse::<f64>() {
+        Json::Num(n)
+    } else {
+        Json::Str(s.to_string())
+    }
+}
+
+/// Parse a URL-encoded string (form body or query) into a typed `Json` object.
+/// Supports `key=value`, `key[]=a&key[]=b`, and automatically infers numbers/booleans.
+pub fn form_to_json(input: &str) -> Json {
+    let mut map: BTreeMap<String, Json> = BTreeMap::new();
+    for pair in input.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = match pair.split_once('=') {
+            Some((k, v)) => (url_decode(k), url_decode(v)),
+            None => (url_decode(pair), String::new()),
+        };
+        let val = infer_json_type(&v);
+        
+        if let Some(stripped) = k.strip_suffix("[]") {
+            let key = stripped.to_string();
+            match map.get_mut(&key) {
+                Some(Json::Arr(arr)) => {
+                    arr.push(val);
+                }
+                Some(_) => {} // skip if it was previously not an array (type clash)
+                None => {
+                    map.insert(key, Json::Arr(vec![val]));
+                }
+            }
+        } else {
+            map.insert(k, val);
+        }
+    }
+    Json::Obj(map)
 }
 
 #[cfg(test)]
