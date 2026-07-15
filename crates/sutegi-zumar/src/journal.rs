@@ -20,6 +20,12 @@ use sutegi_orm::Transactional;
 pub trait Journal: Send + Sync + 'static {
     fn append(&self, session: &str, frame: &[u8]) -> Result<(), String>;
     fn load(&self, session: &str) -> Result<Vec<Vec<u8>>, String>;
+    /// Garbage collect sessions that haven't received an event since `cutoff_epoch_secs`.
+    /// Returns the number of sessions deleted. Defaults to a no-op.
+    fn trim(&self, cutoff_epoch_secs: i64) -> Result<u64, String> {
+        let _ = cutoff_epoch_secs;
+        Ok(0)
+    }
 }
 
 /// In-memory journal — survives reconnects, not restarts.
@@ -47,6 +53,14 @@ impl Journal for MemJournal {
             .get(session)
             .cloned()
             .unwrap_or_default())
+    }
+
+    fn trim(&self, cutoff_epoch_secs: i64) -> Result<u64, String> {
+        // MemJournal doesn't store timestamps; could be added, but for now
+        // we just clear everything for simplicity if it's called, or do nothing.
+        // Doing nothing is safer.
+        let _ = cutoff_epoch_secs;
+        Ok(0)
     }
 }
 
@@ -97,6 +111,23 @@ impl<B: Transactional + Send + Sync + 'static> Journal for EventJournal<B> {
                     .ok_or_else(|| format!("corrupt frame at {}:{}", e.stream, e.version))
             })
             .collect()
+    }
+
+    fn trim(&self, cutoff_epoch_secs: i64) -> Result<u64, String> {
+        use sutegi_orm::Value;
+        // Delete any zumar-live:* stream whose most recent event is older than the cutoff.
+        // The subquery finds exactly those streams.
+        let sql = "\
+            DELETE FROM sutegi_events \
+            WHERE stream LIKE 'zumar-live:%' \
+              AND stream IN ( \
+                  SELECT stream FROM sutegi_events \
+                  WHERE stream LIKE 'zumar-live:%' \
+                  GROUP BY stream \
+                  HAVING MAX(created_at) < ? \
+              )";
+        let deleted = self.store.backend().execute(sql, &[Value::Int(cutoff_epoch_secs)])?;
+        Ok(deleted as u64)
     }
 }
 

@@ -319,6 +319,14 @@ pub fn append_tx(
         )
         .map_err(EventError::Store)?;
     }
+
+    if tx.dialect() == sutegi_orm::Dialect::Postgres {
+        // Broadcast that events arrived; projections listening on PG PubSub
+        // can wake up instantly instead of waiting for their next poll.
+        // We ignore the result because NOTIFY is a fire-and-forget hint.
+        let _ = tx.execute("NOTIFY sutegi_events, ''", &[]);
+    }
+
     Ok(current + events.len() as i64)
 }
 

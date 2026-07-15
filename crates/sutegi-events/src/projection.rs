@@ -32,6 +32,7 @@ pub struct Projections<B: Transactional> {
     projections: Vec<(String, ProjectionFn)>,
     batch: i64,
     poll_interval: Duration,
+    wakeup: Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
 }
 
 impl<B: Transactional> Projections<B> {
@@ -43,6 +44,7 @@ impl<B: Transactional> Projections<B> {
             projections: Vec::new(),
             batch: 100,
             poll_interval: Duration::from_millis(500),
+            wakeup: Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new())),
         }
     }
 
@@ -56,6 +58,13 @@ impl<B: Transactional> Projections<B> {
     pub fn poll_interval(mut self, d: Duration) -> Projections<B> {
         self.poll_interval = d;
         self
+    }
+
+    /// Wake all sleeping projection workers immediately.
+    /// Wire this to a pub/sub listener (e.g. `sutegi-pubsub/postgres` on the
+    /// `sutegi_events` channel) to make your projections fully push-driven.
+    pub fn wake(&self) {
+        self.wakeup.1.notify_all();
     }
 
     /// Register `name` with its handler. Names key the durable checkpoints, so
@@ -190,11 +199,17 @@ impl<B: Transactional> Projections<B> {
             handles.push(thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     match projections.tick(&name) {
-                        Ok(0) => thread::sleep(projections.poll_interval),
+                        Ok(0) => {
+                            let (lock, cvar) = &*projections.wakeup;
+                            let guard = lock.lock().unwrap();
+                            let _ = cvar.wait_timeout(guard, projections.poll_interval).unwrap();
+                        }
                         Ok(_) => continue, // keep draining while behind
                         Err(e) => {
                             eprintln!("[events] projection '{name}': {e}");
-                            thread::sleep(projections.poll_interval);
+                            let (lock, cvar) = &*projections.wakeup;
+                            let guard = lock.lock().unwrap();
+                            let _ = cvar.wait_timeout(guard, projections.poll_interval).unwrap();
                         }
                     }
                 }

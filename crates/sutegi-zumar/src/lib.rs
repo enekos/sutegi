@@ -56,6 +56,8 @@ pub struct Live<M, Ms> {
     guard: Option<Guard>,
     allowed_origins: Option<Vec<String>>,
     identify: Option<Identify>,
+    trim_interval: Option<std::time::Duration>,
+    trim_max_age: Option<std::time::Duration>,
 }
 
 type Factory<M, Ms> = Arc<dyn Fn(&Request) -> Program<M, Ms> + Send + Sync>;
@@ -73,6 +75,8 @@ impl<M: Send + 'static, Ms: Clone + Send + 'static> Live<M, Ms> {
             guard: None,
             allowed_origins: None,
             identify: None,
+            trim_interval: None,
+            trim_max_age: None,
         }
     }
 
@@ -149,6 +153,15 @@ impl<M: Send + 'static, Ms: Clone + Send + 'static> Live<M, Ms> {
         self
     }
 
+    /// Automatically garbage-collect abandoned session journals.
+    /// A background thread will run every `interval` and delete sessions
+    /// whose most recent event is older than `max_age`.
+    pub fn trim_journal(mut self, interval: std::time::Duration, max_age: std::time::Duration) -> Self {
+        self.trim_interval = Some(interval);
+        self.trim_max_age = Some(max_age);
+        self
+    }
+
     /// Base URL for relative `httpGet` targets (default
     /// `http://127.0.0.1:$PORT` — the app itself).
     pub fn http_base(mut self, base: impl Into<String>) -> Self {
@@ -163,6 +176,23 @@ impl<M: Send + 'static, Ms: Clone + Send + 'static> Live<M, Ms> {
             let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
             format!("http://127.0.0.1:{port}")
         });
+        
+        if let (Some(interval), Some(age), Some(ref journal)) = (self.trim_interval, self.trim_max_age, &self.journal) {
+            let journal = Arc::clone(journal);
+            std::thread::spawn(move || loop {
+                std::thread::sleep(interval);
+                let cutoff = std::time::SystemTime::now()
+                    .checked_sub(age)
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64;
+                if let Err(e) = journal.trim(cutoff) {
+                    eprintln!("sutegi-zumar: journal trim error: {}", e);
+                }
+            });
+        }
+
         // A guarded socket must validate Origin (a WS upgrade ignores the
         // same-origin policy but still carries first-party cookies). With an
         // explicit allowlist, `check_origin` rejects foreign origins before
