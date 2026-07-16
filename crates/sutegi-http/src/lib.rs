@@ -462,47 +462,6 @@ fn parse_request_impl<R: BufRead>(
     limits: &Limits,
     deadline: Instant,
 ) -> io::Result<Option<Incoming>> {
-||||||| parent of 9c93e92 (Security hardening, performance fixes, and pre-commit hook)
-=======
-||||||| parent of 9d28696 (http: drop the redundant per-request deadline clock read)
-=======
-    // The deadline is freshly derived from `now`, so it can't already be past:
-    // skip straight to the parse without the redundant guard clock read.
->>>>>>> 9d28696 (http: drop the redundant per-request deadline clock read)
-    let deadline = Instant::now() + limits.header_timeout;
-    parse_request_impl(reader, limits, deadline)
-}
-
-/// Like [`parse_request`], but with an explicit wall-clock `deadline` spanning
-/// the request line, headers, and body. `handle_connection` computes one
-/// deadline per request and threads it here, so a slow drip is bounded in
-/// total, not merely per recv (slowloris, CWE-400).
-pub fn parse_request_deadline<R: BufRead>(
-    reader: &mut R,
-    limits: &Limits,
-    deadline: Instant,
-) -> io::Result<Option<Incoming>> {
-    // Public entry for a caller-supplied deadline that may already be stale
-    // (unlike the freshly-derived one `parse_request`/`handle_connection` pass):
-    // reject up front so such a caller bails before touching the socket, and a
-    // dripping peer can't slip one buffered line past an expired deadline.
-    if Instant::now() > deadline {
-        return Ok(Some(Incoming::Reject { status: 408 }));
-    }
-    parse_request_impl(reader, limits, deadline)
-}
-
-/// Shared parse body. Callers that derive `deadline` from `now` immediately
-/// beforehand (`parse_request`, `handle_connection`) reach it directly, skipping
-/// the redundant up-front deadline check — the per-line and per-body loops read
-/// the clock only when they must actually wait for more input, so the hot path
-/// (a request already buffered) is syscall-free apart from the one `now` used to
-/// derive the deadline.
-fn parse_request_impl<R: BufRead>(
-    reader: &mut R,
-    limits: &Limits,
-    deadline: Instant,
-) -> io::Result<Option<Incoming>> {
     // One byte buffer, reused for the request line and every header line —
     // this function runs per request, so allocation churn is latency.
     let mut buf: Vec<u8> = Vec::with_capacity(128);
