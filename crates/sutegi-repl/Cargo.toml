@@ -9,10 +9,10 @@ authors.workspace = true
 description = "Tinker-style interactive REPL for sutegi apps: drive routes, tools, and data in-process or against a running server."
 
 [dependencies]
-sutegi-json = { path = "../sutegi-json", version = "0.5.1" }
-sutegi-http = { path = "../sutegi-http", version = "0.5.1" }
-sutegi-web = { path = "../sutegi-web", version = "0.5.1" }
-sutegi-orm = { path = "../sutegi-orm", version = "0.5.1", optional = true }
+sutegi-json = { path = "../sutegi-json", version = "0.6.0" }
+sutegi-http = { path = "../sutegi-http", version = "0.6.0" }
+sutegi-web = { path = "../sutegi-web", version = "0.6.0" }
+sutegi-orm = { path = "../sutegi-orm", version = "0.6.0", optional = true }
 
 [features]
 default = []
@@ -21,7 +21,7 @@ default = []
 orm = ["dep:sutegi-orm"]
 
 [dev-dependencies]
-sutegi-orm = { path = "../sutegi-orm", version = "0.5.1", features = ["sqlite"] }
+sutegi-orm = { path = "../sutegi-orm", version = "0.6.0", features = ["sqlite"] }
 # The fixture app validates tool args (exercising the REPL's 422 reporting)
 # and reaches its Db through ToolCtx::db.
-sutegi-web = { path = "../sutegi-web", version = "0.5.1", features = ["validate", "orm"] }
+sutegi-web = { path = "../sutegi-web", version = "0.6.0", features = ["validate", "orm"] }

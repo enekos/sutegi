@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-18
+
+### Removed
+
+- **`sutegi-ai` crate and the `ai` feature** (breaking). The crate was only a re-export alias (`sutegi::ai`) for the agent tool surface, which already lives in `sutegi-web` and is always compiled. `App::tool`/`stream_tool`, the `schema` helpers, `ToolCtx`, and `/__tools` are now documented as always-on core; the prelude already exported them. Drop `ai` from your feature list (it was in `default`); no code change is needed.
+- **zumar fullstack coupling** (breaking). Removed the `sutegi-zumar` live bridge crate and the `zuc`-dependent CLI commands `dev`, `schema:zu`, and `new --fullstack`. The CLI is now `new` / `make:model` / `make:route` / `introspect` / `repl` and no longer requires an external `zuc` binary or a sibling `zumar` checkout.
+
 ### Added
 
 - Channels (`sutegi-channels`, feature `channels`): Phoenix-style channels — the realtime identity feature. Topic join/leave with an auth callback, a self-describing JSON envelope (`{topic, event, ref, join_ref, payload}` — an object, not Phoenix's positional array, so `/__channels` alone teaches an agent the protocol), `push`/`broadcast`/`broadcast_from`/replies, per-membership `assigns`, heartbeats, rejoin-replaces semantics, `kick`, and `after_join` deferral. `App::channels(pattern, doc, hub)` mounts the WebSocket endpoint plus the **`/__channels` agent manifest** (patterns, docs, per-event payload schemas; `ops_guard`-gated). Broadcasts ride the pubsub `Broker` seam (one pre-encoded frame fanned via the ws reactor), so the same channel code is single-pod on the in-process broker and **cross-pod on `PgPubSub` with zero changes** — verified by two OS processes chatting through a real PostgreSQL. Ships a ~4 KB dependency-free browser client (`sutegi_channels::JS_CLIENT`: auto-rejoin with backoff, heartbeat liveness, ref-tracked receives). Example: `examples/chat`.

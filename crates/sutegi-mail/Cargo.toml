@@ -11,6 +11,6 @@ keywords = ["email", "smtp", "mail", "zero-dependency"]
 categories = ["email", "web-programming"]
 
 [dependencies]
-sutegi-crypto = { path = "../sutegi-crypto", version = "0.5.1" }
-sutegi-json = { path = "../sutegi-json", version = "0.5.1" }
-sutegi-template = { path = "../sutegi-template", version = "0.5.1" }
+sutegi-crypto = { path = "../sutegi-crypto", version = "0.6.0" }
+sutegi-json = { path = "../sutegi-json", version = "0.6.0" }
+sutegi-template = { path = "../sutegi-template", version = "0.6.0" }

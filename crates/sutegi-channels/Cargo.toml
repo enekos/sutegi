@@ -11,10 +11,10 @@ keywords = ["channels", "websocket", "realtime", "pubsub", "zero-dependency"]
 categories = ["web-programming", "web-programming::websocket"]
 
 [dependencies]
-sutegi-json = { path = "../sutegi-json", version = "0.5.1" }
-sutegi-http = { path = "../sutegi-http", version = "0.5.1" }
-sutegi-ws = { path = "../sutegi-ws", version = "0.5.1" }
-sutegi-pubsub = { path = "../sutegi-pubsub", version = "0.5.1" }
+sutegi-json = { path = "../sutegi-json", version = "0.6.0" }
+sutegi-http = { path = "../sutegi-http", version = "0.6.0" }
+sutegi-ws = { path = "../sutegi-ws", version = "0.6.0" }
+sutegi-pubsub = { path = "../sutegi-pubsub", version = "0.6.0" }
 
 [features]
 # Presence: a per-pod tracker over the Broker seam with cross-pod state sync

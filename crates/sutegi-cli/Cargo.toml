@@ -13,6 +13,6 @@ name = "sutegi"
 path = "src/main.rs"
 
 [dependencies]
-sutegi-json = { path = "../sutegi-json", version = "0.5.1" }
+sutegi-json = { path = "../sutegi-json", version = "0.6.0" }
 # Remote-only REPL (no `orm`): data lives behind the running app's surface.
-sutegi-repl = { path = "../sutegi-repl", version = "0.5.1" }
+sutegi-repl = { path = "../sutegi-repl", version = "0.6.0" }

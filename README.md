@@ -1,4 +1,4 @@
-# sutegi — the forge
+# sutegi: the forge
 
 > Batteries-included web ergonomics, in Rust — built from `std` up, with a
 > tiny binary and an AI agent as a first-class user.

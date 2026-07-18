@@ -9,5 +9,5 @@ authors.workspace = true
 description = "Durable, cross-pod job queue for sutegi, backed by PostgreSQL (via the pure-std sutegi-pg driver): atomic FOR UPDATE SKIP LOCKED claim, visibility-timeout crash recovery, retries, delayed dispatch, dead-letter, introspectable stats."
 
 [dependencies]
-sutegi-pg = { path = "../sutegi-pg", version = "0.5.1" }
-sutegi-json = { path = "../sutegi-json", version = "0.5.1" }
+sutegi-pg = { path = "../sutegi-pg", version = "0.6.0" }
+sutegi-json = { path = "../sutegi-json", version = "0.6.0" }
