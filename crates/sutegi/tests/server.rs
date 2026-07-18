@@ -2,10 +2,7 @@
 //! TCP socket against `App::run`. This is the only place that exercises the
 //! request service closure built by `App::into_service` — routing, path params,
 //! 404-vs-405, the always-on operational endpoints, pre/after middleware, and
-//! the mounted AI tool surface — which the per-crate unit tests can't reach.
-//!
-//! The AI portion requires the `ai` feature; inert in a minimal build.
-#![cfg(feature = "ai")]
+//! the mounted agent tool surface — which the per-crate unit tests can't reach.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -176,6 +173,8 @@ fn routing_ops_and_middleware_end_to_end() {
     assert!(bad.body.contains("error"));
 }
 
+// Tool-argument schema validation (the 422-on-missing-arg path) needs `validate`.
+#[cfg(feature = "validate")]
 #[test]
 fn ai_tool_surface_over_http() {
     boot(AI, || {

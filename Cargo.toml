@@ -20,7 +20,6 @@ members = [
     "crates/sutegi-auth",
     "crates/sutegi-mail",
     "crates/sutegi-template",
-    "crates/sutegi-ai",
     "crates/sutegi-repl",
     "crates/sutegi",
     "crates/sutegi-cli",
@@ -42,7 +41,7 @@ members = [
 #   benches      — aatxe statistical microbench runner (path dep on ../aatxe)
 #   fuzz         — coverage-guided libFuzzer targets (nightly, cargo-fuzz)
 #   differential — sutegi-vs-serde_json JSON oracle (stable, `cargo test`)
-exclude = ["benches", "fuzz", "differential", "crates/sutegi-zumar"]
+exclude = ["benches", "fuzz", "differential"]
 
 [workspace.package]
 version = "0.5.1"

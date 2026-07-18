@@ -285,8 +285,6 @@ fn strip_crlf(s: &str) -> Cow<'_, str> {
 }
 
 /// Server resource limits — the difference between "demo" and "won't fall over".
-
-/// Server resource limits — the difference between "demo" and "won't fall over".
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     /// Reject request bodies larger than this (HTTP 413). Default 2 MiB.

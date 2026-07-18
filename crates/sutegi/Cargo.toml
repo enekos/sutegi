@@ -22,7 +22,6 @@ sutegi-orm = { path = "../sutegi-orm", version = "0.5.1", optional = true }
 sutegi-validate = { path = "../sutegi-validate", version = "0.5.1", optional = true }
 sutegi-queue = { path = "../sutegi-queue", version = "0.5.1", optional = true }
 sutegi-events = { path = "../sutegi-events", version = "0.5.1", optional = true }
-sutegi-ai = { path = "../sutegi-ai", version = "0.5.1", optional = true }
 sutegi-hexagon = { path = "../sutegi-hexagon", version = "0.5.1", optional = true }
 sutegi-session = { path = "../sutegi-session", version = "0.5.1", optional = true }
 sutegi-auth = { path = "../sutegi-auth", version = "0.5.1", optional = true }
@@ -40,14 +39,13 @@ sutegi-channels = { path = "../sutegi-channels", version = "0.5.1", optional = t
 # add back only what you need to shrink the binary.
 # `queue` is NOT default: the durable queue needs a PostgreSQL database, so it
 # is opt-in rather than force-compiled into every minimal build.
-default = ["derive", "orm", "validate", "ai"]
+default = ["derive", "orm", "validate"]
 
 # Each pillar is an independent compile-time feature.
 orm = ["dep:sutegi-orm", "sutegi-web/orm", "sutegi-repl?/orm"] # schema + query builder + Ctx::db/model
 validate = ["dep:sutegi-validate", "sutegi-web/validate"] # request / tool validation + Ctx::validate(d)
 queue = ["dep:sutegi-queue"]                              # durable, cross-pod job queue (Postgres-backed)
 events = ["dep:sutegi-events", "orm"]                     # event sourcing: event store + aggregates + projections
-ai = ["dep:sutegi-ai"]                                    # agent surface (schema helpers, ToolCtx)
 derive = ["dep:sutegi-macros", "orm"]                     # #[derive(Model)] / #[derive(Validate)]
 sqlite = ["orm", "sutegi-orm/sqlite"]                     # runnable bundled SQLite (per-pod)
 postgres = ["orm", "sutegi-orm/postgres"]                 # pure-std Postgres driver (cross-pod)

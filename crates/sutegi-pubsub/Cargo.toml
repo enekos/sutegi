@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "sutegi's publish/subscribe broker: topic fan-out over a Broker seam, zero third-party dependencies. In-process by default; the `postgres` feature adds a LISTEN/NOTIFY broker for cross-pod fan-out behind the same trait. Powers realtime subscriptions (zumar live mode, Channels)."
+description = "sutegi's publish/subscribe broker: topic fan-out over a Broker seam, zero third-party dependencies. In-process by default; the `postgres` feature adds a LISTEN/NOTIFY broker for cross-pod fan-out behind the same trait. Powers realtime subscriptions (Channels)."
 keywords = ["pubsub", "broker", "realtime", "zero-dependency"]
 categories = ["web-programming", "concurrency"]
 

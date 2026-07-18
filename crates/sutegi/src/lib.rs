@@ -11,7 +11,6 @@
 //! | `postgres` | sutegi-pg (pure std) | Postgres: the multi-pod execution layer |
 //! | `derive`   | sutegi-macros (build-time only) | `#[derive(Model)]` |
 //! | `validate` | sutegi-validate | request / tool validation |
-//! | `ai`       | sutegi-ai       | `Tool`/`StreamTool` + `/__tools` |
 //! | `queue`    | sutegi-queue (+ sutegi-pg) | durable, cross-pod job queue (Postgres) |
 //! | `events`   | sutegi-events (+ orm) | event sourcing: append-only event store, aggregates, projections |
 //! | `session`  | sutegi-session  | signed-cookie sessions (HMAC-SHA256) |
@@ -28,7 +27,10 @@
 //! | `presence` | + sutegi-channels/presence | who's-online per topic, cross-pod, heartbeat-expired |
 //! | `graceful` | libc            | SIGTERM/SIGINT draining for pods |
 //!
-//! `default = ["derive", "orm", "validate", "ai"]`. For a minimal
+//! The agent tool surface (`App::tool`/`stream_tool`, `schema` helpers,
+//! `ToolCtx`, `/__tools`) is part of always-on core — no feature needed.
+//!
+//! `default = ["derive", "orm", "validate"]`. For a minimal
 //! HTTP service: `sutegi = { version = "*", default-features = false }`.
 //!
 //! ## Built-in operational endpoints (always on)
@@ -42,8 +44,6 @@ pub use sutegi_json as json;
 pub use sutegi_web as web;
 
 // --- optional pillars ---
-#[cfg(feature = "ai")]
-pub use sutegi_ai as ai;
 #[cfg(feature = "auth")]
 pub use sutegi_auth as auth;
 #[cfg(feature = "channels")]

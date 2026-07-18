@@ -175,7 +175,8 @@ impl Ctx<'_> {
     where
         T: sutegi_orm::FromInput + sutegi_validate::Validate,
     {
-        let body_str = std::str::from_utf8(&self.req.body).map_err(|_| Error::bad_request("body is not valid UTF-8"))?;
+        let body_str = std::str::from_utf8(&self.req.body)
+            .map_err(|_| Error::bad_request("body is not valid UTF-8"))?;
         let body = form_to_json(body_str);
         if let Err(errs) = T::rules().validate(&body) {
             return Err(Error::unprocessable("validation failed").with_fields(errs.to_json()));
@@ -709,7 +710,7 @@ impl App {
         self
     }
 
-    /// Record a tool schema for introspection (used by `sutegi-ai`).
+    /// Record a tool schema for introspection.
     pub fn register_tool(mut self, schema: Json) -> App {
         self.tools.push(schema);
         self
@@ -1486,7 +1487,7 @@ pub fn form_to_json(input: &str) -> Json {
             None => (url_decode(pair), String::new()),
         };
         let val = infer_json_type(&v);
-        
+
         if let Some(stripped) = k.strip_suffix("[]") {
             let key = stripped.to_string();
             match map.get_mut(&key) {

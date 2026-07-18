@@ -89,14 +89,13 @@ fn main() -> std::io::Result<()> {
 |-------|----------------|
 | `sutegi-json` | JSON value, serializer, parser (deterministic key order). |
 | `sutegi-http` | HTTP/1.1 parsing + thread-pool server on `std::net`. |
-| `sutegi-web`  | Router, `App` builder, middleware, groups, extractors, streaming (`sse`/`stream`), `/__introspect`. |
+| `sutegi-web`  | Router, `App` builder, middleware, groups, extractors, streaming (`sse`/`stream`), `/__introspect`, and the agent tool surface (`App::tool`/`stream_tool`, `schema` helpers, `ToolCtx`, `/__tools`). |
 | `sutegi-orm`  | Typed schema, fluent parameterized query builder, one `Backend` trait, a JSON key/value store, and two runnable backends: **SQLite** (`sqlite`, single-node) and **Postgres** (`postgres`, multi-pod). |
 | `sutegi-pg`   | Pure-`std` PostgreSQL driver: wire protocol v3 over blocking TCP, SCRAM-SHA-256 auth, connection pool. No async runtime, no C library. |
 | `sutegi-storage` | File/object storage behind one `Storage` trait: local fs, database blobs (over `Backend`), and a pure-`std` S3 SigV4 presigner. |
 | `sutegi-macros` | `#[derive(Model)]` (schema, hydration, `save`, `from_input`) and `#[derive(Validate)]` (field-attr rulesets). Compile-time only (syn/quote never reach your binary). |
 | `sutegi-validate` | Fluent `Validator`-style rule sets **and** a JSON Schema subset validator, with structured errors. |
 | `sutegi-queue` | Durable, cross-pod job queue backed by Postgres (`FOR UPDATE SKIP LOCKED` claim, visibility-timeout retries, dead-letter). |
-| `sutegi-ai`   | The agent surface (`schema` helpers, `ToolCtx`). Tools are first-class on the `App` (`App::tool`/`stream_tool`), auto-mounted at `/__tools` with schema-validated args. |
 | `sutegi-hexagon`  | Opinionated hexagonal/clean-architecture primitives: `AppError`, `UseCase` ports, `respond` adapter glue. |
 | `sutegi`      | Facade crate + `prelude`. |
 | `sutegi-cli`  | The `sutegi` command: scaffold apps/models/routes, `introspect` a live app. |
@@ -112,7 +111,6 @@ what you use:
 | `orm`      | ✓ | schema + query builder + `Backend` trait + KV store |
 | `derive`   | ✓ | `#[derive(Model)]` (build-time syn/quote only) |
 | `validate` | ✓ | request / tool validation + `Ctx::validate`/`validated` |
-| `ai`       | ✓ | agent surface (`schema` helpers, `ToolCtx`) for `App::tool` |
 | `sqlite`   |   | SQLite backend — the **single-node** runnable store (bundled) |
 | `postgres` |   | Postgres backend — the **multi-pod** runnable store (pure std) |
 | `queue`    |   | durable, cross-pod job queue (Postgres-backed) |
