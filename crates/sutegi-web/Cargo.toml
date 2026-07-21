@@ -23,6 +23,8 @@ libc = { version = "0.2", optional = true }
 sutegi-ws = { path = "../sutegi-ws", version = "0.6.0", optional = true }
 # Only pulled in by the `channels` feature: the channel protocol + hub.
 sutegi-channels = { path = "../sutegi-channels", version = "0.6.0", optional = true }
+# Only pulled in by the `actors` feature: actor processes + supervisors.
+sutegi-actors = { path = "../sutegi-actors", version = "0.6.0", optional = true }
 
 [features]
 # Install OS signal handlers (SIGTERM/SIGINT) for graceful shutdown in pods.
@@ -35,3 +37,5 @@ validate = ["dep:sutegi-validate"]
 ws = ["dep:sutegi-ws"]
 # `App::channels` — Phoenix-style channels mounted on a ws endpoint + /__channels.
 channels = ["ws", "dep:sutegi-channels"]
+# `App::actors` — mount an actor Registry at /__actors.
+actors = ["dep:sutegi-actors"]

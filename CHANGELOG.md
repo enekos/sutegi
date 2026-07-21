@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Actors (`sutegi-actors`, feature `actors`): actor processes and OTP-style supervision trees. An `Actor` owns its state on its own thread behind a typed, bounded mailbox (`tell` cast with explicit `TellError::Full` backpressure, `ask` call with timeout); a panic in `handle` crashes only the actor and is captured as `ExitReason::Crashed` — "let it crash" over `catch_unwind`, same posture as the ws reactor. `Supervisor` restarts children from their factory (clean state, never poisoned state) with OTP vocabulary: `Restart` policies (`Permanent`/`Transient`/`Temporary`), `Strategy` (`OneForOne`/`RestForOne`/`OneForAll`, dependents stopped in reverse and restarted in start order), restart intensity (default 3 per 5s) that fails the supervisor and stops all children when exceeded, and per-child fixed `backoff`. Stale exits from supervisor-stopped generations are discarded via a generation counter. `SupervisorHandle::child_ref(name)` is the `whereis` analog. Everything is observable through a clone-cheap `Registry` (state, mailbox depth, restart counts, last crash message), mountable at **`GET /__actors`** via `App::actors(registry)` (`ops_guard`-gated) — the Observer-lite half of the agent contract. 12 unit tests + 2 doctests.
+
 ## [0.6.0] - 2026-07-18
 
 ### Removed

@@ -44,6 +44,8 @@ pub use sutegi_json as json;
 pub use sutegi_web as web;
 
 // --- optional pillars ---
+#[cfg(feature = "actors")]
+pub use sutegi_actors as actors;
 #[cfg(feature = "auth")]
 pub use sutegi_auth as auth;
 #[cfg(feature = "channels")]
@@ -455,6 +457,13 @@ pub mod prelude {
 
     #[cfg(feature = "derive")]
     pub use sutegi_macros::{Model, Validate};
+
+    #[cfg(feature = "actors")]
+    pub use sutegi_actors::{
+        spawn, spawn_opts, Actor, ActorRef, ActorState, ActorStatus, AskError, ChildSpec,
+        ExitReason, Opts as ActorOpts, Registry as ActorRegistry, ReplyTo, Restart, Strategy,
+        Supervisor, SupervisorHandle, SupervisorState, SupervisorStatus, TellError,
+    };
 
     #[cfg(feature = "presence")]
     pub use sutegi_channels::Presence;
