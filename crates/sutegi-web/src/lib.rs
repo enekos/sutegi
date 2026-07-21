@@ -567,6 +567,21 @@ impl App {
         )
     }
 
+    /// Mount an actor registry at `GET /__actors`: live state, mailbox
+    /// depth, and restart counts for every registered actor — the
+    /// Observer-lite half of the agent contract, gated by
+    /// [`App::ops_guard`] like the rest of the `/__` surface. Clone the
+    /// registry from [`sutegi_actors::Supervisor::registry`] (or
+    /// [`sutegi_actors::Opts::registry`]) before starting the tree.
+    #[cfg(feature = "actors")]
+    pub fn actors(self, registry: sutegi_actors::Registry) -> App {
+        self.get(
+            "/__actors",
+            "Live actor process status: state, mailbox depth, restarts.",
+            move |_c: &Ctx| json(200, &registry.snapshot_json()),
+        )
+    }
+
     /// Register a non-streaming AI tool: a `name`, a `description`, its JSON
     /// Schema `parameters` (build with [`schema`]), and a closure that receives
     /// the shared state via [`ToolCtx`] and the validated JSON `args`. Mounted
