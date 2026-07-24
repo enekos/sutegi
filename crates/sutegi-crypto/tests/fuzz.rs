@@ -110,6 +110,24 @@ fn pbkdf2_loop_matches_its_definition() {
 }
 
 #[test]
+fn sha256_streaming_matches_one_shot_differentially() {
+    // Random inputs split at random points across any number of updates must
+    // agree with the (RFC-vector-checked) one-shot digest.
+    let mut seed = 0x0000_5AA2_5600_0000_u64;
+    for _ in 0..1_000 {
+        let bytes = rand_bytes(&mut seed, 400);
+        let mut h = Sha256::new();
+        let mut rest: &[u8] = &bytes;
+        while !rest.is_empty() {
+            let take = 1 + (splitmix(&mut seed) as usize) % rest.len().min(97);
+            h.update(&rest[..take]);
+            rest = &rest[take..];
+        }
+        assert_eq!(h.finalize(), sha256(&bytes));
+    }
+}
+
+#[test]
 fn hmac_matches_its_definition() {
     // HMAC(K, m) == H((K' xor opad) || H((K' xor ipad) || m)), differentially
     // re-derived from the vector-checked sha256 for short keys.
@@ -179,6 +197,52 @@ fn hex_roundtrips_and_decode_never_panics() {
             .map(|_| (0x20 + (splitmix(&mut seed) as u8 % 0x5f)) as char)
             .collect();
         let _ = from_hex(&s); // must not panic on odd length / non-hex
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AEAD fuzz — seal/open round-trips at every length; tampering always rejects.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn aead_roundtrips_and_rejects_tampering() {
+    let mut seed = 0x0000_AEAD_C4AC_4A20_u64;
+    let key: [u8; 32] = hkdf_sha256(b"fuzz master", &[], b"aead-fuzz", 32)
+        .try_into()
+        .unwrap();
+    for round in 0..500 {
+        let pt = rand_bytes(&mut seed, 300);
+        let aad = rand_bytes(&mut seed, 50);
+        let mut nonce = [0u8; 12];
+        nonce[..8].copy_from_slice(&splitmix(&mut seed).to_le_bytes());
+
+        // Explicit-nonce API: deterministic round-trip, aad enforced.
+        let sealed = chacha20_poly1305_seal(&key, &nonce, &aad, &pt);
+        assert_eq!(sealed.len(), pt.len() + 16);
+        assert_eq!(
+            chacha20_poly1305_open(&key, &nonce, &aad, &sealed).expect("own output must open"),
+            pt
+        );
+        if !aad.is_empty() {
+            assert!(chacha20_poly1305_open(&key, &nonce, &[], &sealed).is_none());
+        }
+
+        // Random-nonce API round-trip.
+        let sealed = seal(&key, &pt).unwrap();
+        assert_eq!(open(&key, &sealed).expect("own output must open"), pt);
+
+        // Flip one random bit anywhere (nonce, ciphertext, or tag) → reject.
+        let mut bad = sealed.clone();
+        let i = (splitmix(&mut seed) as usize) % bad.len();
+        bad[i] ^= 1 << (splitmix(&mut seed) % 8);
+        assert!(
+            open(&key, &bad).is_none(),
+            "round {round}: bit flip at {i} accepted"
+        );
+
+        // Truncation at a random point → reject, never panic.
+        let cut = (splitmix(&mut seed) as usize) % sealed.len();
+        assert!(open(&key, &sealed[..cut]).is_none());
     }
 }
 

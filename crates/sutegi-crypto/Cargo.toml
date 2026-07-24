@@ -6,8 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "sutegi's shared pure-std crypto primitives: SHA-256, HMAC, PBKDF2, MD5, hex, Base64, constant-time compare, OS randomness. Zero third-party dependencies, known-answer tested."
-keywords = ["sha256", "hmac", "pbkdf2", "zero-dependency"]
+description = "sutegi's shared pure-std crypto primitives: SHA-256, HMAC, PBKDF2, HKDF, ChaCha20-Poly1305 AEAD, MD5, hex, Base64, constant-time compare, OS randomness. Zero third-party dependencies, known-answer tested."
+keywords = ["sha256", "hmac", "chacha20poly1305", "hkdf", "zero-dependency"]
 categories = ["cryptography"]
 
 [dependencies]
