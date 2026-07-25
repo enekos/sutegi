@@ -127,6 +127,54 @@ pub fn unsupported(capability: &str, backend: &str) -> String {
     format!("unsupported: {capability} is not available on the {backend} backend")
 }
 
+/// A held advisory lock. Dropping the guard releases the lock — on Postgres by
+/// closing the dedicated session that holds it (which is also what makes
+/// crash-release automatic), on SQLite by removing the registry entry.
+///
+/// Exception: a guard from a Postgres *transaction* handle
+/// (`pg_advisory_xact_lock`) releases at COMMIT/ROLLBACK, not at drop — see
+/// the `Tx` impl.
+pub struct LockGuard {
+    name: String,
+    /// Whatever keeps the lock alive; dropping it releases. A dedicated PG
+    /// [`Client`], a registry token, …
+    _hold: Box<dyn std::any::Any + Send>,
+}
+
+impl LockGuard {
+    /// Wrap a backend-specific hold. For backend implementors.
+    pub fn new(name: &str, hold: Box<dyn std::any::Any + Send>) -> LockGuard {
+        LockGuard {
+            name: name.to_string(),
+            _hold: hold,
+        }
+    }
+
+    /// The lock's name as acquired.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl std::fmt::Debug for LockGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LockGuard")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+/// The 64-bit key a named lock maps to on Postgres: the first 8 bytes of
+/// SHA-256(name), big-endian. Public so an operator can inspect or take the
+/// same lock from psql: `SELECT pg_try_advisory_lock(<key>)`.
+pub fn lock_key(name: &str) -> i64 {
+    let digest = sutegi_crypto::sha256(name.as_bytes());
+    i64::from_be_bytes(digest[..8].try_into().expect("8 bytes"))
+}
+
+/// How often the default polling [`lock`](Backend::lock) re-attempts.
+const LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// A runnable execution backend behind the query builder.
 ///
 /// Implementors provide the five dialect-specific **primitives**
@@ -173,6 +221,52 @@ pub trait Backend {
     /// `App::register_capabilities`.
     fn capabilities(&self) -> BackendCaps {
         BackendCaps::none("unknown")
+    }
+
+    /// Try to take the named advisory lock. `Ok(Some(guard))` holds it until
+    /// the guard drops; `Ok(None)` means someone else holds it. Scope is the
+    /// backend's `capabilities().advisory_locks` — cluster-wide on Postgres,
+    /// process-wide on SQLite. The default errors: a backend without the
+    /// capability says so instead of pretending.
+    fn try_lock(&self, name: &str) -> Result<Option<LockGuard>, String> {
+        let _ = name;
+        Err(unsupported("advisory_locks", self.capabilities().backend))
+    }
+
+    /// Take the named lock, waiting up to `timeout`; `Ok(None)` on timeout.
+    /// Default: poll [`try_lock`](Backend::try_lock). The Postgres backend
+    /// overrides this with a server-side blocking wait.
+    fn lock(&self, name: &str, timeout: std::time::Duration) -> Result<Option<LockGuard>, String> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(guard) = self.try_lock(name)? {
+                return Ok(Some(guard));
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(LOCK_POLL_INTERVAL.min(deadline - now));
+        }
+    }
+
+    /// Run `f` while holding the named lock — the singleton-job shape:
+    /// `db.with_lock("nightly-report", timeout, || …)`. `Ok(None)` means the
+    /// lock was never acquired (someone else ran it); `f`'s error passes
+    /// through.
+    fn with_lock<T>(
+        &self,
+        name: &str,
+        timeout: std::time::Duration,
+        f: impl FnOnce() -> Result<T, String>,
+    ) -> Result<Option<T>, String>
+    where
+        Self: Sized,
+    {
+        match self.lock(name, timeout)? {
+            Some(_guard) => f().map(Some),
+            None => Ok(None),
+        }
     }
 
     /// The SQL dialect this backend speaks — the DDL emitter and diff engine

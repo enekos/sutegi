@@ -46,6 +46,12 @@ impl Pool {
         Ok(Pool::new(Config::from_env()?, max_size))
     }
 
+    /// The connection settings this pool dials with — for callers that need a
+    /// dedicated out-of-pool connection (advisory locks, LISTEN sessions).
+    pub fn config(&self) -> &Config {
+        &self.cfg
+    }
+
     /// Check a connection out, run `f`, and return the connection to the pool.
     /// A connection that errors mid-use is dropped rather than reused.
     pub fn with<T>(&self, f: impl FnOnce(&mut Client) -> Result<T, String>) -> Result<T, String> {

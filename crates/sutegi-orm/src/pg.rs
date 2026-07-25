@@ -362,12 +362,76 @@ impl Backend for Pg {
     fn capabilities(&self) -> crate::backend::BackendCaps {
         pg_caps()
     }
+
+    /// Session-scoped `pg_try_advisory_lock` on a **dedicated** connection —
+    /// not a pooled one, so a long-held lock can't starve the pool, and the
+    /// server releasing session locks when the session dies makes
+    /// crash-release automatic: dropping the guard *is* the release.
+    fn try_lock(&self, name: &str) -> Result<Option<crate::backend::LockGuard>, String> {
+        let mut client = Client::connect(self.pool.config())?;
+        if advisory_lock(
+            &mut client,
+            "SELECT pg_try_advisory_lock($1) AS locked",
+            name,
+        )? {
+            Ok(Some(crate::backend::LockGuard::new(name, Box::new(client))))
+        } else {
+            Ok(None) // dropping the client closes the session
+        }
+    }
+
+    /// Server-side blocking wait: `pg_advisory_lock` under `statement_timeout`
+    /// instead of the default client-side polling (which would redial per
+    /// attempt on this backend).
+    fn lock(
+        &self,
+        name: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Option<crate::backend::LockGuard>, String> {
+        if timeout.is_zero() {
+            return self.try_lock(name);
+        }
+        let mut client = Client::connect(self.pool.config())?;
+        let ms = timeout.as_millis().min(i64::MAX as u128);
+        client.batch(&format!("SET statement_timeout = {ms}"))?;
+        let key = crate::backend::lock_key(name);
+        // pg_advisory_lock returns void — the statement *succeeding* is the
+        // acquisition; the timeout firing while queued is the miss.
+        match client.query(
+            "SELECT pg_advisory_lock($1)",
+            &[sutegi_pg::PgValue::Int(key)],
+        ) {
+            Ok(_) => {
+                // The session lives on inside the guard; don't let the
+                // acquisition timeout cancel the holder's later statements.
+                client.batch("SET statement_timeout = 0")?;
+                Ok(Some(crate::backend::LockGuard::new(name, Box::new(client))))
+            }
+            // 57014 = query_canceled: the statement_timeout fired while
+            // queued behind the current holder.
+            Err(e) if e.contains("57014") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Run one `pg_try_advisory_*` statement for
+/// [`crate::backend::lock_key`]`(name)` and read back its boolean.
+fn advisory_lock(client: &mut Client, sql: &str, name: &str) -> Result<bool, String> {
+    let key = crate::backend::lock_key(name);
+    let rows = client.query(sql, &[sutegi_pg::PgValue::Int(key)])?;
+    Ok(rows
+        .first()
+        .and_then(|r| r.get("locked"))
+        .and_then(Json::as_bool)
+        .unwrap_or(false))
 }
 
 /// What the Postgres backend has actually shipped — shared by [`Pg`] and
 /// [`Tx`]. Bits flip here as feature milestones land.
 fn pg_caps() -> crate::backend::BackendCaps {
     crate::backend::BackendCaps {
+        advisory_locks: crate::backend::CapScope::Cluster,
         listen_notify: true,
         vector: true,
         ..crate::backend::BackendCaps::none("postgres")
@@ -446,6 +510,19 @@ impl Backend for Tx<'_> {
     fn capabilities(&self) -> crate::backend::BackendCaps {
         pg_caps()
     }
+
+    /// Transaction-scoped: `pg_try_advisory_xact_lock` on the transaction's
+    /// own connection. The lock releases at COMMIT/ROLLBACK — **not** when the
+    /// guard drops — so it composes with `transact` retries without a
+    /// dangling hold.
+    fn try_lock(&self, name: &str) -> Result<Option<crate::backend::LockGuard>, String> {
+        let locked = advisory_lock(
+            &mut self.client.borrow_mut(),
+            "SELECT pg_try_advisory_xact_lock($1) AS locked",
+            name,
+        )?;
+        Ok(locked.then(|| crate::backend::LockGuard::new(name, Box::new(()))))
+    }
 }
 
 #[cfg(test)]
@@ -459,8 +536,8 @@ mod tests {
         assert_eq!(caps.backend, "postgres");
         assert!(caps.listen_notify);
         assert!(caps.vector);
-        // Nothing else has a framework surface yet — later milestones flip these.
-        assert_eq!(caps.advisory_locks, crate::backend::CapScope::None);
+        assert_eq!(caps.advisory_locks, crate::backend::CapScope::Cluster);
+        // No framework surface yet — later milestones flip these.
         assert!(!caps.row_locks && !caps.returning_dml && !caps.json_path && !caps.fts);
     }
 

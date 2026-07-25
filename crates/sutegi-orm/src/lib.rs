@@ -26,7 +26,8 @@ mod builder;
 mod value;
 
 pub use backend::{
-    row, unsupported, Backend, BackendCaps, CapScope, FromInput, FromRow, Model, Transactional,
+    lock_key, row, unsupported, Backend, BackendCaps, CapScope, FromInput, FromRow, LockGuard,
+    Model, Transactional,
 };
 pub use builder::{DeleteBuilder, Page, QueryBuilder, UpdateBuilder};
 pub use value::{

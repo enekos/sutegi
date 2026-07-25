@@ -32,6 +32,42 @@ enum Source {
     File(String),
 }
 
+impl Source {
+    /// The advisory-lock namespace this database belongs to: two `Db` handles
+    /// on the same file contend for the same names; unrelated databases in the
+    /// same process don't. In-memory databases are private by construction, so
+    /// each pool gets its own namespace.
+    fn lock_namespace(&self) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static MEM_SEQ: AtomicU64 = AtomicU64::new(0);
+        match self {
+            Source::Memory => format!("mem:{}", MEM_SEQ.fetch_add(1, Ordering::Relaxed)),
+            Source::File(path) => format!("file:{path}"),
+        }
+    }
+}
+
+/// The process-wide advisory-lock registry: `namespace ‖ name` entries held by
+/// live [`crate::backend::LockGuard`]s. SQLite has no server to coordinate
+/// through, so the reach is one OS process (`CapScope::Process`) — the honest
+/// analog of Postgres session locks for the single-node store.
+fn lock_registry() -> &'static Mutex<std::collections::HashSet<String>> {
+    use std::sync::OnceLock;
+    static REGISTRY: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Removes its registry entry on drop — the hold inside a SQLite lock guard.
+struct RegistryToken {
+    key: String,
+}
+
+impl Drop for RegistryToken {
+    fn drop(&mut self) {
+        lock_registry().lock().unwrap().remove(&self.key);
+    }
+}
+
 struct Inner {
     /// Idle, ready-to-use connections.
     idle: Vec<Connection>,
@@ -44,12 +80,15 @@ struct Inner {
 struct SqlitePool {
     source: Source,
     max_size: usize,
+    /// Advisory-lock namespace — computed once (memory ids are sequential).
+    lock_ns: String,
     state: (Mutex<Inner>, Condvar),
 }
 
 impl SqlitePool {
     fn new(source: Source, max_size: usize) -> SqlitePool {
         SqlitePool {
+            lock_ns: source.lock_namespace(),
             source,
             max_size: max_size.max(1),
             state: (
@@ -426,10 +465,29 @@ impl Backend for Db {
     }
 
     fn capabilities(&self) -> crate::backend::BackendCaps {
-        // All-off on purpose: bundled SQLite ships JSON1/FTS5/RETURNING, but a
-        // capability describes the *framework surface*, and none of those have
-        // one yet. Bits flip here as feature milestones land.
-        crate::backend::BackendCaps::none("sqlite")
+        // Mostly-off on purpose: bundled SQLite ships JSON1/FTS5/RETURNING,
+        // but a capability describes the *framework surface*, and those have
+        // none yet. Bits flip here as feature milestones land.
+        crate::backend::BackendCaps {
+            advisory_locks: crate::backend::CapScope::Process,
+            ..crate::backend::BackendCaps::none("sqlite")
+        }
+    }
+
+    /// Process-scoped named locks via the registry: two `Db` handles on the
+    /// same file contend, unrelated databases don't. See
+    /// [`Source::lock_namespace`].
+    fn try_lock(&self, name: &str) -> Result<Option<crate::backend::LockGuard>, String> {
+        let key = format!("{}\u{1f}{name}", self.pool.lock_ns);
+        let mut held = lock_registry().lock().unwrap();
+        if held.contains(&key) {
+            return Ok(None);
+        }
+        held.insert(key.clone());
+        Ok(Some(crate::backend::LockGuard::new(
+            name,
+            Box::new(RegistryToken { key }),
+        )))
     }
 }
 
@@ -453,6 +511,12 @@ impl Backend for Tx<'_> {
     fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Json>, String> {
         let conn = self.conn.borrow();
         query_conn(&conn, sql, params)
+    }
+
+    /// Same store, same honesty — but no advisory locks from inside a
+    /// transaction handle (take them on the [`Db`] before `transaction()`).
+    fn capabilities(&self) -> crate::backend::BackendCaps {
+        crate::backend::BackendCaps::none("sqlite")
     }
 
     fn execute(&self, sql: &str, params: &[Value]) -> Result<usize, String> {
@@ -526,12 +590,56 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_capabilities_are_all_off_for_now() {
+    fn sqlite_capabilities_advertise_process_locks_only() {
         let db = Db::memory().unwrap();
-        assert_eq!(
-            db.capabilities(),
-            crate::backend::BackendCaps::none("sqlite")
-        );
+        let caps = db.capabilities();
+        assert_eq!(caps.advisory_locks, crate::backend::CapScope::Process);
+        assert!(!caps.listen_notify && !caps.fts && !caps.json_path);
+    }
+
+    #[test]
+    fn advisory_locks_exclude_within_a_namespace() {
+        let db = Db::memory().unwrap();
+        let guard = db.try_lock("job").unwrap().expect("first acquire");
+        assert_eq!(guard.name(), "job");
+        // Same handle and a clone both see it held.
+        assert!(db.try_lock("job").unwrap().is_none());
+        assert!(db.clone().try_lock("job").unwrap().is_none());
+        // Another name is free; another (memory) database is a new namespace.
+        assert!(db.try_lock("other").unwrap().is_some());
+        assert!(Db::memory().unwrap().try_lock("job").unwrap().is_some());
+        // Dropping the guard releases.
+        drop(guard);
+        assert!(db.try_lock("job").unwrap().is_some());
+    }
+
+    #[test]
+    fn advisory_locks_share_a_namespace_per_file() {
+        let dir = std::env::temp_dir().join(format!("sutegi-locks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("locks.db");
+        let path = path.to_str().unwrap();
+        let a = Db::open(path).unwrap();
+        let b = Db::open(path).unwrap(); // an independent pool on the same file
+        let _guard = a.try_lock("job").unwrap().expect("first acquire");
+        assert!(b.try_lock("job").unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn with_lock_times_out_as_none() {
+        let db = Db::memory().unwrap();
+        let _held = db.try_lock("busy").unwrap().unwrap();
+        let ran = db
+            .with_lock("busy", std::time::Duration::from_millis(60), || Ok(true))
+            .unwrap();
+        assert_eq!(ran, None);
+        // And runs once the holder is gone.
+        drop(_held);
+        let ran = db
+            .with_lock("busy", std::time::Duration::from_millis(60), || Ok(true))
+            .unwrap();
+        assert_eq!(ran, Some(true));
     }
 
     #[test]
