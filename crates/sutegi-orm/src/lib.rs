@@ -46,6 +46,11 @@ pub mod schema_diff;
 /// [`embedding`] legs. See [`search::setup`] / [`search::search`].
 pub mod search;
 
+/// Reactive queries: [`watch::Watcher`] turns a query into an initial result
+/// plus pushed [`watch::Change`] diffs — cluster-scoped over LISTEN/NOTIFY on
+/// Postgres, process-scoped over `update_hook` on SQLite.
+pub mod watch;
+
 /// Versioned, up/down migrations with a `_sutegi_migrations` history table,
 /// over any [`Backend`].
 pub mod migrate;

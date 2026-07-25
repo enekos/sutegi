@@ -77,11 +77,18 @@ struct Inner {
 
 /// A small blocking SQLite connection pool. Connections are opened lazily up to
 /// `max_size` and returned on checkin.
+/// A table-change callback installed on every pooled connection — the
+/// SQLite leg of [`crate::watch`]. Boxed so the pool stays hook-agnostic.
+type ChangeHook = Arc<dyn Fn(&str) + Send + Sync>;
+
 struct SqlitePool {
     source: Source,
     max_size: usize,
     /// Advisory-lock namespace — computed once (memory ids are sequential).
     lock_ns: String,
+    /// Change hook applied to current + future connections (see
+    /// [`Db::set_change_hook`]).
+    change_hook: Mutex<Option<ChangeHook>>,
     state: (Mutex<Inner>, Condvar),
 }
 
@@ -91,6 +98,7 @@ impl SqlitePool {
             lock_ns: source.lock_namespace(),
             source,
             max_size: max_size.max(1),
+            change_hook: Mutex::new(None),
             state: (
                 Mutex::new(Inner {
                     idle: Vec::new(),
@@ -117,7 +125,21 @@ impl SqlitePool {
         // default LRU holds 16). Schema changes are safe: prepare_v2
         // re-prepares stale statements transparently.
         conn.set_prepared_statement_cache_capacity(64);
+        if let Some(hook) = self.change_hook.lock().unwrap().clone() {
+            install_change_hook(&conn, hook);
+        }
         Ok(conn)
+    }
+
+    /// Install `hook` on every current idle connection and on all future
+    /// ones. A connection checked out across this call picks the hook up on
+    /// its next checkout (documented in [`crate::watch`]).
+    fn set_change_hook(&self, hook: ChangeHook) {
+        *self.change_hook.lock().unwrap() = Some(hook.clone());
+        let inner = self.state.0.lock().unwrap();
+        for conn in &inner.idle {
+            install_change_hook(conn, hook.clone());
+        }
     }
 
     /// Check a connection out, run `f`, and return it to the pool. A connection
@@ -162,6 +184,15 @@ impl SqlitePool {
     }
 }
 
+/// Wire rusqlite's `update_hook` to a [`ChangeHook`]: the callback fires
+/// synchronously inside every INSERT/UPDATE/DELETE on this connection with
+/// the table name — the watcher fans it out from there.
+fn install_change_hook(conn: &Connection, hook: ChangeHook) {
+    let _ = conn.update_hook(Some(move |_action, _db: &str, table: &str, _rowid: i64| {
+        hook(table)
+    }));
+}
+
 /// A pooled SQLite handle: cheap to [`clone`](Clone), `Send + Sync`, and a
 /// [`Backend`]. Share it across worker threads by cloning (it's an `Arc`
 /// inside) or by handing it to [`App::state`](../../sutegi_web/struct.App.html).
@@ -196,6 +227,15 @@ impl Db {
         // Fail fast if the file can't be opened / WAL can't be set.
         db.pool.with(|_| Ok(()))?;
         Ok(db)
+    }
+
+    /// Register a table-change callback on every pooled connection (current
+    /// and future) — the SQLite leg of [`crate::watch`]. The callback fires
+    /// synchronously inside each write on this process's pool; writes from
+    /// *other* processes on the same file are invisible (`live_queries:
+    /// process` — believe the capability).
+    pub fn set_change_hook(&self, hook: std::sync::Arc<dyn Fn(&str) + Send + Sync>) {
+        self.pool.set_change_hook(hook);
     }
 
     /// Open the file named by the `env_key` environment variable, or fall back
@@ -502,6 +542,7 @@ impl Backend for Db {
             returning_dml: true,
             json_path: true,
             fts: true,
+            live_queries: crate::backend::CapScope::Process,
             ..crate::backend::BackendCaps::none("sqlite")
         }
     }

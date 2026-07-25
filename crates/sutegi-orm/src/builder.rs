@@ -474,6 +474,12 @@ impl QueryBuilder {
         self.row_lock
     }
 
+    /// The table this query selects from — read by [`crate::watch`] to route
+    /// change notifications.
+    pub fn table_name(&self) -> &str {
+        &self.table
+    }
+
     pub fn select(mut self, cols: &[&str]) -> QueryBuilder {
         for c in cols {
             check_ident(&mut self.err, "column", c);
@@ -616,32 +622,43 @@ impl QueryBuilder {
             return Err(e.clone());
         }
         // Projection: named columns (or *), then JSON projections. Their
-        // bound paths are the first parameters, ahead of WHERE values.
+        // bound paths are the first parameters, ahead of WHERE values. The
+        // JSON-free fast path avoids cloning the column list — build() runs
+        // on every query.
         let mut params = Vec::new();
-        let mut cols = if self.columns.is_empty() {
-            vec!["*".to_string()]
+        let cols = if self.json_selects.is_empty() {
+            if self.columns.is_empty() {
+                "*".to_string()
+            } else {
+                self.columns.join(", ")
+            }
         } else {
-            self.columns.clone()
-        };
-        for (col, segs, alias) in &self.json_selects {
-            match dialect {
-                Dialect::Sqlite => {
-                    params.push(Value::Text(sqlite_json_path(segs)));
-                    cols.push(format!("json_extract({col}, ?) AS {alias}"));
-                }
-                Dialect::Postgres => {
-                    params.push(Value::Text(pg_json_path_array(segs)));
-                    cols.push(format!("{col} #>> ? AS {alias}"));
+            let mut cols = if self.columns.is_empty() {
+                vec!["*".to_string()]
+            } else {
+                self.columns.clone()
+            };
+            for (col, segs, alias) in &self.json_selects {
+                match dialect {
+                    Dialect::Sqlite => {
+                        params.push(Value::Text(sqlite_json_path(segs)));
+                        cols.push(format!("json_extract({col}, ?) AS {alias}"));
+                    }
+                    Dialect::Postgres => {
+                        params.push(Value::Text(pg_json_path_array(segs)));
+                        cols.push(format!("{col} #>> ? AS {alias}"));
+                    }
                 }
             }
-        }
+            cols.join(", ")
+        };
         let distinct = if self.distinct { "DISTINCT " } else { "" };
         let (where_sql, where_params) = render_predicates(&self.preds, dialect)?;
         params.extend(where_params);
         let mut sql = format!(
             "SELECT {}{} FROM {}{}",
             distinct,
-            cols.join(", "),
+            cols,
             self.build_from_and_joins(),
             where_sql
         );

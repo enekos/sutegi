@@ -519,6 +519,7 @@ fn pg_caps() -> crate::backend::BackendCaps {
         fts: true,
         listen_notify: true,
         vector: true,
+        live_queries: crate::backend::CapScope::Cluster,
         ..crate::backend::BackendCaps::none("postgres")
     }
 }
@@ -633,8 +634,7 @@ mod tests {
         assert!(caps.row_locks && caps.skip_locked && caps.isolation_levels);
         assert!(caps.returning_dml && caps.bulk_copy);
         assert!(caps.json_path && caps.json_contains && caps.fts);
-        // No framework surface yet — the reactive milestone flips this.
-        assert_eq!(caps.live_queries, crate::backend::CapScope::None);
+        assert_eq!(caps.live_queries, crate::backend::CapScope::Cluster);
     }
 
     #[test]
