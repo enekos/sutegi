@@ -501,6 +501,7 @@ impl Backend for Db {
             isolation_levels: true,
             returning_dml: true,
             json_path: true,
+            fts: true,
             ..crate::backend::BackendCaps::none("sqlite")
         }
     }
@@ -559,6 +560,7 @@ impl Backend for Tx<'_> {
         crate::backend::BackendCaps {
             returning_dml: true,
             json_path: true,
+            fts: true,
             ..crate::backend::BackendCaps::none("sqlite")
         }
     }
@@ -638,8 +640,8 @@ mod tests {
         let db = Db::memory().unwrap();
         let caps = db.capabilities();
         assert_eq!(caps.advisory_locks, crate::backend::CapScope::Process);
-        assert!(caps.json_path && !caps.json_contains);
-        assert!(!caps.listen_notify && !caps.fts);
+        assert!(caps.json_path && caps.fts && !caps.json_contains);
+        assert!(!caps.listen_notify);
     }
 
     #[test]

@@ -41,6 +41,11 @@ pub use value::{
 /// shadow schema. No I/O — it operates on [`TableSchema`] values.
 pub mod schema_diff;
 
+/// Full-text + hybrid search over any [`Backend`]: one grammar, `tsvector`
+/// on Postgres / FTS5 on SQLite, and reciprocal-rank fusion with the
+/// [`embedding`] legs. See [`search::setup`] / [`search::search`].
+pub mod search;
+
 /// Versioned, up/down migrations with a `_sutegi_migrations` history table,
 /// over any [`Backend`].
 pub mod migrate;

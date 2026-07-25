@@ -339,6 +339,7 @@ pub struct App {
     ops_guard: Option<Middleware>,
     models: Vec<Json>,
     capabilities: Option<Json>,
+    search: Vec<Json>,
     tools: Vec<Json>,
     tool_defs: Vec<ToolDef>,
     state: StateMap,
@@ -410,6 +411,7 @@ impl App {
             ops_guard: None,
             models: Vec::new(),
             capabilities: None,
+            search: Vec::new(),
             tools: Vec::new(),
             tool_defs: Vec::new(),
             state: StateMap::new(),
@@ -743,6 +745,20 @@ impl App {
         self
     }
 
+    /// Record a full-text-searchable table for introspection: `/__introspect`
+    /// gains a `search` entry naming the table and its searched columns, so an
+    /// agent can discover what's searchable without source access.
+    pub fn register_search(mut self, table: &str, cols: &[&str]) -> App {
+        self.search.push(Json::obj(vec![
+            ("table", Json::str(table)),
+            (
+                "columns",
+                Json::arr(cols.iter().map(|c| Json::str(*c)).collect()),
+            ),
+        ]));
+        self
+    }
+
     /// Build the JSON description of the entire application surface.
     fn introspection(&self) -> Json {
         let routes = self
@@ -775,6 +791,9 @@ impl App {
         ];
         if let Some(caps) = &self.capabilities {
             doc.push(("capabilities", caps.clone()));
+        }
+        if !self.search.is_empty() {
+            doc.push(("search", Json::arr(self.search.clone())));
         }
         Json::obj(doc)
     }
@@ -1833,6 +1852,24 @@ mod tests {
             block.get("advisory_locks").and_then(Json::as_str),
             Some("none")
         );
+    }
+
+    #[test]
+    fn introspection_lists_registered_search_tables() {
+        let intro = App::new("t")
+            .register_search("docs", &["title", "body"])
+            .introspection();
+        let entries = intro.get("search").and_then(Json::as_array).unwrap();
+        assert_eq!(entries[0].get("table").and_then(Json::as_str), Some("docs"));
+        assert_eq!(
+            entries[0]
+                .get("columns")
+                .and_then(Json::as_array)
+                .map(|c| c.len()),
+            Some(2)
+        );
+        // Absent when nothing registered.
+        assert!(App::new("t").introspection().get("search").is_none());
     }
 
     #[test]
