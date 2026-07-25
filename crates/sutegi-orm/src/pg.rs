@@ -358,6 +358,20 @@ impl Backend for Pg {
     fn dialect(&self) -> Dialect {
         Dialect::Postgres
     }
+
+    fn capabilities(&self) -> crate::backend::BackendCaps {
+        pg_caps()
+    }
+}
+
+/// What the Postgres backend has actually shipped — shared by [`Pg`] and
+/// [`Tx`]. Bits flip here as feature milestones land.
+fn pg_caps() -> crate::backend::BackendCaps {
+    crate::backend::BackendCaps {
+        listen_notify: true,
+        vector: true,
+        ..crate::backend::BackendCaps::none("postgres")
+    }
 }
 
 impl crate::backend::Transactional for Pg {
@@ -428,12 +442,27 @@ impl Backend for Tx<'_> {
     fn dialect(&self) -> Dialect {
         Dialect::Postgres
     }
+
+    fn capabilities(&self) -> crate::backend::BackendCaps {
+        pg_caps()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::value::{ColType, Column};
+
+    #[test]
+    fn pg_capabilities_advertise_shipped_features_only() {
+        let caps = pg_caps();
+        assert_eq!(caps.backend, "postgres");
+        assert!(caps.listen_notify);
+        assert!(caps.vector);
+        // Nothing else has a framework surface yet — later milestones flip these.
+        assert_eq!(caps.advisory_locks, crate::backend::CapScope::None);
+        assert!(!caps.row_locks && !caps.returning_dml && !caps.json_path && !caps.fts);
+    }
 
     #[test]
     fn placeholder_translation() {

@@ -15,6 +15,118 @@ use crate::builder::{DeleteBuilder, Page, QueryBuilder, UpdateBuilder};
 use crate::value::{TableSchema, Value};
 use sutegi_json::Json;
 
+/// How far a coordination guarantee reaches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapScope {
+    /// Not available on this backend.
+    None,
+    /// Holds within one OS process (e.g. SQLite named locks).
+    Process,
+    /// Holds across every pod sharing the database (e.g. Postgres advisory
+    /// locks).
+    Cluster,
+}
+
+impl CapScope {
+    /// The stable string form used in `/__introspect`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CapScope::None => "none",
+            CapScope::Process => "process",
+            CapScope::Cluster => "cluster",
+        }
+    }
+}
+
+/// What a [`Backend`] can actually do beyond the core query/execute surface —
+/// coordination, DML extras, documents/search, realtime. Callers (and agents,
+/// via the `capabilities` block in `/__introspect`) read this **before**
+/// reaching for a feature instead of finding out from a dialect SQL error.
+///
+/// A capability describes the *framework surface*, not the underlying C
+/// library: SQLite ships JSON1/FTS5/RETURNING, but the bit stays off until
+/// sutegi exposes the feature through the builder/`Backend`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BackendCaps {
+    /// Which store this is: `"sqlite"`, `"postgres"`, or an impl-defined name.
+    pub backend: &'static str,
+    // --- coordination ---
+    /// Named advisory locks (`lock`/`try_lock`) and how far they reach.
+    pub advisory_locks: CapScope,
+    /// Row-level locking clauses (`FOR UPDATE` / `FOR SHARE`).
+    pub row_locks: bool,
+    /// `SKIP LOCKED` / `NOWAIT` on row-locking reads.
+    pub skip_locked: bool,
+    /// Explicit isolation levels on transactions.
+    pub isolation_levels: bool,
+    // --- dml ---
+    /// `RETURNING` on UPDATE / DELETE builders.
+    pub returning_dml: bool,
+    /// A native bulk-insert path (e.g. Postgres `COPY FROM STDIN`).
+    pub bulk_copy: bool,
+    // --- documents & search ---
+    /// JSON path queries (`where_json` / `select_json`).
+    pub json_path: bool,
+    /// JSON containment (`@>`-style `where_json_contains`).
+    pub json_contains: bool,
+    /// Full-text search (`tsvector` / FTS5) through the builder.
+    pub fts: bool,
+    // --- realtime & vectors ---
+    /// `LISTEN`/`NOTIFY`-style push wakeups.
+    pub listen_notify: bool,
+    /// Vector (embedding) columns and nearest-neighbor pushdown.
+    pub vector: bool,
+    /// Watched queries (`watch()`) and how far change delivery reaches.
+    pub live_queries: CapScope,
+}
+
+impl BackendCaps {
+    /// Everything off — the honest default for a backend that has declared
+    /// nothing. Named overrides start from this and flip what they support.
+    pub fn none(backend: &'static str) -> BackendCaps {
+        BackendCaps {
+            backend,
+            advisory_locks: CapScope::None,
+            row_locks: false,
+            skip_locked: false,
+            isolation_levels: false,
+            returning_dml: false,
+            bulk_copy: false,
+            json_path: false,
+            json_contains: false,
+            fts: false,
+            listen_notify: false,
+            vector: false,
+            live_queries: CapScope::None,
+        }
+    }
+
+    /// The stable JSON form served under `capabilities` in `/__introspect`.
+    pub fn to_json(&self) -> Json {
+        Json::obj(vec![
+            ("advisory_locks", Json::str(self.advisory_locks.as_str())),
+            ("backend", Json::str(self.backend)),
+            ("bulk_copy", Json::Bool(self.bulk_copy)),
+            ("fts", Json::Bool(self.fts)),
+            ("isolation_levels", Json::Bool(self.isolation_levels)),
+            ("json_contains", Json::Bool(self.json_contains)),
+            ("json_path", Json::Bool(self.json_path)),
+            ("listen_notify", Json::Bool(self.listen_notify)),
+            ("live_queries", Json::str(self.live_queries.as_str())),
+            ("returning_dml", Json::Bool(self.returning_dml)),
+            ("row_locks", Json::Bool(self.row_locks)),
+            ("skip_locked", Json::Bool(self.skip_locked)),
+            ("vector", Json::Bool(self.vector)),
+        ])
+    }
+}
+
+/// The uniform error for reaching past a backend's capabilities — features
+/// gate on [`BackendCaps`] and return this instead of a dialect SQL error.
+pub fn unsupported(capability: &str, backend: &str) -> String {
+    format!("unsupported: {capability} is not available on the {backend} backend")
+}
+
 /// A runnable execution backend behind the query builder.
 ///
 /// Implementors provide the five dialect-specific **primitives**
@@ -53,6 +165,15 @@ pub trait Backend {
 
     /// Create a table from a schema if it does not already exist.
     fn migrate(&self, schema: &TableSchema) -> Result<(), String>;
+
+    /// What this backend can do beyond the core surface — see [`BackendCaps`].
+    /// Defaults to all-off (`BackendCaps::none("unknown")`) so a backend never
+    /// advertises what it hasn't implemented; the bundled SQLite and Postgres
+    /// backends override it. Surface it to agents via
+    /// `App::register_capabilities`.
+    fn capabilities(&self) -> BackendCaps {
+        BackendCaps::none("unknown")
+    }
 
     /// The SQL dialect this backend speaks — the DDL emitter and diff engine
     /// need it to render the right statements. Defaults to SQLite; the Postgres
@@ -531,5 +652,56 @@ mod tests {
         let page = mem.paginate(&QueryBuilder::table("t"), 1, 10).unwrap();
         assert_eq!(page.total, 2);
         assert_eq!(page.items.len(), 2);
+    }
+
+    #[test]
+    fn capabilities_default_is_all_off() {
+        // A backend that declares nothing advertises nothing.
+        struct Bare;
+        impl Backend for Bare {
+            fn query(&self, _: &str, _: &[Value]) -> Result<Vec<Json>, String> {
+                Ok(Vec::new())
+            }
+            fn execute(&self, _: &str, _: &[Value]) -> Result<usize, String> {
+                Ok(0)
+            }
+            fn insert(&self, _: &str, _: &[(&str, Value)], _: &str) -> Result<i64, String> {
+                Ok(0)
+            }
+            fn upsert(
+                &self,
+                _: &str,
+                _: &[(&str, Value)],
+                _: &str,
+                _: &str,
+            ) -> Result<i64, String> {
+                Ok(0)
+            }
+            fn migrate(&self, _: &TableSchema) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let caps = Bare.capabilities();
+        assert_eq!(caps, BackendCaps::none("unknown"));
+        assert_eq!(caps.advisory_locks, CapScope::None);
+        assert!(!caps.listen_notify);
+    }
+
+    #[test]
+    fn capabilities_json_shape_is_stable() {
+        let json = BackendCaps::none("postgres").to_json().to_string();
+        // Alphabetical keys; scopes as strings, features as booleans.
+        assert!(json.starts_with("{\"advisory_locks\":\"none\",\"backend\":\"postgres\""));
+        assert!(json.contains("\"listen_notify\":false"));
+        assert!(json.contains("\"live_queries\":\"none\""));
+    }
+
+    #[test]
+    fn unsupported_error_names_capability_and_backend() {
+        assert_eq!(
+            unsupported("advisory_locks", "sqlite"),
+            "unsupported: advisory_locks is not available on the sqlite backend"
+        );
     }
 }

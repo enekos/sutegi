@@ -424,6 +424,13 @@ impl Backend for Db {
     fn introspect(&self) -> Result<Vec<TableSchema>, String> {
         self.pool.with(|conn| introspect_sqlite(conn))
     }
+
+    fn capabilities(&self) -> crate::backend::BackendCaps {
+        // All-off on purpose: bundled SQLite ships JSON1/FTS5/RETURNING, but a
+        // capability describes the *framework surface*, and none of those have
+        // one yet. Bits flip here as feature milestones land.
+        crate::backend::BackendCaps::none("sqlite")
+    }
 }
 
 impl crate::backend::Transactional for Db {
@@ -516,6 +523,15 @@ mod tests {
             .column(Column::new("id", ColType::Integer).primary())
             .column(Column::new("title", ColType::Text))
             .column(Column::new("done", ColType::Boolean))
+    }
+
+    #[test]
+    fn sqlite_capabilities_are_all_off_for_now() {
+        let db = Db::memory().unwrap();
+        assert_eq!(
+            db.capabilities(),
+            crate::backend::BackendCaps::none("sqlite")
+        );
     }
 
     #[test]

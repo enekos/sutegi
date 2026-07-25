@@ -25,7 +25,9 @@ mod backend;
 mod builder;
 mod value;
 
-pub use backend::{row, Backend, FromInput, FromRow, Model, Transactional};
+pub use backend::{
+    row, unsupported, Backend, BackendCaps, CapScope, FromInput, FromRow, Model, Transactional,
+};
 pub use builder::{DeleteBuilder, Page, QueryBuilder, UpdateBuilder};
 pub use value::{
     create_table_sql, default_sql, parse_default_literal, schema_from_json, schema_json,
