@@ -514,6 +514,8 @@ fn pg_caps() -> crate::backend::BackendCaps {
         isolation_levels: true,
         returning_dml: true,
         bulk_copy: true,
+        json_path: true,
+        json_contains: true,
         listen_notify: true,
         vector: true,
         ..crate::backend::BackendCaps::none("postgres")
@@ -629,8 +631,9 @@ mod tests {
         assert_eq!(caps.advisory_locks, crate::backend::CapScope::Cluster);
         assert!(caps.row_locks && caps.skip_locked && caps.isolation_levels);
         assert!(caps.returning_dml && caps.bulk_copy);
+        assert!(caps.json_path && caps.json_contains);
         // No framework surface yet — later milestones flip these.
-        assert!(!caps.json_path && !caps.json_contains && !caps.fts);
+        assert!(!caps.fts);
         assert_eq!(caps.live_queries, crate::backend::CapScope::None);
     }
 

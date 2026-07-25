@@ -500,6 +500,7 @@ impl Backend for Db {
             advisory_locks: crate::backend::CapScope::Process,
             isolation_levels: true,
             returning_dml: true,
+            json_path: true,
             ..crate::backend::BackendCaps::none("sqlite")
         }
     }
@@ -557,6 +558,7 @@ impl Backend for Tx<'_> {
     fn capabilities(&self) -> crate::backend::BackendCaps {
         crate::backend::BackendCaps {
             returning_dml: true,
+            json_path: true,
             ..crate::backend::BackendCaps::none("sqlite")
         }
     }
@@ -636,7 +638,8 @@ mod tests {
         let db = Db::memory().unwrap();
         let caps = db.capabilities();
         assert_eq!(caps.advisory_locks, crate::backend::CapScope::Process);
-        assert!(!caps.listen_notify && !caps.fts && !caps.json_path);
+        assert!(caps.json_path && !caps.json_contains);
+        assert!(!caps.listen_notify && !caps.fts);
     }
 
     #[test]
@@ -747,6 +750,74 @@ mod tests {
         let n = db.insert_many("todos", &["title", "done"], &rows).unwrap();
         assert_eq!(n, 777);
         assert_eq!(db.count(&QueryBuilder::table("todos")).unwrap(), 777);
+    }
+
+    #[test]
+    fn json_path_queries_round_trip() {
+        use crate::value::ColType;
+        let db = Db::memory().unwrap();
+        db.migrate(
+            &TableSchema::new("docs")
+                .column(Column::new("id", ColType::Integer).primary())
+                .column(Column::new("meta", ColType::Json)),
+        )
+        .unwrap();
+        let doc = |views: i64, kind: &str| {
+            Value::Json(Json::obj(vec![
+                ("kind", Json::str(kind)),
+                ("stats", Json::obj(vec![("views", Json::int(views))])),
+            ]))
+        };
+        db.insert("docs", &[("meta", doc(9, "post"))], "id")
+            .unwrap();
+        db.insert("docs", &[("meta", doc(100, "post"))], "id")
+            .unwrap();
+        db.insert("docs", &[("meta", doc(3, "page"))], "id")
+            .unwrap();
+
+        // Numeric comparison happens as numbers (9 < 100, not "9" > "100").
+        let hot = db
+            .select(&QueryBuilder::table("docs").where_json(
+                "meta",
+                "$.stats.views",
+                ">",
+                Value::Int(50),
+            ))
+            .unwrap();
+        assert_eq!(hot.len(), 1);
+
+        // Projection + count through the same dialect-aware path.
+        let projected = db
+            .select(
+                &QueryBuilder::table("docs")
+                    .select(&["id"])
+                    .select_json("meta", "$.kind", "kind")
+                    .order_by("id", false),
+            )
+            .unwrap();
+        assert_eq!(
+            projected[0].get("kind").and_then(Json::as_str),
+            Some("post")
+        );
+        assert_eq!(
+            db.count(&QueryBuilder::table("docs").where_json(
+                "meta",
+                "$.kind",
+                "=",
+                Value::Text("post".into()),
+            ))
+            .unwrap(),
+            2
+        );
+
+        // Containment is honestly unsupported here.
+        let err = db
+            .select(
+                &QueryBuilder::table("docs")
+                    .where_json_contains("meta", Json::obj(vec![("kind", Json::str("post"))])),
+            )
+            .unwrap_err();
+        assert!(err.contains("json_contains"), "{err}");
     }
 
     #[test]

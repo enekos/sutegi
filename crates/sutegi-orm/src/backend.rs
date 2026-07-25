@@ -354,13 +354,17 @@ pub trait Backend {
 
     // --- default methods (shared, implemented via the primitives) ---
 
-    /// Run a query builder and return rows as JSON objects. A requested
-    /// row-lock clause is emitted here — per this backend's dialect and
-    /// capabilities — so `build()` stays dialect-blind.
+    /// Run a query builder and return rows as JSON objects. Dialect-specific
+    /// pieces are resolved here — row-lock clauses and JSON path SQL — so
+    /// `build()` stays dialect-blind.
     fn select(&self, qb: &QueryBuilder) -> Result<Vec<Json>, String> {
-        let (mut sql, params) = qb.build()?;
+        let caps = self.capabilities();
+        if qb.uses_json() && !caps.json_path {
+            return Err(unsupported("json_path", caps.backend));
+        }
+        let (mut sql, params) = qb.build_for(self.dialect())?;
         if let Some(lock) = qb.row_lock() {
-            sql.push_str(&row_lock_sql(lock, &self.capabilities())?);
+            sql.push_str(&row_lock_sql(lock, &caps)?);
         }
         self.query(&sql, &params)
     }
@@ -428,7 +432,11 @@ pub trait Backend {
 
     /// Count rows matching a query builder (uses its `build_count`).
     fn count(&self, qb: &QueryBuilder) -> Result<i64, String> {
-        let (sql, params) = qb.build_count()?;
+        let caps = self.capabilities();
+        if qb.uses_json() && !caps.json_path {
+            return Err(unsupported("json_path", caps.backend));
+        }
+        let (sql, params) = qb.build_count_for(self.dialect())?;
         Ok(self
             .query_one(&sql, &params)?
             .and_then(|r| r.get("count").and_then(|j| j.as_f64()))

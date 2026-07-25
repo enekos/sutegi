@@ -3,7 +3,7 @@
 //! ordered bound parameters; each backend translates placeholders to its own
 //! dialect (SQLite keeps `?`, Postgres rewrites to `$1, $2, …`).
 
-use crate::value::Value;
+use crate::value::{Dialect, Value};
 
 /// Validate a SQL **identifier** (table or column name) that the builder
 /// interpolates directly into SQL. Identifiers cannot be bound as parameters,
@@ -97,28 +97,147 @@ pub fn validate_write_idents(
     Ok(())
 }
 
+/// One segment of a parsed JSON path: an object key or an array index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JsonSeg {
+    Key(String),
+    Index(u64),
+}
+
+/// Parse the supported JSONPath subset — `$.key.nested[0].deeper` — into
+/// segments. Deliberately a subset (identifier keys + `[n]` indexes): exotic
+/// keys need per-engine quoting rules; identifiers compile everywhere. The
+/// compiled path is always **bound as a parameter**, never spliced, but the
+/// parse also gives builder-time errors instead of engine ones.
+pub fn parse_json_path(path: &str) -> Result<Vec<JsonSeg>, String> {
+    let bad = |why: &str| Err(format!("invalid json path {path:?}: {why}"));
+    let Some(mut rest) = path.strip_prefix('$') else {
+        return bad("must start with $");
+    };
+    let mut segs = Vec::new();
+    while !rest.is_empty() {
+        if let Some(r) = rest.strip_prefix('.') {
+            let end = r
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(r.len());
+            if end == 0 {
+                return bad("empty key");
+            }
+            let key = &r[..end];
+            if !key.as_bytes()[0].is_ascii_alphabetic() && key.as_bytes()[0] != b'_' {
+                return bad("keys must start with a letter or _");
+            }
+            segs.push(JsonSeg::Key(key.to_string()));
+            rest = &r[end..];
+        } else if let Some(r) = rest.strip_prefix('[') {
+            let Some(close) = r.find(']') else {
+                return bad("unclosed [");
+            };
+            let n: u64 = match r[..close].parse() {
+                Ok(n) => n,
+                Err(_) => return bad("index must be a non-negative integer"),
+            };
+            segs.push(JsonSeg::Index(n));
+            rest = &r[close + 1..];
+        } else {
+            return bad("expected . or [");
+        }
+    }
+    if segs.is_empty() {
+        return bad("path has no segments");
+    }
+    Ok(segs)
+}
+
+/// The canonical SQLite JSON1 path string for parsed segments (`$.a.b[0]`).
+fn sqlite_json_path(segs: &[JsonSeg]) -> String {
+    let mut out = String::from("$");
+    for s in segs {
+        match s {
+            JsonSeg::Key(k) => {
+                out.push('.');
+                out.push_str(k);
+            }
+            JsonSeg::Index(n) => out.push_str(&format!("[{n}]")),
+        }
+    }
+    out
+}
+
+/// The Postgres `text[]` literal for parsed segments (`{a,b,0}`), for
+/// binding to `#>>`. Segment characters are parser-restricted, so no array
+/// quoting is ever needed.
+fn pg_json_path_array(segs: &[JsonSeg]) -> String {
+    let parts: Vec<String> = segs
+        .iter()
+        .map(|s| match s {
+            JsonSeg::Key(k) => k.clone(),
+            JsonSeg::Index(n) => n.to_string(),
+        })
+        .collect();
+    format!("{{{}}}", parts.join(","))
+}
+
 /// A single `WHERE` predicate, shared by the SELECT/UPDATE/DELETE builders.
 /// Predicates are joined with `AND`; use [`Predicate::Or`] for an OR group.
 #[derive(Clone, Debug)]
 enum Predicate {
-    Cmp(String, String, Value),       // col op ?
-    In(String, Vec<Value>),           // col IN (?, …)  — empty => "0 = 1"
-    IsNull(String, bool),             // true => IS NULL, false => IS NOT NULL
-    Or(Vec<(String, String, Value)>), // (a op ? OR b op ? …)
-    Raw(String, Vec<Value>),          // an arbitrary parenthesized fragment
+    Cmp(String, String, Value),                   // col op ?
+    In(String, Vec<Value>),                       // col IN (?, …)  — empty => "0 = 1"
+    IsNull(String, bool),                         // true => IS NULL, false => IS NOT NULL
+    Or(Vec<(String, String, Value)>),             // (a op ? OR b op ? …)
+    Raw(String, Vec<Value>),                      // an arbitrary parenthesized fragment
+    JsonCmp(String, Vec<JsonSeg>, String, Value), // json_extract/#>> path op ?
+    JsonContains(String, Value),                  // col @> ? — Postgres only
 }
 
 /// Render a predicate list to a `" WHERE …"` clause (empty string if none) plus
 /// the ordered bound parameters. Shared by every builder so AND/OR/NULL/raw
-/// behave identically across SELECT, UPDATE, and DELETE.
-fn render_predicates(preds: &[Predicate]) -> (String, Vec<Value>) {
+/// behave identically across SELECT, UPDATE, and DELETE. Takes the dialect
+/// because JSON predicates are the first whose SQL *shape* differs per engine;
+/// paths are still bound as parameters either way.
+fn render_predicates(
+    preds: &[Predicate],
+    dialect: Dialect,
+) -> Result<(String, Vec<Value>), String> {
     if preds.is_empty() {
-        return (String::new(), Vec::new());
+        return Ok((String::new(), Vec::new()));
     }
     let mut clauses = Vec::new();
     let mut params = Vec::new();
     for p in preds {
         match p {
+            Predicate::JsonCmp(col, segs, op, v) => match dialect {
+                Dialect::Sqlite => {
+                    // json_extract returns typed values — no casts needed.
+                    params.push(Value::Text(sqlite_json_path(segs)));
+                    params.push(v.clone());
+                    clauses.push(format!("json_extract({col}, ?) {op} ?"));
+                }
+                Dialect::Postgres => {
+                    // #>> returns text; cast by the *value's* type so numeric
+                    // comparison is numeric ('9' < '10'), not lexicographic.
+                    params.push(Value::Text(pg_json_path_array(segs)));
+                    params.push(v.clone());
+                    let lhs = match v {
+                        Value::Int(_) | Value::Real(_) => format!("({col} #>> ?)::numeric"),
+                        Value::Bool(_) => format!("({col} #>> ?)::boolean"),
+                        _ => format!("{col} #>> ?"),
+                    };
+                    clauses.push(format!("{lhs} {op} ?"));
+                }
+            },
+            Predicate::JsonContains(col, v) => match dialect {
+                // No containment operator; emulating @> with json_each walks
+                // would lie about semantics. The caps gate reports it first.
+                Dialect::Sqlite => {
+                    return Err(crate::backend::unsupported("json_contains", "sqlite"))
+                }
+                Dialect::Postgres => {
+                    params.push(v.clone());
+                    clauses.push(format!("{col} @> ?::jsonb"));
+                }
+            },
             Predicate::Cmp(c, op, v) => {
                 params.push(v.clone());
                 clauses.push(format!("{} {} ?", c, op));
@@ -159,7 +278,7 @@ fn render_predicates(preds: &[Predicate]) -> (String, Vec<Value>) {
             }
         }
     }
-    (format!(" WHERE {}", clauses.join(" AND ")), params)
+    Ok((format!(" WHERE {}", clauses.join(" AND ")), params))
 }
 
 /// A requested row-lock clause (`FOR UPDATE` / `FOR SHARE` + wait behavior).
@@ -199,6 +318,8 @@ pub struct QueryBuilder {
     limit: Option<i64>,
     offset: Option<i64>,
     row_lock: Option<RowLock>,
+    /// `select_json` projections: `(column, path segments, alias)`.
+    json_selects: Vec<(String, Vec<JsonSeg>, String)>,
     /// First identifier/operator validation error, surfaced by [`build`]. Kept
     /// as a field so the setters stay fluent (`-> Self`) rather than `Result`.
     err: Option<String>,
@@ -233,8 +354,68 @@ impl QueryBuilder {
             limit: None,
             offset: None,
             row_lock: None,
+            json_selects: Vec::new(),
             err,
         }
+    }
+
+    /// `WHERE <json path> <op> ?` inside a JSON column:
+    /// `where_json("meta", "$.author.id", "=", Value::Int(7))`. Compiled per
+    /// dialect by the executing backend (`json_extract` / `#>>`), path bound
+    /// as a parameter; requires the `json_path` capability.
+    pub fn where_json(mut self, col: &str, path: &str, op: &str, value: Value) -> QueryBuilder {
+        check_ident(&mut self.err, "column", col);
+        check_op(&mut self.err, op);
+        match parse_json_path(path) {
+            Ok(segs) => {
+                self.preds.push(Predicate::JsonCmp(
+                    col.to_string(),
+                    segs,
+                    op.to_string(),
+                    value,
+                ));
+            }
+            Err(e) if self.err.is_none() => self.err = Some(e),
+            Err(_) => {}
+        }
+        self
+    }
+
+    /// `WHERE col @> ?` — JSON containment (does the document contain this
+    /// subdocument?). Postgres only (`json_contains` capability); SQLite has
+    /// no containment operator and errors rather than emulating it.
+    pub fn where_json_contains(mut self, col: &str, value: sutegi_json::Json) -> QueryBuilder {
+        check_ident(&mut self.err, "column", col);
+        self.preds
+            .push(Predicate::JsonContains(col.to_string(), Value::Json(value)));
+        self
+    }
+
+    /// Project a JSON path out as a column:
+    /// `select_json("meta", "$.author.name", "author_name")`. Combines with
+    /// [`select`](QueryBuilder::select); requires the `json_path` capability.
+    pub fn select_json(mut self, col: &str, path: &str, alias: &str) -> QueryBuilder {
+        check_ident(&mut self.err, "column", col);
+        check_ident(&mut self.err, "alias", alias);
+        match parse_json_path(path) {
+            Ok(segs) => {
+                self.json_selects
+                    .push((col.to_string(), segs, alias.to_string()));
+            }
+            Err(e) if self.err.is_none() => self.err = Some(e),
+            Err(_) => {}
+        }
+        self
+    }
+
+    /// Whether this query uses any JSON feature — read by the backend to gate
+    /// on the `json_path` capability before any SQL is sent.
+    pub fn uses_json(&self) -> bool {
+        !self.json_selects.is_empty()
+            || self
+                .preds
+                .iter()
+                .any(|p| matches!(p, Predicate::JsonCmp(..) | Predicate::JsonContains(..)))
     }
 
     /// Lock matched rows for writing (`FOR UPDATE`). Emitted per dialect by
@@ -424,20 +605,43 @@ impl QueryBuilder {
     /// identifier or operator supplied to a setter failed validation — an
     /// injection attempt (or a typo) surfaces here rather than reaching the DB.
     pub fn build(&self) -> Result<(String, Vec<Value>), String> {
+        self.build_for(Dialect::Sqlite)
+    }
+
+    /// [`build`](QueryBuilder::build) for an explicit dialect — the form the
+    /// `Backend::select` default uses. Only JSON features render differently;
+    /// a JSON-free query is identical across dialects.
+    pub fn build_for(&self, dialect: Dialect) -> Result<(String, Vec<Value>), String> {
         if let Some(e) = &self.err {
             return Err(e.clone());
         }
-        let cols = if self.columns.is_empty() {
-            "*".to_string()
+        // Projection: named columns (or *), then JSON projections. Their
+        // bound paths are the first parameters, ahead of WHERE values.
+        let mut params = Vec::new();
+        let mut cols = if self.columns.is_empty() {
+            vec!["*".to_string()]
         } else {
-            self.columns.join(", ")
+            self.columns.clone()
         };
+        for (col, segs, alias) in &self.json_selects {
+            match dialect {
+                Dialect::Sqlite => {
+                    params.push(Value::Text(sqlite_json_path(segs)));
+                    cols.push(format!("json_extract({col}, ?) AS {alias}"));
+                }
+                Dialect::Postgres => {
+                    params.push(Value::Text(pg_json_path_array(segs)));
+                    cols.push(format!("{col} #>> ? AS {alias}"));
+                }
+            }
+        }
         let distinct = if self.distinct { "DISTINCT " } else { "" };
-        let (where_sql, params) = render_predicates(&self.preds);
+        let (where_sql, where_params) = render_predicates(&self.preds, dialect)?;
+        params.extend(where_params);
         let mut sql = format!(
             "SELECT {}{} FROM {}{}",
             distinct,
-            cols,
+            cols.join(", "),
             self.build_from_and_joins(),
             where_sql
         );
@@ -465,10 +669,15 @@ impl QueryBuilder {
     /// Build a `SELECT COUNT(*)` over the same table/joins/filters (ignores
     /// columns/order/limit/group), for pagination totals.
     pub fn build_count(&self) -> Result<(String, Vec<Value>), String> {
+        self.build_count_for(Dialect::Sqlite)
+    }
+
+    /// [`build_count`](QueryBuilder::build_count) for an explicit dialect.
+    pub fn build_count_for(&self, dialect: Dialect) -> Result<(String, Vec<Value>), String> {
         if let Some(e) = &self.err {
             return Err(e.clone());
         }
-        let (where_sql, params) = render_predicates(&self.preds);
+        let (where_sql, params) = render_predicates(&self.preds, dialect)?;
         Ok((
             format!(
                 "SELECT COUNT(*) AS count FROM {}{}",
@@ -553,7 +762,7 @@ impl UpdateBuilder {
                 format!("{} = ?", c)
             })
             .collect();
-        let (where_sql, where_params) = render_predicates(&self.preds);
+        let (where_sql, where_params) = render_predicates(&self.preds, Dialect::Sqlite)?;
         params.extend(where_params);
         Ok((
             format!(
@@ -633,7 +842,7 @@ impl DeleteBuilder {
         if let Some(e) = &self.err {
             return Err(e.clone());
         }
-        let (where_sql, params) = render_predicates(&self.preds);
+        let (where_sql, params) = render_predicates(&self.preds, Dialect::Sqlite)?;
         Ok((
             format!(
                 "DELETE FROM {}{}{}",
@@ -970,6 +1179,86 @@ mod tests {
         );
         // skip_locked without a lock mode is a builder error.
         assert!(QueryBuilder::table("jobs").skip_locked().build().is_err());
+    }
+
+    #[test]
+    fn json_path_parser_accepts_the_subset_and_rejects_the_rest() {
+        assert_eq!(
+            parse_json_path("$.a.b_2[0].c").unwrap(),
+            vec![
+                JsonSeg::Key("a".into()),
+                JsonSeg::Key("b_2".into()),
+                JsonSeg::Index(0),
+                JsonSeg::Key("c".into()),
+            ]
+        );
+        assert_eq!(parse_json_path("$[3]").unwrap(), vec![JsonSeg::Index(3)]);
+        for bad in [
+            "a.b",               // no $
+            "$",                 // no segments
+            "$..a",              // empty key
+            "$.a[",              // unclosed index
+            "$.a[-1]",           // negative index
+            "$.a[x]",            // non-numeric index
+            "$.'quoted'",        // quoting unsupported (deliberate subset)
+            "$.a; DROP TABLE t", // injection shape
+            "$.9lives",          // key can't start with a digit
+        ] {
+            assert!(parse_json_path(bad).is_err(), "{bad} should fail");
+        }
+    }
+
+    #[test]
+    fn json_predicates_compile_per_dialect_with_bound_paths() {
+        let qb = QueryBuilder::table("docs")
+            .select_json("meta", "$.author.name", "author")
+            .where_json("meta", "$.stats.views", ">", Value::Int(100));
+
+        let (sql, params) = qb.build_for(Dialect::Sqlite).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT *, json_extract(meta, ?) AS author FROM docs WHERE json_extract(meta, ?) > ?"
+        );
+        assert_eq!(params[0], Value::Text("$.author.name".into()));
+        assert_eq!(params[1], Value::Text("$.stats.views".into()));
+        assert_eq!(params[2], Value::Int(100));
+
+        let (sql, params) = qb.build_for(Dialect::Postgres).unwrap();
+        // Numeric value => ::numeric cast so 9 < 10 compares as numbers.
+        assert_eq!(
+            sql,
+            "SELECT *, meta #>> ? AS author FROM docs WHERE (meta #>> ?)::numeric > ?"
+        );
+        assert_eq!(params[0], Value::Text("{author,name}".into()));
+        assert_eq!(params[1], Value::Text("{stats,views}".into()));
+
+        // Text comparison: no cast on either side.
+        let qb = QueryBuilder::table("docs").where_json(
+            "meta",
+            "$.kind",
+            "=",
+            Value::Text("post".into()),
+        );
+        let (sql, _) = qb.build_for(Dialect::Postgres).unwrap();
+        assert!(sql.contains("meta #>> ? = ?"));
+        assert!(!sql.contains("::numeric"));
+
+        // Containment: Postgres renders, canonical build errors.
+        let qb =
+            QueryBuilder::table("docs").where_json_contains("meta", sutegi_json::Json::obj(vec![]));
+        assert!(qb
+            .build_for(Dialect::Postgres)
+            .unwrap()
+            .0
+            .contains("meta @> ?::jsonb"));
+        assert!(qb.build().is_err());
+        assert!(qb.uses_json());
+
+        // A malformed path is a builder error, not engine SQL.
+        assert!(QueryBuilder::table("docs")
+            .where_json("meta", "$..", "=", Value::Int(1))
+            .build()
+            .is_err());
     }
 
     #[test]
