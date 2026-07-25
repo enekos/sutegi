@@ -269,6 +269,13 @@ impl<B: Transactional> EventStore<B> {
                 Ok(result) => return result,
                 Err(e) if is_unique_violation(&e) && attempt + 1 < MAX_APPEND_RETRIES => {
                     attempt += 1;
+                    // Quadratic backoff: losers of a position race otherwise
+                    // retry in lockstep and one writer can lose every race up
+                    // to the ceiling under a thundering herd. Spreading the
+                    // re-reads makes MAX_APPEND_RETRIES a real bound.
+                    std::thread::sleep(std::time::Duration::from_micros(
+                        (attempt * attempt * 50) as u64,
+                    ));
                 }
                 Err(e) => return Err(EventError::Store(e)),
             }

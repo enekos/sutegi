@@ -32,6 +32,42 @@ enum Source {
     File(String),
 }
 
+impl Source {
+    /// The advisory-lock namespace this database belongs to: two `Db` handles
+    /// on the same file contend for the same names; unrelated databases in the
+    /// same process don't. In-memory databases are private by construction, so
+    /// each pool gets its own namespace.
+    fn lock_namespace(&self) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static MEM_SEQ: AtomicU64 = AtomicU64::new(0);
+        match self {
+            Source::Memory => format!("mem:{}", MEM_SEQ.fetch_add(1, Ordering::Relaxed)),
+            Source::File(path) => format!("file:{path}"),
+        }
+    }
+}
+
+/// The process-wide advisory-lock registry: `namespace ‖ name` entries held by
+/// live [`crate::backend::LockGuard`]s. SQLite has no server to coordinate
+/// through, so the reach is one OS process (`CapScope::Process`) — the honest
+/// analog of Postgres session locks for the single-node store.
+fn lock_registry() -> &'static Mutex<std::collections::HashSet<String>> {
+    use std::sync::OnceLock;
+    static REGISTRY: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Removes its registry entry on drop — the hold inside a SQLite lock guard.
+struct RegistryToken {
+    key: String,
+}
+
+impl Drop for RegistryToken {
+    fn drop(&mut self) {
+        lock_registry().lock().unwrap().remove(&self.key);
+    }
+}
+
 struct Inner {
     /// Idle, ready-to-use connections.
     idle: Vec<Connection>,
@@ -41,17 +77,28 @@ struct Inner {
 
 /// A small blocking SQLite connection pool. Connections are opened lazily up to
 /// `max_size` and returned on checkin.
+/// A table-change callback installed on every pooled connection — the
+/// SQLite leg of [`crate::watch`]. Boxed so the pool stays hook-agnostic.
+type ChangeHook = Arc<dyn Fn(&str) + Send + Sync>;
+
 struct SqlitePool {
     source: Source,
     max_size: usize,
+    /// Advisory-lock namespace — computed once (memory ids are sequential).
+    lock_ns: String,
+    /// Change hook applied to current + future connections (see
+    /// [`Db::set_change_hook`]).
+    change_hook: Mutex<Option<ChangeHook>>,
     state: (Mutex<Inner>, Condvar),
 }
 
 impl SqlitePool {
     fn new(source: Source, max_size: usize) -> SqlitePool {
         SqlitePool {
+            lock_ns: source.lock_namespace(),
             source,
             max_size: max_size.max(1),
+            change_hook: Mutex::new(None),
             state: (
                 Mutex::new(Inner {
                     idle: Vec::new(),
@@ -78,7 +125,21 @@ impl SqlitePool {
         // default LRU holds 16). Schema changes are safe: prepare_v2
         // re-prepares stale statements transparently.
         conn.set_prepared_statement_cache_capacity(64);
+        if let Some(hook) = self.change_hook.lock().unwrap().clone() {
+            install_change_hook(&conn, hook);
+        }
         Ok(conn)
+    }
+
+    /// Install `hook` on every current idle connection and on all future
+    /// ones. A connection checked out across this call picks the hook up on
+    /// its next checkout (documented in [`crate::watch`]).
+    fn set_change_hook(&self, hook: ChangeHook) {
+        *self.change_hook.lock().unwrap() = Some(hook.clone());
+        let inner = self.state.0.lock().unwrap();
+        for conn in &inner.idle {
+            install_change_hook(conn, hook.clone());
+        }
     }
 
     /// Check a connection out, run `f`, and return it to the pool. A connection
@@ -123,6 +184,15 @@ impl SqlitePool {
     }
 }
 
+/// Wire rusqlite's `update_hook` to a [`ChangeHook`]: the callback fires
+/// synchronously inside every INSERT/UPDATE/DELETE on this connection with
+/// the table name — the watcher fans it out from there.
+fn install_change_hook(conn: &Connection, hook: ChangeHook) {
+    let _ = conn.update_hook(Some(move |_action, _db: &str, table: &str, _rowid: i64| {
+        hook(table)
+    }));
+}
+
 /// A pooled SQLite handle: cheap to [`clone`](Clone), `Send + Sync`, and a
 /// [`Backend`]. Share it across worker threads by cloning (it's an `Arc`
 /// inside) or by handing it to [`App::state`](../../sutegi_web/struct.App.html).
@@ -159,6 +229,15 @@ impl Db {
         Ok(db)
     }
 
+    /// Register a table-change callback on every pooled connection (current
+    /// and future) — the SQLite leg of [`crate::watch`]. The callback fires
+    /// synchronously inside each write on this process's pool; writes from
+    /// *other* processes on the same file are invisible (`live_queries:
+    /// process` — believe the capability).
+    pub fn set_change_hook(&self, hook: std::sync::Arc<dyn Fn(&str) + Send + Sync>) {
+        self.pool.set_change_hook(hook);
+    }
+
     /// Open the file named by the `env_key` environment variable, or fall back
     /// to an in-memory database when it is unset — the common "persist in
     /// prod, ephemeral in dev/tests" shape.
@@ -178,8 +257,36 @@ impl Db {
     /// which is a [`Backend`], so the whole query builder + `Model` surface
     /// works inside the transaction.
     pub fn transaction<T>(&self, f: impl FnOnce(&Tx) -> Result<T, String>) -> Result<T, String> {
+        self.transaction_begin("BEGIN", f)
+    }
+
+    /// [`transaction`](Db::transaction) at an explicit isolation level.
+    /// SQLite is always serializable; levels map to *when the write lock is
+    /// taken*: `Serializable` → `BEGIN EXCLUSIVE`, `RepeatableRead` →
+    /// `BEGIN IMMEDIATE` (write intent up front — no deferred-upgrade
+    /// deadlock race), `ReadCommitted` → plain `BEGIN`. Stronger than asked
+    /// is honest; weaker would not be.
+    pub fn transaction_with<T>(
+        &self,
+        isolation: crate::backend::Isolation,
+        f: impl FnOnce(&Tx) -> Result<T, String>,
+    ) -> Result<T, String> {
+        use crate::backend::Isolation;
+        let begin = match isolation {
+            Isolation::ReadCommitted => "BEGIN",
+            Isolation::RepeatableRead => "BEGIN IMMEDIATE",
+            Isolation::Serializable => "BEGIN EXCLUSIVE",
+        };
+        self.transaction_begin(begin, f)
+    }
+
+    fn transaction_begin<T>(
+        &self,
+        begin: &str,
+        f: impl FnOnce(&Tx) -> Result<T, String>,
+    ) -> Result<T, String> {
         self.pool.with(|conn| {
-            conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+            conn.execute_batch(begin).map_err(|e| e.to_string())?;
             let tx = Tx {
                 conn: RefCell::new(conn),
             };
@@ -424,6 +531,37 @@ impl Backend for Db {
     fn introspect(&self) -> Result<Vec<TableSchema>, String> {
         self.pool.with(|conn| introspect_sqlite(conn))
     }
+
+    fn capabilities(&self) -> crate::backend::BackendCaps {
+        // Mostly-off on purpose: bundled SQLite ships JSON1/FTS5/RETURNING,
+        // but a capability describes the *framework surface*, and those have
+        // none yet. Bits flip here as feature milestones land.
+        crate::backend::BackendCaps {
+            advisory_locks: crate::backend::CapScope::Process,
+            isolation_levels: true,
+            returning_dml: true,
+            json_path: true,
+            fts: true,
+            live_queries: crate::backend::CapScope::Process,
+            ..crate::backend::BackendCaps::none("sqlite")
+        }
+    }
+
+    /// Process-scoped named locks via the registry: two `Db` handles on the
+    /// same file contend, unrelated databases don't. See
+    /// [`Source::lock_namespace`].
+    fn try_lock(&self, name: &str) -> Result<Option<crate::backend::LockGuard>, String> {
+        let key = format!("{}\u{1f}{name}", self.pool.lock_ns);
+        let mut held = lock_registry().lock().unwrap();
+        if held.contains(&key) {
+            return Ok(None);
+        }
+        held.insert(key.clone());
+        Ok(Some(crate::backend::LockGuard::new(
+            name,
+            Box::new(RegistryToken { key }),
+        )))
+    }
 }
 
 impl crate::backend::Transactional for Db {
@@ -432,6 +570,14 @@ impl crate::backend::Transactional for Db {
         f: &mut dyn FnMut(&dyn Backend) -> Result<(), String>,
     ) -> Result<(), String> {
         self.transaction(|tx| f(tx))
+    }
+
+    fn run_in_tx_with(
+        &self,
+        isolation: crate::backend::Isolation,
+        f: &mut dyn FnMut(&dyn Backend) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.transaction_with(isolation, |tx| f(tx))
     }
 }
 
@@ -446,6 +592,18 @@ impl Backend for Tx<'_> {
     fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Json>, String> {
         let conn = self.conn.borrow();
         query_conn(&conn, sql, params)
+    }
+
+    /// Same store, same honesty — RETURNING works inside the transaction,
+    /// but no advisory locks (take them on the [`Db`] before `transaction()`)
+    /// and no nested isolation.
+    fn capabilities(&self) -> crate::backend::BackendCaps {
+        crate::backend::BackendCaps {
+            returning_dml: true,
+            json_path: true,
+            fts: true,
+            ..crate::backend::BackendCaps::none("sqlite")
+        }
     }
 
     fn execute(&self, sql: &str, params: &[Value]) -> Result<usize, String> {
@@ -516,6 +674,209 @@ mod tests {
             .column(Column::new("id", ColType::Integer).primary())
             .column(Column::new("title", ColType::Text))
             .column(Column::new("done", ColType::Boolean))
+    }
+
+    #[test]
+    fn sqlite_capabilities_advertise_process_locks_only() {
+        let db = Db::memory().unwrap();
+        let caps = db.capabilities();
+        assert_eq!(caps.advisory_locks, crate::backend::CapScope::Process);
+        assert!(caps.json_path && caps.fts && !caps.json_contains);
+        assert!(!caps.listen_notify);
+    }
+
+    #[test]
+    fn advisory_locks_exclude_within_a_namespace() {
+        let db = Db::memory().unwrap();
+        let guard = db.try_lock("job").unwrap().expect("first acquire");
+        assert_eq!(guard.name(), "job");
+        // Same handle and a clone both see it held.
+        assert!(db.try_lock("job").unwrap().is_none());
+        assert!(db.clone().try_lock("job").unwrap().is_none());
+        // Another name is free; another (memory) database is a new namespace.
+        assert!(db.try_lock("other").unwrap().is_some());
+        assert!(Db::memory().unwrap().try_lock("job").unwrap().is_some());
+        // Dropping the guard releases.
+        drop(guard);
+        assert!(db.try_lock("job").unwrap().is_some());
+    }
+
+    #[test]
+    fn advisory_locks_share_a_namespace_per_file() {
+        let dir = std::env::temp_dir().join(format!("sutegi-locks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("locks.db");
+        let path = path.to_str().unwrap();
+        let a = Db::open(path).unwrap();
+        let b = Db::open(path).unwrap(); // an independent pool on the same file
+        let _guard = a.try_lock("job").unwrap().expect("first acquire");
+        assert!(b.try_lock("job").unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn returning_dml_round_trips() {
+        let db = Db::memory().unwrap();
+        db.migrate(&todos_schema()).unwrap();
+        db.insert(
+            "todos",
+            &[
+                ("title", Value::Text("a".into())),
+                ("done", Value::Bool(false)),
+            ],
+            "id",
+        )
+        .unwrap();
+
+        let rows = db
+            .update_returning(
+                &UpdateBuilder::table("todos")
+                    .set("done", Value::Bool(true))
+                    .filter("title", "=", Value::Text("a".into()))
+                    .returning(&["id", "done"]),
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("done").and_then(Json::as_i64), Some(1));
+
+        let rows = db
+            .delete_returning(
+                &DeleteBuilder::table("todos")
+                    .filter("done", "=", Value::Bool(true))
+                    .returning(&["title"]),
+            )
+            .unwrap();
+        assert_eq!(rows[0].get("title").and_then(Json::as_str), Some("a"));
+        assert_eq!(db.count(&QueryBuilder::table("todos")).unwrap(), 0);
+    }
+
+    #[test]
+    fn transaction_with_all_levels_and_lock_noop() {
+        use crate::backend::Isolation;
+        let db = Db::memory().unwrap();
+        db.migrate(&todos_schema()).unwrap();
+        for iso in [
+            Isolation::ReadCommitted,
+            Isolation::RepeatableRead,
+            Isolation::Serializable,
+        ] {
+            db.transaction_with(iso, |tx| {
+                tx.insert(
+                    "todos",
+                    &[
+                        ("title", Value::Text(format!("{iso:?}"))),
+                        ("done", Value::Bool(false)),
+                    ],
+                    "id",
+                )
+            })
+            .unwrap();
+        }
+        assert_eq!(db.count(&QueryBuilder::table("todos")).unwrap(), 3);
+
+        // for_update is a documented no-op on SQLite; skip_locked errors.
+        assert!(db
+            .select(&QueryBuilder::table("todos").for_update())
+            .is_ok());
+        assert!(db
+            .select(&QueryBuilder::table("todos").for_update().skip_locked())
+            .is_err());
+    }
+
+    #[test]
+    fn insert_many_default_batches_on_sqlite() {
+        let db = Db::memory().unwrap();
+        db.migrate(&todos_schema()).unwrap();
+        let rows: Vec<Vec<Value>> = (0..777)
+            .map(|i| vec![Value::Text(format!("t{i}")), Value::Bool(i % 2 == 0)])
+            .collect();
+        let n = db.insert_many("todos", &["title", "done"], &rows).unwrap();
+        assert_eq!(n, 777);
+        assert_eq!(db.count(&QueryBuilder::table("todos")).unwrap(), 777);
+    }
+
+    #[test]
+    fn json_path_queries_round_trip() {
+        use crate::value::ColType;
+        let db = Db::memory().unwrap();
+        db.migrate(
+            &TableSchema::new("docs")
+                .column(Column::new("id", ColType::Integer).primary())
+                .column(Column::new("meta", ColType::Json)),
+        )
+        .unwrap();
+        let doc = |views: i64, kind: &str| {
+            Value::Json(Json::obj(vec![
+                ("kind", Json::str(kind)),
+                ("stats", Json::obj(vec![("views", Json::int(views))])),
+            ]))
+        };
+        db.insert("docs", &[("meta", doc(9, "post"))], "id")
+            .unwrap();
+        db.insert("docs", &[("meta", doc(100, "post"))], "id")
+            .unwrap();
+        db.insert("docs", &[("meta", doc(3, "page"))], "id")
+            .unwrap();
+
+        // Numeric comparison happens as numbers (9 < 100, not "9" > "100").
+        let hot = db
+            .select(&QueryBuilder::table("docs").where_json(
+                "meta",
+                "$.stats.views",
+                ">",
+                Value::Int(50),
+            ))
+            .unwrap();
+        assert_eq!(hot.len(), 1);
+
+        // Projection + count through the same dialect-aware path.
+        let projected = db
+            .select(
+                &QueryBuilder::table("docs")
+                    .select(&["id"])
+                    .select_json("meta", "$.kind", "kind")
+                    .order_by("id", false),
+            )
+            .unwrap();
+        assert_eq!(
+            projected[0].get("kind").and_then(Json::as_str),
+            Some("post")
+        );
+        assert_eq!(
+            db.count(&QueryBuilder::table("docs").where_json(
+                "meta",
+                "$.kind",
+                "=",
+                Value::Text("post".into()),
+            ))
+            .unwrap(),
+            2
+        );
+
+        // Containment is honestly unsupported here.
+        let err = db
+            .select(
+                &QueryBuilder::table("docs")
+                    .where_json_contains("meta", Json::obj(vec![("kind", Json::str("post"))])),
+            )
+            .unwrap_err();
+        assert!(err.contains("json_contains"), "{err}");
+    }
+
+    #[test]
+    fn with_lock_times_out_as_none() {
+        let db = Db::memory().unwrap();
+        let _held = db.try_lock("busy").unwrap().unwrap();
+        let ran = db
+            .with_lock("busy", std::time::Duration::from_millis(60), || Ok(true))
+            .unwrap();
+        assert_eq!(ran, None);
+        // And runs once the holder is gone.
+        drop(_held);
+        let ran = db
+            .with_lock("busy", std::time::Duration::from_millis(60), || Ok(true))
+            .unwrap();
+        assert_eq!(ran, Some(true));
     }
 
     #[test]

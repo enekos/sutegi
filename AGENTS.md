@@ -19,13 +19,19 @@ Returns the full application surface:
   "name": "todo-demo",
   "routes": [ { "method": "GET", "pattern": "/todos", "doc": "List all todos." } ],
   "models": [ { "table": "todos", "columns": [ { "name": "id", "type": "integer", "primary": true } ] } ],
-  "tools":  [ { "name": "create_todo", "description": "...", "input_schema": { ... } } ]
+  "tools":  [ { "name": "create_todo", "description": "...", "input_schema": { ... } } ],
+  "capabilities": { "backend": "postgres", "advisory_locks": "cluster", "fts": true, ... }
 }
 ```
 
 `routes` is the HTTP surface (with intent in `doc`), `models` is the data shape,
 `tools` is what you can call. Keys are sorted, so the document is stable to diff
 and cache.
+
+`capabilities` (present when the app registered its backend) describes what the
+store behind the app can do — coordination scopes (`none`/`process`/`cluster`),
+search, JSON paths, realtime. Check it **before** invoking a feature-dependent
+tool instead of finding out from an error.
 
 ## 2. Get the tool manifest
 

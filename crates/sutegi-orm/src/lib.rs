@@ -25,8 +25,11 @@ mod backend;
 mod builder;
 mod value;
 
-pub use backend::{row, Backend, FromInput, FromRow, Model, Transactional};
-pub use builder::{DeleteBuilder, Page, QueryBuilder, UpdateBuilder};
+pub use backend::{
+    lock_key, row, unsupported, Backend, BackendCaps, CapScope, FromInput, FromRow, Isolation,
+    LockGuard, Model, Transactional,
+};
+pub use builder::{DeleteBuilder, LockWait, Page, QueryBuilder, RowLock, UpdateBuilder};
 pub use value::{
     create_table_sql, default_sql, parse_default_literal, schema_from_json, schema_json,
     schema_to_json, value_from_json, value_to_json, ColType, Column, Dialect, FkAction, ForeignKey,
@@ -37,6 +40,16 @@ pub use value::{
 /// [`schema_diff::diff`], and the [`schema_diff::apply`] fold that builds the
 /// shadow schema. No I/O — it operates on [`TableSchema`] values.
 pub mod schema_diff;
+
+/// Full-text + hybrid search over any [`Backend`]: one grammar, `tsvector`
+/// on Postgres / FTS5 on SQLite, and reciprocal-rank fusion with the
+/// [`embedding`] legs. See [`search::setup`] / [`search::search`].
+pub mod search;
+
+/// Reactive queries: [`watch::Watcher`] turns a query into an initial result
+/// plus pushed [`watch::Change`] diffs — cluster-scoped over LISTEN/NOTIFY on
+/// Postgres, process-scoped over `update_hook` on SQLite.
+pub mod watch;
 
 /// Versioned, up/down migrations with a `_sutegi_migrations` history table,
 /// over any [`Backend`].

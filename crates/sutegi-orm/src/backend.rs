@@ -15,6 +15,230 @@ use crate::builder::{DeleteBuilder, Page, QueryBuilder, UpdateBuilder};
 use crate::value::{TableSchema, Value};
 use sutegi_json::Json;
 
+/// How far a coordination guarantee reaches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapScope {
+    /// Not available on this backend.
+    None,
+    /// Holds within one OS process (e.g. SQLite named locks).
+    Process,
+    /// Holds across every pod sharing the database (e.g. Postgres advisory
+    /// locks).
+    Cluster,
+}
+
+impl CapScope {
+    /// The stable string form used in `/__introspect`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CapScope::None => "none",
+            CapScope::Process => "process",
+            CapScope::Cluster => "cluster",
+        }
+    }
+}
+
+/// What a [`Backend`] can actually do beyond the core query/execute surface —
+/// coordination, DML extras, documents/search, realtime. Callers (and agents,
+/// via the `capabilities` block in `/__introspect`) read this **before**
+/// reaching for a feature instead of finding out from a dialect SQL error.
+///
+/// A capability describes the *framework surface*, not the underlying C
+/// library: SQLite ships JSON1/FTS5/RETURNING, but the bit stays off until
+/// sutegi exposes the feature through the builder/`Backend`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BackendCaps {
+    /// Which store this is: `"sqlite"`, `"postgres"`, or an impl-defined name.
+    pub backend: &'static str,
+    // --- coordination ---
+    /// Named advisory locks (`lock`/`try_lock`) and how far they reach.
+    pub advisory_locks: CapScope,
+    /// Row-level locking clauses (`FOR UPDATE` / `FOR SHARE`).
+    pub row_locks: bool,
+    /// `SKIP LOCKED` / `NOWAIT` on row-locking reads.
+    pub skip_locked: bool,
+    /// Explicit isolation levels on transactions.
+    pub isolation_levels: bool,
+    // --- dml ---
+    /// `RETURNING` on UPDATE / DELETE builders.
+    pub returning_dml: bool,
+    /// A native bulk-insert path (e.g. Postgres `COPY FROM STDIN`).
+    pub bulk_copy: bool,
+    // --- documents & search ---
+    /// JSON path queries (`where_json` / `select_json`).
+    pub json_path: bool,
+    /// JSON containment (`@>`-style `where_json_contains`).
+    pub json_contains: bool,
+    /// Full-text search (`tsvector` / FTS5) through the builder.
+    pub fts: bool,
+    // --- realtime & vectors ---
+    /// `LISTEN`/`NOTIFY`-style push wakeups.
+    pub listen_notify: bool,
+    /// Vector (embedding) columns and nearest-neighbor pushdown.
+    pub vector: bool,
+    /// Watched queries (`watch()`) and how far change delivery reaches.
+    pub live_queries: CapScope,
+}
+
+impl BackendCaps {
+    /// Everything off — the honest default for a backend that has declared
+    /// nothing. Named overrides start from this and flip what they support.
+    pub fn none(backend: &'static str) -> BackendCaps {
+        BackendCaps {
+            backend,
+            advisory_locks: CapScope::None,
+            row_locks: false,
+            skip_locked: false,
+            isolation_levels: false,
+            returning_dml: false,
+            bulk_copy: false,
+            json_path: false,
+            json_contains: false,
+            fts: false,
+            listen_notify: false,
+            vector: false,
+            live_queries: CapScope::None,
+        }
+    }
+
+    /// The stable JSON form served under `capabilities` in `/__introspect`.
+    pub fn to_json(&self) -> Json {
+        Json::obj(vec![
+            ("advisory_locks", Json::str(self.advisory_locks.as_str())),
+            ("backend", Json::str(self.backend)),
+            ("bulk_copy", Json::Bool(self.bulk_copy)),
+            ("fts", Json::Bool(self.fts)),
+            ("isolation_levels", Json::Bool(self.isolation_levels)),
+            ("json_contains", Json::Bool(self.json_contains)),
+            ("json_path", Json::Bool(self.json_path)),
+            ("listen_notify", Json::Bool(self.listen_notify)),
+            ("live_queries", Json::str(self.live_queries.as_str())),
+            ("returning_dml", Json::Bool(self.returning_dml)),
+            ("row_locks", Json::Bool(self.row_locks)),
+            ("skip_locked", Json::Bool(self.skip_locked)),
+            ("vector", Json::Bool(self.vector)),
+        ])
+    }
+}
+
+/// The uniform error for reaching past a backend's capabilities — features
+/// gate on [`BackendCaps`] and return this instead of a dialect SQL error.
+pub fn unsupported(capability: &str, backend: &str) -> String {
+    format!("unsupported: {capability} is not available on the {backend} backend")
+}
+
+/// A held advisory lock. Dropping the guard releases the lock — on Postgres by
+/// closing the dedicated session that holds it (which is also what makes
+/// crash-release automatic), on SQLite by removing the registry entry.
+///
+/// Exception: a guard from a Postgres *transaction* handle
+/// (`pg_advisory_xact_lock`) releases at COMMIT/ROLLBACK, not at drop — see
+/// the `Tx` impl.
+pub struct LockGuard {
+    name: String,
+    /// Whatever keeps the lock alive; dropping it releases. A dedicated PG
+    /// [`Client`], a registry token, …
+    _hold: Box<dyn std::any::Any + Send>,
+}
+
+impl LockGuard {
+    /// Wrap a backend-specific hold. For backend implementors.
+    pub fn new(name: &str, hold: Box<dyn std::any::Any + Send>) -> LockGuard {
+        LockGuard {
+            name: name.to_string(),
+            _hold: hold,
+        }
+    }
+
+    /// The lock's name as acquired.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl std::fmt::Debug for LockGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LockGuard")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+/// The 64-bit key a named lock maps to on Postgres: the first 8 bytes of
+/// SHA-256(name), big-endian. Public so an operator can inspect or take the
+/// same lock from psql: `SELECT pg_try_advisory_lock(<key>)`.
+pub fn lock_key(name: &str) -> i64 {
+    let digest = sutegi_crypto::sha256(name.as_bytes());
+    i64::from_be_bytes(digest[..8].try_into().expect("8 bytes"))
+}
+
+/// How often the default polling [`lock`](Backend::lock) re-attempts.
+const LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Render a requested row-lock clause for a backend, or gate it. Backends
+/// without row locks treat plain `FOR UPDATE`/`FOR SHARE` as a documented
+/// no-op (a SQLite write transaction already holds the whole-database lock —
+/// strictly coarser), but `SKIP LOCKED`/`NOWAIT` **error**: their entire point
+/// is altered semantics under contention, which such a backend cannot express.
+fn row_lock_sql(lock: crate::builder::RowLock, caps: &BackendCaps) -> Result<String, String> {
+    use crate::builder::LockWait;
+    if !caps.row_locks {
+        return match lock.wait {
+            LockWait::Wait => Ok(String::new()),
+            LockWait::SkipLocked => Err(unsupported("skip_locked", caps.backend)),
+            LockWait::NoWait => Err(unsupported("nowait", caps.backend)),
+        };
+    }
+    let mut sql = String::from(if lock.exclusive {
+        " FOR UPDATE"
+    } else {
+        " FOR SHARE"
+    });
+    match lock.wait {
+        LockWait::Wait => {}
+        LockWait::SkipLocked if caps.skip_locked => sql.push_str(" SKIP LOCKED"),
+        LockWait::NoWait if caps.skip_locked => sql.push_str(" NOWAIT"),
+        LockWait::SkipLocked => return Err(unsupported("skip_locked", caps.backend)),
+        LockWait::NoWait => return Err(unsupported("nowait", caps.backend)),
+    }
+    Ok(sql)
+}
+
+/// Validate a bulk-insert call's identifiers and row widths — shared by the
+/// default [`Backend::insert_many`] and the Postgres COPY override.
+pub(crate) fn check_bulk_shape(
+    table: &str,
+    cols: &[&str],
+    rows: &[Vec<Value>],
+) -> Result<(), String> {
+    if cols.is_empty() {
+        return Err("insert_many: no columns".into());
+    }
+    let named: Vec<(&str, Value)> = cols.iter().map(|c| (*c, Value::Null)).collect();
+    crate::builder::validate_write_idents(table, &named, &[])?;
+    if let Some((i, row)) = rows.iter().enumerate().find(|(_, r)| r.len() != cols.len()) {
+        return Err(format!(
+            "insert_many: row {i} has {} values, expected {}",
+            row.len(),
+            cols.len()
+        ));
+    }
+    Ok(())
+}
+
+/// A transaction isolation level for
+/// [`Transactional::transact_with`]. Postgres maps directly
+/// (`BEGIN ISOLATION LEVEL …`); SQLite is always serializable by nature, so
+/// levels map to *when the write lock is taken* (`Serializable` →
+/// `BEGIN EXCLUSIVE`, `RepeatableRead` → `BEGIN IMMEDIATE`, `ReadCommitted` →
+/// plain `BEGIN`) — running *stronger* than asked is honest, weaker is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Isolation {
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
 /// A runnable execution backend behind the query builder.
 ///
 /// Implementors provide the five dialect-specific **primitives**
@@ -54,6 +278,61 @@ pub trait Backend {
     /// Create a table from a schema if it does not already exist.
     fn migrate(&self, schema: &TableSchema) -> Result<(), String>;
 
+    /// What this backend can do beyond the core surface — see [`BackendCaps`].
+    /// Defaults to all-off (`BackendCaps::none("unknown")`) so a backend never
+    /// advertises what it hasn't implemented; the bundled SQLite and Postgres
+    /// backends override it. Surface it to agents via
+    /// `App::register_capabilities`.
+    fn capabilities(&self) -> BackendCaps {
+        BackendCaps::none("unknown")
+    }
+
+    /// Try to take the named advisory lock. `Ok(Some(guard))` holds it until
+    /// the guard drops; `Ok(None)` means someone else holds it. Scope is the
+    /// backend's `capabilities().advisory_locks` — cluster-wide on Postgres,
+    /// process-wide on SQLite. The default errors: a backend without the
+    /// capability says so instead of pretending.
+    fn try_lock(&self, name: &str) -> Result<Option<LockGuard>, String> {
+        let _ = name;
+        Err(unsupported("advisory_locks", self.capabilities().backend))
+    }
+
+    /// Take the named lock, waiting up to `timeout`; `Ok(None)` on timeout.
+    /// Default: poll [`try_lock`](Backend::try_lock). The Postgres backend
+    /// overrides this with a server-side blocking wait.
+    fn lock(&self, name: &str, timeout: std::time::Duration) -> Result<Option<LockGuard>, String> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(guard) = self.try_lock(name)? {
+                return Ok(Some(guard));
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(LOCK_POLL_INTERVAL.min(deadline - now));
+        }
+    }
+
+    /// Run `f` while holding the named lock — the singleton-job shape:
+    /// `db.with_lock("nightly-report", timeout, || …)`. `Ok(None)` means the
+    /// lock was never acquired (someone else ran it); `f`'s error passes
+    /// through.
+    fn with_lock<T>(
+        &self,
+        name: &str,
+        timeout: std::time::Duration,
+        f: impl FnOnce() -> Result<T, String>,
+    ) -> Result<Option<T>, String>
+    where
+        Self: Sized,
+    {
+        match self.lock(name, timeout)? {
+            Some(_guard) => f().map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// The SQL dialect this backend speaks — the DDL emitter and diff engine
     /// need it to render the right statements. Defaults to SQLite; the Postgres
     /// backend and its transaction handle override it.
@@ -75,10 +354,75 @@ pub trait Backend {
 
     // --- default methods (shared, implemented via the primitives) ---
 
-    /// Run a query builder and return rows as JSON objects.
+    /// Run a query builder and return rows as JSON objects. Dialect-specific
+    /// pieces are resolved here — row-lock clauses and JSON path SQL — so
+    /// `build()` stays dialect-blind.
     fn select(&self, qb: &QueryBuilder) -> Result<Vec<Json>, String> {
-        let (sql, params) = qb.build()?;
+        let caps = self.capabilities();
+        if qb.uses_json() && !caps.json_path {
+            return Err(unsupported("json_path", caps.backend));
+        }
+        let (mut sql, params) = qb.build_for(self.dialect())?;
+        if let Some(lock) = qb.row_lock() {
+            sql.push_str(&row_lock_sql(lock, &caps)?);
+        }
         self.query(&sql, &params)
+    }
+
+    /// Run an UPDATE with a `RETURNING` clause and get the affected rows back
+    /// in the same round-trip. Gated on the `returning_dml` capability — a
+    /// backend whose driver would silently discard the rows errors instead.
+    fn update_returning(&self, ub: &UpdateBuilder) -> Result<Vec<Json>, String> {
+        let caps = self.capabilities();
+        if !caps.returning_dml {
+            return Err(unsupported("returning_dml", caps.backend));
+        }
+        let (sql, params) = ub.build()?;
+        self.query(&sql, &params)
+    }
+
+    /// Run a DELETE with a `RETURNING` clause and get the deleted rows back.
+    /// Same gating as [`update_returning`](Backend::update_returning).
+    fn delete_returning(&self, db: &DeleteBuilder) -> Result<Vec<Json>, String> {
+        let caps = self.capabilities();
+        if !caps.returning_dml {
+            return Err(unsupported("returning_dml", caps.backend));
+        }
+        let (sql, params) = db.build()?;
+        self.query(&sql, &params)
+    }
+
+    /// Insert many rows of the same shape in few statements. The default
+    /// batches multi-row `INSERT … VALUES` under the placeholder budget and
+    /// works on any backend; Postgres overrides it with wire-native
+    /// `COPY FROM STDIN` (`bulk_copy: true` marks the native path).
+    fn insert_many(
+        &self,
+        table: &str,
+        cols: &[&str],
+        rows: &[Vec<Value>],
+    ) -> Result<usize, String> {
+        check_bulk_shape(table, cols, rows)?;
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        // Rows per statement: SQLite's binding ceiling is the tight one
+        // (32766 on the bundled build); stay well under it and cap statement
+        // size for Postgres too.
+        let per_batch = (30_000 / cols.len().max(1)).clamp(1, 500);
+        let row_marks = format!("({})", vec!["?"; cols.len()].join(", "));
+        let mut affected = 0;
+        for chunk in rows.chunks(per_batch) {
+            let sql = format!(
+                "INSERT INTO {} ({}) VALUES {}",
+                table,
+                cols.join(", "),
+                vec![row_marks.as_str(); chunk.len()].join(", "),
+            );
+            let params: Vec<Value> = chunk.iter().flatten().cloned().collect();
+            affected += self.execute(&sql, &params)?;
+        }
+        Ok(affected)
     }
 
     /// Run a SELECT and return only the first row, if any.
@@ -88,7 +432,11 @@ pub trait Backend {
 
     /// Count rows matching a query builder (uses its `build_count`).
     fn count(&self, qb: &QueryBuilder) -> Result<i64, String> {
-        let (sql, params) = qb.build_count()?;
+        let caps = self.capabilities();
+        if qb.uses_json() && !caps.json_path {
+            return Err(unsupported("json_path", caps.backend));
+        }
+        let (sql, params) = qb.build_count_for(self.dialect())?;
         Ok(self
             .query_one(&sql, &params)?
             .and_then(|r| r.get("count").and_then(|j| j.as_f64()))
@@ -179,6 +527,37 @@ pub trait Transactional: Backend {
     {
         let mut out: Option<T> = None;
         self.run_in_tx(&mut |tx| {
+            out = Some(f(tx)?);
+            Ok(())
+        })?;
+        out.ok_or_else(|| "transaction closure did not run".to_string())
+    }
+
+    /// Object-safe core of [`transact_with`](Transactional::transact_with).
+    /// The default **errors** (`unsupported("isolation_levels")`) — silently
+    /// running at a weaker level than asked would be a lie; the bundled
+    /// backends override it.
+    fn run_in_tx_with(
+        &self,
+        isolation: Isolation,
+        f: &mut dyn FnMut(&dyn Backend) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let _ = (isolation, f);
+        Err(unsupported("isolation_levels", self.capabilities().backend))
+    }
+
+    /// [`transact`](Transactional::transact) at an explicit [`Isolation`]
+    /// level: `db.transact_with(Isolation::Serializable, |tx| …)`.
+    fn transact_with<T>(
+        &self,
+        isolation: Isolation,
+        mut f: impl FnMut(&dyn Backend) -> Result<T, String>,
+    ) -> Result<T, String>
+    where
+        Self: Sized,
+    {
+        let mut out: Option<T> = None;
+        self.run_in_tx_with(isolation, &mut |tx| {
             out = Some(f(tx)?);
             Ok(())
         })?;
@@ -531,5 +910,135 @@ mod tests {
         let page = mem.paginate(&QueryBuilder::table("t"), 1, 10).unwrap();
         assert_eq!(page.total, 2);
         assert_eq!(page.items.len(), 2);
+    }
+
+    #[test]
+    fn capabilities_default_is_all_off() {
+        // A backend that declares nothing advertises nothing.
+        struct Bare;
+        impl Backend for Bare {
+            fn query(&self, _: &str, _: &[Value]) -> Result<Vec<Json>, String> {
+                Ok(Vec::new())
+            }
+            fn execute(&self, _: &str, _: &[Value]) -> Result<usize, String> {
+                Ok(0)
+            }
+            fn insert(&self, _: &str, _: &[(&str, Value)], _: &str) -> Result<i64, String> {
+                Ok(0)
+            }
+            fn upsert(
+                &self,
+                _: &str,
+                _: &[(&str, Value)],
+                _: &str,
+                _: &str,
+            ) -> Result<i64, String> {
+                Ok(0)
+            }
+            fn migrate(&self, _: &TableSchema) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let caps = Bare.capabilities();
+        assert_eq!(caps, BackendCaps::none("unknown"));
+        assert_eq!(caps.advisory_locks, CapScope::None);
+        assert!(!caps.listen_notify);
+    }
+
+    #[test]
+    fn capabilities_json_shape_is_stable() {
+        let json = BackendCaps::none("postgres").to_json().to_string();
+        // Alphabetical keys; scopes as strings, features as booleans.
+        assert!(json.starts_with("{\"advisory_locks\":\"none\",\"backend\":\"postgres\""));
+        assert!(json.contains("\"listen_notify\":false"));
+        assert!(json.contains("\"live_queries\":\"none\""));
+    }
+
+    #[test]
+    fn unsupported_error_names_capability_and_backend() {
+        assert_eq!(
+            unsupported("advisory_locks", "sqlite"),
+            "unsupported: advisory_locks is not available on the sqlite backend"
+        );
+    }
+
+    #[test]
+    fn row_lock_sql_emits_or_gates_per_caps() {
+        use crate::builder::{LockWait, RowLock};
+        let lock = |exclusive, wait| RowLock { exclusive, wait };
+
+        let pg = BackendCaps {
+            row_locks: true,
+            skip_locked: true,
+            ..BackendCaps::none("postgres")
+        };
+        let sql = |l| row_lock_sql(l, &pg).unwrap();
+        assert_eq!(sql(lock(true, LockWait::Wait)), " FOR UPDATE");
+        assert_eq!(sql(lock(false, LockWait::Wait)), " FOR SHARE");
+        assert_eq!(
+            sql(lock(true, LockWait::SkipLocked)),
+            " FOR UPDATE SKIP LOCKED"
+        );
+        assert_eq!(sql(lock(true, LockWait::NoWait)), " FOR UPDATE NOWAIT");
+
+        // No row locks: plain lock is a documented no-op, altered-semantics
+        // variants error.
+        let lite = BackendCaps::none("sqlite");
+        assert_eq!(row_lock_sql(lock(true, LockWait::Wait), &lite).unwrap(), "");
+        assert!(row_lock_sql(lock(true, LockWait::SkipLocked), &lite).is_err());
+        assert!(row_lock_sql(lock(true, LockWait::NoWait), &lite).is_err());
+    }
+
+    #[test]
+    fn insert_many_batches_under_the_placeholder_budget() {
+        use std::cell::RefCell;
+
+        /// Records each executed statement's placeholder count.
+        #[derive(Default)]
+        struct Recorder {
+            batches: RefCell<Vec<usize>>,
+        }
+        impl Backend for Recorder {
+            fn query(&self, _: &str, _: &[Value]) -> Result<Vec<Json>, String> {
+                Ok(Vec::new())
+            }
+            fn execute(&self, sql: &str, params: &[Value]) -> Result<usize, String> {
+                assert!(sql.starts_with("INSERT INTO items (a, b) VALUES (?, ?)"));
+                self.batches.borrow_mut().push(params.len());
+                Ok(params.len() / 2)
+            }
+            fn insert(&self, _: &str, _: &[(&str, Value)], _: &str) -> Result<i64, String> {
+                Ok(0)
+            }
+            fn upsert(
+                &self,
+                _: &str,
+                _: &[(&str, Value)],
+                _: &str,
+                _: &str,
+            ) -> Result<i64, String> {
+                Ok(0)
+            }
+            fn migrate(&self, _: &TableSchema) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let rec = Recorder::default();
+        let rows: Vec<Vec<Value>> = (0..1201)
+            .map(|i| vec![Value::Int(i), Value::Text(format!("r{i}"))])
+            .collect();
+        let n = rec.insert_many("items", &["a", "b"], &rows).unwrap();
+        assert_eq!(n, 1201);
+        // 500 rows per statement: 500 + 500 + 201.
+        assert_eq!(*rec.batches.borrow(), vec![1000, 1000, 402]);
+
+        // Shape errors are caught before any statement runs.
+        assert!(rec
+            .insert_many("items", &["a", "b"], &[vec![Value::Int(1)]])
+            .is_err());
+        assert!(rec.insert_many("items; --", &["a"], &[]).is_err());
+        assert_eq!(rec.insert_many("items", &["a", "b"], &[]).unwrap(), 0);
     }
 }

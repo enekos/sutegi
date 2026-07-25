@@ -338,6 +338,8 @@ pub struct App {
     middleware: Vec<Middleware>,
     ops_guard: Option<Middleware>,
     models: Vec<Json>,
+    capabilities: Option<Json>,
+    search: Vec<Json>,
     tools: Vec<Json>,
     tool_defs: Vec<ToolDef>,
     state: StateMap,
@@ -408,6 +410,8 @@ impl App {
             middleware: Vec::new(),
             ops_guard: None,
             models: Vec::new(),
+            capabilities: None,
+            search: Vec::new(),
             tools: Vec::new(),
             tool_defs: Vec::new(),
             state: StateMap::new(),
@@ -731,6 +735,30 @@ impl App {
         self
     }
 
+    /// Record the backend's [capability
+    /// descriptor](sutegi_orm::BackendCaps) for introspection:
+    /// `app.register_capabilities(db.capabilities())`. `/__introspect` gains a
+    /// `capabilities` block agents read before reaching for a feature.
+    #[cfg(feature = "orm")]
+    pub fn register_capabilities(mut self, caps: sutegi_orm::BackendCaps) -> App {
+        self.capabilities = Some(caps.to_json());
+        self
+    }
+
+    /// Record a full-text-searchable table for introspection: `/__introspect`
+    /// gains a `search` entry naming the table and its searched columns, so an
+    /// agent can discover what's searchable without source access.
+    pub fn register_search(mut self, table: &str, cols: &[&str]) -> App {
+        self.search.push(Json::obj(vec![
+            ("table", Json::str(table)),
+            (
+                "columns",
+                Json::arr(cols.iter().map(|c| Json::str(*c)).collect()),
+            ),
+        ]));
+        self
+    }
+
     /// Build the JSON description of the entire application surface.
     fn introspection(&self) -> Json {
         let routes = self
@@ -744,7 +772,7 @@ impl App {
                 ])
             })
             .collect();
-        Json::obj(vec![
+        let mut doc = vec![
             ("name", Json::str(self.name.clone())),
             ("framework", Json::str("sutegi")),
             ("version", Json::str(env!("CARGO_PKG_VERSION"))),
@@ -760,7 +788,14 @@ impl App {
                     ("metrics", Json::str("/__metrics")),
                 ]),
             ),
-        ])
+        ];
+        if let Some(caps) = &self.capabilities {
+            doc.push(("capabilities", caps.clone()));
+        }
+        if !self.search.is_empty() {
+            doc.push(("search", Json::arr(self.search.clone())));
+        }
+        Json::obj(doc)
     }
 
     /// Build the request service closure (shared by every `run*` variant).
@@ -1794,6 +1829,47 @@ mod tests {
         assert_eq!(call("/__tools/anything", Method::Post).status, 401);
         // Ordinary routes are untouched by the ops guard.
         assert_eq!(call("/", Method::Get).status, 200);
+    }
+
+    #[cfg(feature = "orm")]
+    #[test]
+    fn introspection_includes_registered_capabilities() {
+        // Absent unless registered — existing introspection docs are unchanged.
+        let intro = App::new("t").introspection();
+        assert!(intro.get("capabilities").is_none());
+
+        let caps = sutegi_orm::BackendCaps {
+            listen_notify: true,
+            ..sutegi_orm::BackendCaps::none("postgres")
+        };
+        let intro = App::new("t").register_capabilities(caps).introspection();
+        let block = intro.get("capabilities").unwrap();
+        assert_eq!(
+            block.get("backend").and_then(Json::as_str),
+            Some("postgres")
+        );
+        assert_eq!(
+            block.get("advisory_locks").and_then(Json::as_str),
+            Some("none")
+        );
+    }
+
+    #[test]
+    fn introspection_lists_registered_search_tables() {
+        let intro = App::new("t")
+            .register_search("docs", &["title", "body"])
+            .introspection();
+        let entries = intro.get("search").and_then(Json::as_array).unwrap();
+        assert_eq!(entries[0].get("table").and_then(Json::as_str), Some("docs"));
+        assert_eq!(
+            entries[0]
+                .get("columns")
+                .and_then(Json::as_array)
+                .map(|c| c.len()),
+            Some(2)
+        );
+        // Absent when nothing registered.
+        assert!(App::new("t").introspection().get("search").is_none());
     }
 
     #[test]
