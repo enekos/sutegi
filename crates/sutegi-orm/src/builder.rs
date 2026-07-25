@@ -162,6 +162,28 @@ fn render_predicates(preds: &[Predicate]) -> (String, Vec<Value>) {
     (format!(" WHERE {}", clauses.join(" AND ")), params)
 }
 
+/// A requested row-lock clause (`FOR UPDATE` / `FOR SHARE` + wait behavior).
+/// Stored on the builder; **emitted by `Backend::select`**, which knows the
+/// dialect and capabilities — `build()` stays dialect-blind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowLock {
+    /// `true` = `FOR UPDATE`, `false` = `FOR SHARE`.
+    pub exclusive: bool,
+    /// Contention behavior: wait (None), skip, or fail fast.
+    pub wait: LockWait,
+}
+
+/// What a row-locking read does when it meets a locked row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockWait {
+    /// Block until the lock is free (the default).
+    Wait,
+    /// `SKIP LOCKED` — silently skip locked rows (work-queue claims).
+    SkipLocked,
+    /// `NOWAIT` — error immediately instead of blocking.
+    NoWait,
+}
+
 /// A fluent, parameterized SELECT builder with filters, OR groups, joins,
 /// grouping, ordering, and paging. Emits `?` placeholders and the matching
 /// ordered parameter list — driver-agnostic and injection-safe.
@@ -176,6 +198,7 @@ pub struct QueryBuilder {
     order: Vec<(String, bool)>,
     limit: Option<i64>,
     offset: Option<i64>,
+    row_lock: Option<RowLock>,
     /// First identifier/operator validation error, surfaced by [`build`]. Kept
     /// as a field so the setters stay fluent (`-> Self`) rather than `Result`.
     err: Option<String>,
@@ -209,8 +232,65 @@ impl QueryBuilder {
             order: Vec::new(),
             limit: None,
             offset: None,
+            row_lock: None,
             err,
         }
+    }
+
+    /// Lock matched rows for writing (`FOR UPDATE`). Emitted per dialect by
+    /// the executing backend: Postgres locks rows; SQLite omits it (a write
+    /// transaction there already holds the whole-database lock — strictly
+    /// coarser). Combine with [`skip_locked`](QueryBuilder::skip_locked) /
+    /// [`nowait`](QueryBuilder::nowait) for contention behavior.
+    pub fn for_update(mut self) -> QueryBuilder {
+        self.row_lock = Some(RowLock {
+            exclusive: true,
+            wait: self.row_lock.map(|l| l.wait).unwrap_or(LockWait::Wait),
+        });
+        self
+    }
+
+    /// Lock matched rows for reading (`FOR SHARE`) — writers wait, readers
+    /// don't. Same dialect handling as [`for_update`](QueryBuilder::for_update).
+    pub fn for_share(mut self) -> QueryBuilder {
+        self.row_lock = Some(RowLock {
+            exclusive: false,
+            wait: self.row_lock.map(|l| l.wait).unwrap_or(LockWait::Wait),
+        });
+        self
+    }
+
+    /// `SKIP LOCKED`: skip rows another transaction holds — the work-queue
+    /// claim shape. Requires a prior `for_update`/`for_share` and the
+    /// `skip_locked` capability; backends without it **error** rather than
+    /// silently blocking (the changed semantics are the entire point).
+    pub fn skip_locked(mut self) -> QueryBuilder {
+        match &mut self.row_lock {
+            Some(l) => l.wait = LockWait::SkipLocked,
+            None if self.err.is_none() => {
+                self.err = Some("skip_locked requires for_update or for_share first".into());
+            }
+            None => {}
+        }
+        self
+    }
+
+    /// `NOWAIT`: error immediately on a locked row instead of blocking. Same
+    /// requirements as [`skip_locked`](QueryBuilder::skip_locked).
+    pub fn nowait(mut self) -> QueryBuilder {
+        match &mut self.row_lock {
+            Some(l) => l.wait = LockWait::NoWait,
+            None if self.err.is_none() => {
+                self.err = Some("nowait requires for_update or for_share first".into());
+            }
+            None => {}
+        }
+        self
+    }
+
+    /// The requested row-lock clause, if any — read by the executing backend.
+    pub fn row_lock(&self) -> Option<RowLock> {
+        self.row_lock
     }
 
     pub fn select(mut self, cols: &[&str]) -> QueryBuilder {
@@ -406,6 +486,7 @@ pub struct UpdateBuilder {
     table: String,
     sets: Vec<(String, Value)>,
     preds: Vec<Predicate>,
+    returning: Vec<String>,
     err: Option<String>,
 }
 
@@ -417,6 +498,7 @@ impl UpdateBuilder {
             table: table.to_string(),
             sets: Vec::new(),
             preds: Vec::new(),
+            returning: Vec::new(),
             err,
         }
     }
@@ -442,6 +524,20 @@ impl UpdateBuilder {
             .push(Predicate::Raw(fragment.to_string(), params));
         self
     }
+    /// `RETURNING cols` — get the affected rows back in the same round-trip.
+    /// Execute via [`Backend::update_returning`], which routes through `query`
+    /// (rows come back) and gates on the `returning_dml` capability.
+    pub fn returning(mut self, cols: &[&str]) -> UpdateBuilder {
+        for c in cols {
+            check_ident(&mut self.err, "column", c);
+        }
+        self.returning = cols.iter().map(|c| c.to_string()).collect();
+        self
+    }
+    /// Whether a `RETURNING` clause was requested — read by the backend.
+    pub fn has_returning(&self) -> bool {
+        !self.returning.is_empty()
+    }
     /// Returns `(sql, params)`. Params are SET values first, then WHERE values.
     /// `Err` if any identifier/operator failed validation.
     pub fn build(&self) -> Result<(String, Vec<Value>), String> {
@@ -461,13 +557,24 @@ impl UpdateBuilder {
         params.extend(where_params);
         Ok((
             format!(
-                "UPDATE {} SET {}{}",
+                "UPDATE {} SET {}{}{}",
                 self.table,
                 assignments.join(", "),
-                where_sql
+                where_sql,
+                returning_sql(&self.returning),
             ),
             params,
         ))
+    }
+}
+
+/// Render a `RETURNING` suffix (empty string if no columns were requested).
+/// Same syntax on both engines (SQLite ≥ 3.35).
+fn returning_sql(cols: &[String]) -> String {
+    if cols.is_empty() {
+        String::new()
+    } else {
+        format!(" RETURNING {}", cols.join(", "))
     }
 }
 
@@ -476,6 +583,7 @@ impl UpdateBuilder {
 pub struct DeleteBuilder {
     table: String,
     preds: Vec<Predicate>,
+    returning: Vec<String>,
     err: Option<String>,
 }
 
@@ -486,6 +594,7 @@ impl DeleteBuilder {
         DeleteBuilder {
             table: table.to_string(),
             preds: Vec::new(),
+            returning: Vec::new(),
             err,
         }
     }
@@ -506,13 +615,34 @@ impl DeleteBuilder {
             .push(Predicate::Raw(fragment.to_string(), params));
         self
     }
+    /// `RETURNING cols` — get the deleted rows back. Execute via
+    /// [`Backend::delete_returning`].
+    pub fn returning(mut self, cols: &[&str]) -> DeleteBuilder {
+        for c in cols {
+            check_ident(&mut self.err, "column", c);
+        }
+        self.returning = cols.iter().map(|c| c.to_string()).collect();
+        self
+    }
+    /// Whether a `RETURNING` clause was requested — read by the backend.
+    pub fn has_returning(&self) -> bool {
+        !self.returning.is_empty()
+    }
     /// `Err` if any identifier/operator failed validation.
     pub fn build(&self) -> Result<(String, Vec<Value>), String> {
         if let Some(e) = &self.err {
             return Err(e.clone());
         }
         let (where_sql, params) = render_predicates(&self.preds);
-        Ok((format!("DELETE FROM {}{}", self.table, where_sql), params))
+        Ok((
+            format!(
+                "DELETE FROM {}{}{}",
+                self.table,
+                where_sql,
+                returning_sql(&self.returning),
+            ),
+            params,
+        ))
     }
 }
 
@@ -811,5 +941,63 @@ mod tests {
         .to_json();
         assert_eq!(j.get("pages").and_then(sutegi_json::Json::as_i64), Some(3));
         assert_eq!(j.get("total").and_then(sutegi_json::Json::as_i64), Some(5));
+    }
+
+    #[test]
+    fn row_lock_state_is_stored_not_emitted() {
+        // build() stays dialect-blind; the clause is the backend's job.
+        let qb = QueryBuilder::table("jobs").for_update().skip_locked();
+        let (sql, _) = qb.build().unwrap();
+        assert!(!sql.contains("FOR UPDATE"));
+        assert_eq!(
+            qb.row_lock(),
+            Some(RowLock {
+                exclusive: true,
+                wait: LockWait::SkipLocked
+            })
+        );
+        // for_share + nowait; later for_update keeps the wait mode.
+        let qb = QueryBuilder::table("jobs")
+            .for_share()
+            .nowait()
+            .for_update();
+        assert_eq!(
+            qb.row_lock(),
+            Some(RowLock {
+                exclusive: true,
+                wait: LockWait::NoWait
+            })
+        );
+        // skip_locked without a lock mode is a builder error.
+        assert!(QueryBuilder::table("jobs").skip_locked().build().is_err());
+    }
+
+    #[test]
+    fn returning_renders_and_validates() {
+        let (sql, params) = UpdateBuilder::table("todos")
+            .set("done", Value::Bool(true))
+            .filter("id", "=", Value::Int(1))
+            .returning(&["id", "title"])
+            .build()
+            .unwrap();
+        assert_eq!(
+            sql,
+            "UPDATE todos SET done = ? WHERE id = ? RETURNING id, title"
+        );
+        assert_eq!(params.len(), 2);
+
+        let (sql, _) = DeleteBuilder::table("todos")
+            .filter("done", "=", Value::Bool(true))
+            .returning(&["id"])
+            .build()
+            .unwrap();
+        assert_eq!(sql, "DELETE FROM todos WHERE done = ? RETURNING id");
+
+        // Injection attempt in a returning column is rejected.
+        assert!(UpdateBuilder::table("todos")
+            .set("done", Value::Bool(true))
+            .returning(&["id; DROP TABLE todos"])
+            .build()
+            .is_err());
     }
 }

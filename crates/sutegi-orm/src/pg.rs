@@ -298,8 +298,32 @@ impl Pg {
     /// a [`Backend`] pinned to one connection — so the query builder + `Model`
     /// surface all run inside the transaction (unlike a raw `Client`).
     pub fn transaction<T>(&self, f: impl FnOnce(&Tx) -> Result<T, String>) -> Result<T, String> {
+        self.transaction_begin("BEGIN", f)
+    }
+
+    /// [`transaction`](Pg::transaction) at an explicit isolation level
+    /// (`BEGIN ISOLATION LEVEL …`).
+    pub fn transaction_with<T>(
+        &self,
+        isolation: crate::backend::Isolation,
+        f: impl FnOnce(&Tx) -> Result<T, String>,
+    ) -> Result<T, String> {
+        use crate::backend::Isolation;
+        let begin = match isolation {
+            Isolation::ReadCommitted => "BEGIN ISOLATION LEVEL READ COMMITTED",
+            Isolation::RepeatableRead => "BEGIN ISOLATION LEVEL REPEATABLE READ",
+            Isolation::Serializable => "BEGIN ISOLATION LEVEL SERIALIZABLE",
+        };
+        self.transaction_begin(begin, f)
+    }
+
+    fn transaction_begin<T>(
+        &self,
+        begin: &str,
+        f: impl FnOnce(&Tx) -> Result<T, String>,
+    ) -> Result<T, String> {
         self.pool.with(|client| {
-            client.batch("BEGIN")?;
+            client.batch(begin)?;
             let tx = Tx {
                 client: RefCell::new(client),
             };
@@ -413,6 +437,59 @@ impl Backend for Pg {
             Err(e) => Err(e),
         }
     }
+
+    /// Bulk insert over wire-native `COPY … FROM STDIN` (text format) — one
+    /// round-trip for the whole batch instead of one statement per chunk.
+    fn insert_many(
+        &self,
+        table: &str,
+        cols: &[&str],
+        rows: &[Vec<Value>],
+    ) -> Result<usize, String> {
+        crate::backend::check_bulk_shape(table, cols, rows)?;
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let sql = format!("COPY {} ({}) FROM STDIN", table, cols.join(", "));
+        let mut data = String::new();
+        for row in rows {
+            for (i, v) in row.iter().enumerate() {
+                if i > 0 {
+                    data.push('\t');
+                }
+                copy_text(v, &mut data);
+            }
+            data.push('\n');
+        }
+        self.pool
+            .with(|client| client.copy_in(&sql, data.as_bytes()))
+            .map(|n| n as usize)
+    }
+}
+
+/// Render one [`Value`] in COPY text format: `\N` for NULL, `t`/`f` booleans,
+/// and `\\ \t \n \r` escaped inside text so field/row delimiters survive.
+fn copy_text(v: &Value, out: &mut String) {
+    let escape_into = |s: &str, out: &mut String| {
+        for c in s.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '\t' => out.push_str("\\t"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                _ => out.push(c),
+            }
+        }
+    };
+    match v {
+        Value::Null => out.push_str("\\N"),
+        Value::Int(i) => out.push_str(&i.to_string()),
+        Value::Real(r) => out.push_str(&r.to_string()),
+        Value::Bool(b) => out.push(if *b { 't' } else { 'f' }),
+        Value::Text(s) => escape_into(s, out),
+        Value::Json(j) => escape_into(&j.to_string(), out),
+        Value::Vector(vec) => escape_into(&crate::value::vector_to_text(vec), out),
+    }
 }
 
 /// Run one `pg_try_advisory_*` statement for
@@ -432,6 +509,11 @@ fn advisory_lock(client: &mut Client, sql: &str, name: &str) -> Result<bool, Str
 fn pg_caps() -> crate::backend::BackendCaps {
     crate::backend::BackendCaps {
         advisory_locks: crate::backend::CapScope::Cluster,
+        row_locks: true,
+        skip_locked: true,
+        isolation_levels: true,
+        returning_dml: true,
+        bulk_copy: true,
         listen_notify: true,
         vector: true,
         ..crate::backend::BackendCaps::none("postgres")
@@ -444,6 +526,14 @@ impl crate::backend::Transactional for Pg {
         f: &mut dyn FnMut(&dyn Backend) -> Result<(), String>,
     ) -> Result<(), String> {
         self.transaction(|tx| f(tx))
+    }
+
+    fn run_in_tx_with(
+        &self,
+        isolation: crate::backend::Isolation,
+        f: &mut dyn FnMut(&dyn Backend) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.transaction_with(isolation, |tx| f(tx))
     }
 }
 
@@ -537,8 +627,11 @@ mod tests {
         assert!(caps.listen_notify);
         assert!(caps.vector);
         assert_eq!(caps.advisory_locks, crate::backend::CapScope::Cluster);
+        assert!(caps.row_locks && caps.skip_locked && caps.isolation_levels);
+        assert!(caps.returning_dml && caps.bulk_copy);
         // No framework surface yet — later milestones flip these.
-        assert!(!caps.row_locks && !caps.returning_dml && !caps.json_path && !caps.fts);
+        assert!(!caps.json_path && !caps.json_contains && !caps.fts);
+        assert_eq!(caps.live_queries, crate::backend::CapScope::None);
     }
 
     #[test]

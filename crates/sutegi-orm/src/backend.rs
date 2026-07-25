@@ -175,6 +175,70 @@ pub fn lock_key(name: &str) -> i64 {
 /// How often the default polling [`lock`](Backend::lock) re-attempts.
 const LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// Render a requested row-lock clause for a backend, or gate it. Backends
+/// without row locks treat plain `FOR UPDATE`/`FOR SHARE` as a documented
+/// no-op (a SQLite write transaction already holds the whole-database lock —
+/// strictly coarser), but `SKIP LOCKED`/`NOWAIT` **error**: their entire point
+/// is altered semantics under contention, which such a backend cannot express.
+fn row_lock_sql(lock: crate::builder::RowLock, caps: &BackendCaps) -> Result<String, String> {
+    use crate::builder::LockWait;
+    if !caps.row_locks {
+        return match lock.wait {
+            LockWait::Wait => Ok(String::new()),
+            LockWait::SkipLocked => Err(unsupported("skip_locked", caps.backend)),
+            LockWait::NoWait => Err(unsupported("nowait", caps.backend)),
+        };
+    }
+    let mut sql = String::from(if lock.exclusive {
+        " FOR UPDATE"
+    } else {
+        " FOR SHARE"
+    });
+    match lock.wait {
+        LockWait::Wait => {}
+        LockWait::SkipLocked if caps.skip_locked => sql.push_str(" SKIP LOCKED"),
+        LockWait::NoWait if caps.skip_locked => sql.push_str(" NOWAIT"),
+        LockWait::SkipLocked => return Err(unsupported("skip_locked", caps.backend)),
+        LockWait::NoWait => return Err(unsupported("nowait", caps.backend)),
+    }
+    Ok(sql)
+}
+
+/// Validate a bulk-insert call's identifiers and row widths — shared by the
+/// default [`Backend::insert_many`] and the Postgres COPY override.
+pub(crate) fn check_bulk_shape(
+    table: &str,
+    cols: &[&str],
+    rows: &[Vec<Value>],
+) -> Result<(), String> {
+    if cols.is_empty() {
+        return Err("insert_many: no columns".into());
+    }
+    let named: Vec<(&str, Value)> = cols.iter().map(|c| (*c, Value::Null)).collect();
+    crate::builder::validate_write_idents(table, &named, &[])?;
+    if let Some((i, row)) = rows.iter().enumerate().find(|(_, r)| r.len() != cols.len()) {
+        return Err(format!(
+            "insert_many: row {i} has {} values, expected {}",
+            row.len(),
+            cols.len()
+        ));
+    }
+    Ok(())
+}
+
+/// A transaction isolation level for
+/// [`Transactional::transact_with`]. Postgres maps directly
+/// (`BEGIN ISOLATION LEVEL …`); SQLite is always serializable by nature, so
+/// levels map to *when the write lock is taken* (`Serializable` →
+/// `BEGIN EXCLUSIVE`, `RepeatableRead` → `BEGIN IMMEDIATE`, `ReadCommitted` →
+/// plain `BEGIN`) — running *stronger* than asked is honest, weaker is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Isolation {
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
 /// A runnable execution backend behind the query builder.
 ///
 /// Implementors provide the five dialect-specific **primitives**
@@ -290,10 +354,71 @@ pub trait Backend {
 
     // --- default methods (shared, implemented via the primitives) ---
 
-    /// Run a query builder and return rows as JSON objects.
+    /// Run a query builder and return rows as JSON objects. A requested
+    /// row-lock clause is emitted here — per this backend's dialect and
+    /// capabilities — so `build()` stays dialect-blind.
     fn select(&self, qb: &QueryBuilder) -> Result<Vec<Json>, String> {
-        let (sql, params) = qb.build()?;
+        let (mut sql, params) = qb.build()?;
+        if let Some(lock) = qb.row_lock() {
+            sql.push_str(&row_lock_sql(lock, &self.capabilities())?);
+        }
         self.query(&sql, &params)
+    }
+
+    /// Run an UPDATE with a `RETURNING` clause and get the affected rows back
+    /// in the same round-trip. Gated on the `returning_dml` capability — a
+    /// backend whose driver would silently discard the rows errors instead.
+    fn update_returning(&self, ub: &UpdateBuilder) -> Result<Vec<Json>, String> {
+        let caps = self.capabilities();
+        if !caps.returning_dml {
+            return Err(unsupported("returning_dml", caps.backend));
+        }
+        let (sql, params) = ub.build()?;
+        self.query(&sql, &params)
+    }
+
+    /// Run a DELETE with a `RETURNING` clause and get the deleted rows back.
+    /// Same gating as [`update_returning`](Backend::update_returning).
+    fn delete_returning(&self, db: &DeleteBuilder) -> Result<Vec<Json>, String> {
+        let caps = self.capabilities();
+        if !caps.returning_dml {
+            return Err(unsupported("returning_dml", caps.backend));
+        }
+        let (sql, params) = db.build()?;
+        self.query(&sql, &params)
+    }
+
+    /// Insert many rows of the same shape in few statements. The default
+    /// batches multi-row `INSERT … VALUES` under the placeholder budget and
+    /// works on any backend; Postgres overrides it with wire-native
+    /// `COPY FROM STDIN` (`bulk_copy: true` marks the native path).
+    fn insert_many(
+        &self,
+        table: &str,
+        cols: &[&str],
+        rows: &[Vec<Value>],
+    ) -> Result<usize, String> {
+        check_bulk_shape(table, cols, rows)?;
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        // Rows per statement: SQLite's binding ceiling is the tight one
+        // (32766 on the bundled build); stay well under it and cap statement
+        // size for Postgres too.
+        let per_batch = (30_000 / cols.len().max(1)).clamp(1, 500);
+        let row_marks = format!("({})", vec!["?"; cols.len()].join(", "));
+        let mut affected = 0;
+        for chunk in rows.chunks(per_batch) {
+            let sql = format!(
+                "INSERT INTO {} ({}) VALUES {}",
+                table,
+                cols.join(", "),
+                vec![row_marks.as_str(); chunk.len()].join(", "),
+            );
+            let params: Vec<Value> = chunk.iter().flatten().cloned().collect();
+            affected += self.execute(&sql, &params)?;
+        }
+        Ok(affected)
     }
 
     /// Run a SELECT and return only the first row, if any.
@@ -394,6 +519,37 @@ pub trait Transactional: Backend {
     {
         let mut out: Option<T> = None;
         self.run_in_tx(&mut |tx| {
+            out = Some(f(tx)?);
+            Ok(())
+        })?;
+        out.ok_or_else(|| "transaction closure did not run".to_string())
+    }
+
+    /// Object-safe core of [`transact_with`](Transactional::transact_with).
+    /// The default **errors** (`unsupported("isolation_levels")`) — silently
+    /// running at a weaker level than asked would be a lie; the bundled
+    /// backends override it.
+    fn run_in_tx_with(
+        &self,
+        isolation: Isolation,
+        f: &mut dyn FnMut(&dyn Backend) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let _ = (isolation, f);
+        Err(unsupported("isolation_levels", self.capabilities().backend))
+    }
+
+    /// [`transact`](Transactional::transact) at an explicit [`Isolation`]
+    /// level: `db.transact_with(Isolation::Serializable, |tx| …)`.
+    fn transact_with<T>(
+        &self,
+        isolation: Isolation,
+        mut f: impl FnMut(&dyn Backend) -> Result<T, String>,
+    ) -> Result<T, String>
+    where
+        Self: Sized,
+    {
+        let mut out: Option<T> = None;
+        self.run_in_tx_with(isolation, &mut |tx| {
             out = Some(f(tx)?);
             Ok(())
         })?;
@@ -797,5 +953,84 @@ mod tests {
             unsupported("advisory_locks", "sqlite"),
             "unsupported: advisory_locks is not available on the sqlite backend"
         );
+    }
+
+    #[test]
+    fn row_lock_sql_emits_or_gates_per_caps() {
+        use crate::builder::{LockWait, RowLock};
+        let lock = |exclusive, wait| RowLock { exclusive, wait };
+
+        let pg = BackendCaps {
+            row_locks: true,
+            skip_locked: true,
+            ..BackendCaps::none("postgres")
+        };
+        let sql = |l| row_lock_sql(l, &pg).unwrap();
+        assert_eq!(sql(lock(true, LockWait::Wait)), " FOR UPDATE");
+        assert_eq!(sql(lock(false, LockWait::Wait)), " FOR SHARE");
+        assert_eq!(
+            sql(lock(true, LockWait::SkipLocked)),
+            " FOR UPDATE SKIP LOCKED"
+        );
+        assert_eq!(sql(lock(true, LockWait::NoWait)), " FOR UPDATE NOWAIT");
+
+        // No row locks: plain lock is a documented no-op, altered-semantics
+        // variants error.
+        let lite = BackendCaps::none("sqlite");
+        assert_eq!(row_lock_sql(lock(true, LockWait::Wait), &lite).unwrap(), "");
+        assert!(row_lock_sql(lock(true, LockWait::SkipLocked), &lite).is_err());
+        assert!(row_lock_sql(lock(true, LockWait::NoWait), &lite).is_err());
+    }
+
+    #[test]
+    fn insert_many_batches_under_the_placeholder_budget() {
+        use std::cell::RefCell;
+
+        /// Records each executed statement's placeholder count.
+        #[derive(Default)]
+        struct Recorder {
+            batches: RefCell<Vec<usize>>,
+        }
+        impl Backend for Recorder {
+            fn query(&self, _: &str, _: &[Value]) -> Result<Vec<Json>, String> {
+                Ok(Vec::new())
+            }
+            fn execute(&self, sql: &str, params: &[Value]) -> Result<usize, String> {
+                assert!(sql.starts_with("INSERT INTO items (a, b) VALUES (?, ?)"));
+                self.batches.borrow_mut().push(params.len());
+                Ok(params.len() / 2)
+            }
+            fn insert(&self, _: &str, _: &[(&str, Value)], _: &str) -> Result<i64, String> {
+                Ok(0)
+            }
+            fn upsert(
+                &self,
+                _: &str,
+                _: &[(&str, Value)],
+                _: &str,
+                _: &str,
+            ) -> Result<i64, String> {
+                Ok(0)
+            }
+            fn migrate(&self, _: &TableSchema) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let rec = Recorder::default();
+        let rows: Vec<Vec<Value>> = (0..1201)
+            .map(|i| vec![Value::Int(i), Value::Text(format!("r{i}"))])
+            .collect();
+        let n = rec.insert_many("items", &["a", "b"], &rows).unwrap();
+        assert_eq!(n, 1201);
+        // 500 rows per statement: 500 + 500 + 201.
+        assert_eq!(*rec.batches.borrow(), vec![1000, 1000, 402]);
+
+        // Shape errors are caught before any statement runs.
+        assert!(rec
+            .insert_many("items", &["a", "b"], &[vec![Value::Int(1)]])
+            .is_err());
+        assert!(rec.insert_many("items; --", &["a"], &[]).is_err());
+        assert_eq!(rec.insert_many("items", &["a", "b"], &[]).unwrap(), 0);
     }
 }

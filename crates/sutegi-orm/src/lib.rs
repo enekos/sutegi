@@ -26,10 +26,10 @@ mod builder;
 mod value;
 
 pub use backend::{
-    lock_key, row, unsupported, Backend, BackendCaps, CapScope, FromInput, FromRow, LockGuard,
-    Model, Transactional,
+    lock_key, row, unsupported, Backend, BackendCaps, CapScope, FromInput, FromRow, Isolation,
+    LockGuard, Model, Transactional,
 };
-pub use builder::{DeleteBuilder, Page, QueryBuilder, UpdateBuilder};
+pub use builder::{DeleteBuilder, LockWait, Page, QueryBuilder, RowLock, UpdateBuilder};
 pub use value::{
     create_table_sql, default_sql, parse_default_literal, schema_from_json, schema_json,
     schema_to_json, value_from_json, value_to_json, ColType, Column, Dialect, FkAction, ForeignKey,

@@ -230,6 +230,69 @@ impl Client {
         !self.broken && self.batch("SELECT 1").is_ok()
     }
 
+    /// Run a `COPY … FROM STDIN` with `data` as the whole stream (text
+    /// format: tab-separated fields, newline-terminated rows, `\N` nulls).
+    /// Returns the row count from `CommandComplete` (`COPY <n>`).
+    ///
+    /// Flow: simple `Query` → `CopyInResponse` → one `CopyData` + `CopyDone`
+    /// → `CommandComplete`/`ErrorResponse` → `ReadyForQuery`. If the server
+    /// rejects the statement itself (bad table, permissions) it never enters
+    /// copy mode — we drain to `ReadyForQuery` and return the error without
+    /// sending data.
+    pub fn copy_in(&mut self, sql: &str, data: &[u8]) -> Result<u64, String> {
+        let mut msg = sql.as_bytes().to_vec();
+        msg.push(0);
+        self.send_msg(b'Q', &msg)?;
+
+        // Wait for CopyInResponse ('G'); an error here means copy mode was
+        // never entered.
+        loop {
+            let (tag, body) = self.recv()?;
+            match tag {
+                b'G' => break,
+                b'E' => {
+                    let err = parse_error(&body);
+                    loop {
+                        if self.recv()?.0 == b'Z' {
+                            break;
+                        }
+                    }
+                    return Err(err);
+                }
+                _ => continue,
+            }
+        }
+
+        self.send_msg(b'd', data)?; // CopyData
+        self.send_msg(b'c', &[])?; // CopyDone
+
+        // Collect the COPY row count; drain to ReadyForQuery either way.
+        let mut err = None;
+        let mut affected = 0;
+        loop {
+            let (tag, body) = self.recv()?;
+            match tag {
+                b'Z' => break,
+                b'E' => err = Some(parse_error(&body)),
+                b'C' => {
+                    // "COPY <n>\0"
+                    let text = String::from_utf8_lossy(&body);
+                    affected = text
+                        .trim_end_matches('\0')
+                        .rsplit(' ')
+                        .next()
+                        .and_then(|n| n.parse().ok())
+                        .unwrap_or(0);
+                }
+                _ => continue,
+            }
+        }
+        match err {
+            Some(e) => Err(e),
+            None => Ok(affected),
+        }
+    }
+
     /// The extended-query exchange, with per-connection statement caching.
     ///
     /// A novel SQL string is `Parse`d into a named statement and remembered;

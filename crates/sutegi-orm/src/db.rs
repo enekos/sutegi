@@ -217,8 +217,36 @@ impl Db {
     /// which is a [`Backend`], so the whole query builder + `Model` surface
     /// works inside the transaction.
     pub fn transaction<T>(&self, f: impl FnOnce(&Tx) -> Result<T, String>) -> Result<T, String> {
+        self.transaction_begin("BEGIN", f)
+    }
+
+    /// [`transaction`](Db::transaction) at an explicit isolation level.
+    /// SQLite is always serializable; levels map to *when the write lock is
+    /// taken*: `Serializable` → `BEGIN EXCLUSIVE`, `RepeatableRead` →
+    /// `BEGIN IMMEDIATE` (write intent up front — no deferred-upgrade
+    /// deadlock race), `ReadCommitted` → plain `BEGIN`. Stronger than asked
+    /// is honest; weaker would not be.
+    pub fn transaction_with<T>(
+        &self,
+        isolation: crate::backend::Isolation,
+        f: impl FnOnce(&Tx) -> Result<T, String>,
+    ) -> Result<T, String> {
+        use crate::backend::Isolation;
+        let begin = match isolation {
+            Isolation::ReadCommitted => "BEGIN",
+            Isolation::RepeatableRead => "BEGIN IMMEDIATE",
+            Isolation::Serializable => "BEGIN EXCLUSIVE",
+        };
+        self.transaction_begin(begin, f)
+    }
+
+    fn transaction_begin<T>(
+        &self,
+        begin: &str,
+        f: impl FnOnce(&Tx) -> Result<T, String>,
+    ) -> Result<T, String> {
         self.pool.with(|conn| {
-            conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+            conn.execute_batch(begin).map_err(|e| e.to_string())?;
             let tx = Tx {
                 conn: RefCell::new(conn),
             };
@@ -470,6 +498,8 @@ impl Backend for Db {
         // none yet. Bits flip here as feature milestones land.
         crate::backend::BackendCaps {
             advisory_locks: crate::backend::CapScope::Process,
+            isolation_levels: true,
+            returning_dml: true,
             ..crate::backend::BackendCaps::none("sqlite")
         }
     }
@@ -498,6 +528,14 @@ impl crate::backend::Transactional for Db {
     ) -> Result<(), String> {
         self.transaction(|tx| f(tx))
     }
+
+    fn run_in_tx_with(
+        &self,
+        isolation: crate::backend::Isolation,
+        f: &mut dyn FnMut(&dyn Backend) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.transaction_with(isolation, |tx| f(tx))
+    }
 }
 
 /// A transaction handle: a [`Backend`] pinned to a single connection for the
@@ -513,10 +551,14 @@ impl Backend for Tx<'_> {
         query_conn(&conn, sql, params)
     }
 
-    /// Same store, same honesty — but no advisory locks from inside a
-    /// transaction handle (take them on the [`Db`] before `transaction()`).
+    /// Same store, same honesty — RETURNING works inside the transaction,
+    /// but no advisory locks (take them on the [`Db`] before `transaction()`)
+    /// and no nested isolation.
     fn capabilities(&self) -> crate::backend::BackendCaps {
-        crate::backend::BackendCaps::none("sqlite")
+        crate::backend::BackendCaps {
+            returning_dml: true,
+            ..crate::backend::BackendCaps::none("sqlite")
+        }
     }
 
     fn execute(&self, sql: &str, params: &[Value]) -> Result<usize, String> {
@@ -624,6 +666,87 @@ mod tests {
         let _guard = a.try_lock("job").unwrap().expect("first acquire");
         assert!(b.try_lock("job").unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn returning_dml_round_trips() {
+        let db = Db::memory().unwrap();
+        db.migrate(&todos_schema()).unwrap();
+        db.insert(
+            "todos",
+            &[
+                ("title", Value::Text("a".into())),
+                ("done", Value::Bool(false)),
+            ],
+            "id",
+        )
+        .unwrap();
+
+        let rows = db
+            .update_returning(
+                &UpdateBuilder::table("todos")
+                    .set("done", Value::Bool(true))
+                    .filter("title", "=", Value::Text("a".into()))
+                    .returning(&["id", "done"]),
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("done").and_then(Json::as_i64), Some(1));
+
+        let rows = db
+            .delete_returning(
+                &DeleteBuilder::table("todos")
+                    .filter("done", "=", Value::Bool(true))
+                    .returning(&["title"]),
+            )
+            .unwrap();
+        assert_eq!(rows[0].get("title").and_then(Json::as_str), Some("a"));
+        assert_eq!(db.count(&QueryBuilder::table("todos")).unwrap(), 0);
+    }
+
+    #[test]
+    fn transaction_with_all_levels_and_lock_noop() {
+        use crate::backend::Isolation;
+        let db = Db::memory().unwrap();
+        db.migrate(&todos_schema()).unwrap();
+        for iso in [
+            Isolation::ReadCommitted,
+            Isolation::RepeatableRead,
+            Isolation::Serializable,
+        ] {
+            db.transaction_with(iso, |tx| {
+                tx.insert(
+                    "todos",
+                    &[
+                        ("title", Value::Text(format!("{iso:?}"))),
+                        ("done", Value::Bool(false)),
+                    ],
+                    "id",
+                )
+            })
+            .unwrap();
+        }
+        assert_eq!(db.count(&QueryBuilder::table("todos")).unwrap(), 3);
+
+        // for_update is a documented no-op on SQLite; skip_locked errors.
+        assert!(db
+            .select(&QueryBuilder::table("todos").for_update())
+            .is_ok());
+        assert!(db
+            .select(&QueryBuilder::table("todos").for_update().skip_locked())
+            .is_err());
+    }
+
+    #[test]
+    fn insert_many_default_batches_on_sqlite() {
+        let db = Db::memory().unwrap();
+        db.migrate(&todos_schema()).unwrap();
+        let rows: Vec<Vec<Value>> = (0..777)
+            .map(|i| vec![Value::Text(format!("t{i}")), Value::Bool(i % 2 == 0)])
+            .collect();
+        let n = db.insert_many("todos", &["title", "done"], &rows).unwrap();
+        assert_eq!(n, 777);
+        assert_eq!(db.count(&QueryBuilder::table("todos")).unwrap(), 777);
     }
 
     #[test]
