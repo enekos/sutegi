@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-07-27
+
+The production user-system release: everything Laravel's auth scaffolding does, still zero third-party dependencies.
+
+### Added
+
+- Auth: **remember me** (`sutegi_auth::Remember`) — selector/validator cookies where only the validator's SHA-256 is stored, the validator **rotates on every use** (a stolen-then-replayed copy revokes the row, surfacing the theft), tokens are **bound to the password hash** at mint (password change kills them silently), and server-side expiry (default 30 days) ignores whatever the client claims. `Auth::remember(store)` + `Auth::login_remembered` mint it; **`Auth::identify`** is the handler-side revival point — session-or-remember, returning an `Identified { user, via_remember }` whose `attach(resp)` sets the fresh session + rotated remember cookies (sutegi middleware cannot set cookies on pass-through, so revival lives in whatever endpoint establishes client identity: a `/me`, a page shell). `Auth::logout_from(req, resp)` revokes the presented token and expires both cookies; `Auth::logout_everywhere(uid)` revokes them all.
+- Auth: **login throttling** (`sutegi_auth::Throttle`) — Laravel's `ThrottlesLogins` as a DB-backed fixed window (default 5 attempts / 60 s, per any key you choose — the convention is `login:<email>|<ip>`), so every pod counts the same attempts. `too_many(key)` → retry-after seconds, `hit(key)` (atomic `UPDATE … attempts + 1`), `clear(key)` on success.
+- Session/Auth: **CSRF tokens** — `Sessions::csrf(&mut Session)` get-or-mints a 32-byte token inside the signed session, `Sessions::verify_csrf` compares in constant time, `Auth::csrf(req, resp)` is the handler shape, and the `require_csrf` guard enforces `X-CSRF-Token` on mutating methods (419 on mismatch, Laravel's "Page Expired") while passing reads and `Authorization`-header callers — bearer clients carry no ambient credential, which is what CSRF forges.
+- Auth: **sessions bound to the password hash** — `Auth::login` stamps a 16-hex fingerprint of the current PHC string into the signed session; `Auth::current`/`Auth::identify` treat a stale binding as anonymous. Changing a password now logs out every other device on their next store-checking request (`AuthenticateSession` semantics). `Auth::user_id` stays pure cookie-HMAC (documented as not enforcing the binding). Sessions minted by 0.7 (no fingerprint) still pass — strict on mismatch, lenient on absence.
+- Auth: **auto-rehash at login** — `Users::authenticate` transparently re-hashes a verified password whose stored iteration count is below the store's (best-effort; a rehash failure never fails a valid login). Raise the work factor in one place and the fleet upgrades itself credential-by-credential.
+- Auth: `require_verified` guard — Laravel's `verified` middleware: 401 anonymous, 403 `email unverified` until `verified_at` is set.
+- Auth: profile operations — `Users::change_password(id, current, new)` (verifies the current password first; the profile-screen shape), `Users::set_name`, and `Users::set_email` (normalizes, checks uniqueness, **resets `verified_at` to 0** so the new address must re-verify).
+- Auth: API-token lifecycle — `Tokens::issue_expiring(uid, name, ttl)` mints tokens that stop verifying after their deadline (Sanctum expiration), every successful `verify` stamps `last_used_at`, and both fields ride `ApiToken::to_json()`/`list()`. Existing `api_tokens` tables upgrade in place (tolerant `ALTER`s, same pattern as `users.verified_at`).
+- Session: `Sessions::cookie_for(&Session)` — the `Set-Cookie` value `save` would attach, for callers that collect cookies before touching a response (what `Auth::identify` rides).
+- Example: `examples/auth` now exercises the whole system — `"remember": true` login, `/me` revival, throttled login (429 + `retry_after`), full logout.
+
+### Changed
+
+- Auth: `Auth` has a new public `remember: Option<Remember<B>>` field; code constructing `Auth` as a struct literal must add `remember: None` (the `Auth::new` builder is unaffected).
+- Auth: a login that triggers an auto-rehash changes the password-hash fingerprint, so **other** devices' sessions and remember tokens from before the rehash stop validating — same semantics as an actual password change, and a one-time event per credential after raising the work factor.
+
 ## [0.7.0] - 2026-07-25
 
 ### Added

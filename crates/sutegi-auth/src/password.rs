@@ -62,6 +62,14 @@ pub fn needs_rehash(stored: &str, iterations: u32) -> bool {
     }
 }
 
+/// A short fingerprint of a stored hash — what sessions, remember tokens,
+/// and reset links bind to so they die when the password changes. Not
+/// secret-bearing: 16 hex chars of SHA-256 over the PHC string.
+pub(crate) fn fingerprint(stored_hash: &str) -> String {
+    use sutegi_crypto::{hex, sha256};
+    hex(&sha256(stored_hash.as_bytes()))[..16].to_string()
+}
+
 fn parse_phc(stored: &str) -> Option<(u32, Vec<u8>, Vec<u8>)> {
     let mut parts = stored.split('$');
     if !parts.next()?.is_empty() {

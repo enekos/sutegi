@@ -24,6 +24,10 @@ pub struct ApiToken {
     /// A human label ("ci-deploy", "claude-agent"), for revocation lists.
     pub name: String,
     pub created_at: i64,
+    /// Unix seconds after which the token stops verifying; `0` = never.
+    pub expires_at: i64,
+    /// Unix seconds of the last successful verify; `0` = never used.
+    pub last_used_at: i64,
 }
 
 impl ApiToken {
@@ -33,6 +37,8 @@ impl ApiToken {
             ("user_id", Json::int(self.user_id)),
             ("name", Json::str(self.name.clone())),
             ("created_at", Json::int(self.created_at)),
+            ("expires_at", Json::int(self.expires_at)),
+            ("last_used_at", Json::int(self.last_used_at)),
         ])
     }
 }
@@ -55,8 +61,18 @@ impl<B: Backend> Tokens<B> {
                 .column(Column::new("user_id", ColType::Integer))
                 .column(Column::new("name", ColType::Text))
                 .column(Column::new("token_hash", ColType::Text))
-                .column(Column::new("created_at", ColType::Integer)),
+                .column(Column::new("created_at", ColType::Integer))
+                .column(Column::new("expires_at", ColType::Integer))
+                .column(Column::new("last_used_at", ColType::Integer)),
         )?;
+        // Upgrade path for tables created before expiry/usage existed; the
+        // "duplicate column" error on an already-current table is expected.
+        for col in ["expires_at", "last_used_at"] {
+            let _ = self.backend.execute(
+                &format!("ALTER TABLE api_tokens ADD COLUMN {col} BIGINT NOT NULL DEFAULT 0"),
+                &[],
+            );
+        }
         self.backend
             .execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS api_tokens_hash_unique ON api_tokens (token_hash)",
@@ -65,9 +81,29 @@ impl<B: Backend> Tokens<B> {
             .map(|_| ())
     }
 
-    /// Mint a token for `user_id`. Returns `(plaintext, record)` — show or
-    /// deliver the plaintext now; it cannot be recovered later.
+    /// Mint a non-expiring token for `user_id`. Returns `(plaintext, record)`
+    /// — show or deliver the plaintext now; it cannot be recovered later.
     pub fn issue(&self, user_id: i64, name: &str) -> Result<(String, ApiToken), String> {
+        self.issue_with(user_id, name, 0)
+    }
+
+    /// Mint a token that stops verifying after `ttl_secs` (Sanctum's token
+    /// expiration).
+    pub fn issue_expiring(
+        &self,
+        user_id: i64,
+        name: &str,
+        ttl_secs: i64,
+    ) -> Result<(String, ApiToken), String> {
+        self.issue_with(user_id, name, now_secs() + ttl_secs.max(1))
+    }
+
+    fn issue_with(
+        &self,
+        user_id: i64,
+        name: &str,
+        expires_at: i64,
+    ) -> Result<(String, ApiToken), String> {
         let plaintext = format!("{TOKEN_PREFIX}{}", hex(&random_bytes(32)?));
         let created_at = now_secs();
         let id = self.backend.insert(
@@ -77,6 +113,8 @@ impl<B: Backend> Tokens<B> {
                 ("name", Value::Text(name.to_string())),
                 ("token_hash", Value::Text(hash_of(&plaintext))),
                 ("created_at", Value::Int(created_at)),
+                ("expires_at", Value::Int(expires_at)),
+                ("last_used_at", Value::Int(0)),
             ],
             "id",
         )?;
@@ -87,33 +125,48 @@ impl<B: Backend> Tokens<B> {
                 user_id,
                 name: name.to_string(),
                 created_at,
+                expires_at,
+                last_used_at: 0,
             },
         ))
     }
 
-    /// Resolve a presented token to its owning user id, or `None`. The lookup
-    /// is by SHA-256 — equality on an unpredictable 256-bit value, so an index
-    /// probe leaks nothing usable.
+    /// Resolve a presented token to its owning user id, or `None` (unknown
+    /// or expired). The lookup is by SHA-256 — equality on an unpredictable
+    /// 256-bit value, so an index probe leaks nothing usable. A hit stamps
+    /// `last_used_at` (best-effort).
     pub fn verify(&self, presented: &str) -> Result<Option<i64>, String> {
         if !presented.starts_with(TOKEN_PREFIX) {
             return Ok(None);
         }
-        Ok(self
-            .backend
-            .query_one(
-                "SELECT user_id FROM api_tokens WHERE token_hash = ?",
-                &[Value::Text(hash_of(presented))],
-            )?
-            .and_then(|r| r.get("user_id").and_then(Json::as_f64))
-            .map(|f| f as i64))
+        let Some(row) = self.backend.query_one(
+            "SELECT id, user_id, expires_at FROM api_tokens WHERE token_hash = ?",
+            &[Value::Text(hash_of(presented))],
+        )?
+        else {
+            return Ok(None);
+        };
+        let int_of = |k: &str| row.get(k).and_then(Json::as_f64).map(|f| f as i64);
+        let (Some(id), Some(user_id)) = (int_of("id"), int_of("user_id")) else {
+            return Ok(None);
+        };
+        let expires_at = int_of("expires_at").unwrap_or(0);
+        if expires_at > 0 && expires_at < now_secs() {
+            return Ok(None);
+        }
+        let _ = self.backend.execute(
+            "UPDATE api_tokens SET last_used_at = ? WHERE id = ?",
+            &[Value::Int(now_secs()), Value::Int(id)],
+        );
+        Ok(Some(user_id))
     }
 
     /// A user's tokens (metadata only), newest first.
     pub fn list(&self, user_id: i64) -> Result<Vec<ApiToken>, String> {
         self.backend
             .query(
-                "SELECT id, user_id, name, created_at FROM api_tokens \
-                 WHERE user_id = ? ORDER BY id DESC",
+                "SELECT id, user_id, name, created_at, expires_at, last_used_at \
+                 FROM api_tokens WHERE user_id = ? ORDER BY id DESC",
                 &[Value::Int(user_id)],
             )?
             .iter()
@@ -158,6 +211,8 @@ fn token_of(row: &Json) -> Result<ApiToken, String> {
             .unwrap_or_default()
             .to_string(),
         created_at: int_of("created_at")?,
+        expires_at: int_of("expires_at").unwrap_or(0),
+        last_used_at: int_of("last_used_at").unwrap_or(0),
     })
 }
 
@@ -200,6 +255,31 @@ mod tests {
         let stored = rows[0].get("token_hash").and_then(Json::as_str).unwrap();
         assert_ne!(stored, plain);
         assert!(!stored.contains(&plain[4..20]));
+    }
+
+    #[test]
+    fn expiry_and_last_used() {
+        let tokens = store();
+        let (fresh, rec) = tokens.issue_expiring(3, "short", 3_600).unwrap();
+        assert!(rec.expires_at > now_secs());
+        assert_eq!(tokens.verify(&fresh).unwrap(), Some(3));
+        // A verify stamps last_used_at.
+        let listed = &tokens.list(3).unwrap()[0];
+        assert!(listed.last_used_at > 0);
+
+        // Backdate the expiry: the token stops verifying.
+        tokens
+            .backend
+            .execute(
+                "UPDATE api_tokens SET expires_at = 1 WHERE id = ?",
+                &[Value::Int(rec.id)],
+            )
+            .unwrap();
+        assert_eq!(tokens.verify(&fresh).unwrap(), None);
+
+        // Non-expiring tokens (expires_at = 0) still verify.
+        let (forever, _) = tokens.issue(3, "forever").unwrap();
+        assert_eq!(tokens.verify(&forever).unwrap(), Some(3));
     }
 
     #[test]

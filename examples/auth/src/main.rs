@@ -1,21 +1,23 @@
 //! The sutegi user system, end to end: registration, signed-cookie login with
-//! server-side expiry, role-gated admin routes, and API tokens for agents.
+//! server-side expiry, remember-me revival, login throttling, role-gated
+//! admin routes, and API tokens for agents.
 //!
 //! ```text
 //! curl -c /tmp/cj -X POST localhost:8080/register -d '{"email":"root@example.com","password":"password1","name":"Root"}'
-//! curl -c /tmp/cj -X POST localhost:8080/login    -d '{"email":"root@example.com","password":"password1"}'
-//! curl -b /tmp/cj localhost:8080/me
+//! curl -c /tmp/cj -X POST localhost:8080/login    -d '{"email":"root@example.com","password":"password1","remember":true}'
+//! curl -b /tmp/cj -c /tmp/cj localhost:8080/me      # revives from the remember cookie if the session lapsed
 //! curl -b /tmp/cj localhost:8080/admin/users        # first user is admin
 //! curl -b /tmp/cj -X POST localhost:8080/tokens -d '{"name":"my-agent"}'
 //! curl -H "Authorization: Bearer stg_…" localhost:8080/api/whoami
-//! curl -b /tmp/cj -X POST localhost:8080/logout
+//! curl -b /tmp/cj -X POST localhost:8080/logout     # kills session + remember token
 //! curl "localhost:8080/verify-email?token=…"        # from the emailed link
 //! curl -X POST localhost:8080/forgot-password -d '{"email":"root@example.com"}'
 //! curl -X POST localhost:8080/reset-password -d '{"token":"…","password":"newpass99"}'
 //! ```
 //!
 //! The **first registered user becomes `admin`** (bootstrap convention);
-//! everyone after is a plain `user`.
+//! everyone after is a plain `user`. Six failed logins in a minute lock the
+//! email+IP pair out (429 with a retry hint).
 
 use std::sync::Arc;
 use sutegi::prelude::*;
@@ -31,14 +33,17 @@ fn main() -> std::io::Result<()> {
     users.migrate().expect("migrate users");
     let tokens = Arc::new(Tokens::new(db.clone()));
     tokens.migrate().expect("migrate tokens");
+    let remember = Remember::new(db.clone()).insecure();
+    remember.migrate().expect("migrate remember tokens");
+    let throttle = Arc::new(Throttle::new(db.clone())); // 5 attempts / 60 s
+    throttle.migrate().expect("migrate throttle");
 
     let secret = std::env::var("SESSION_SECRET")
         .unwrap_or_else(|_| "dev-only-secret-set-SESSION_SECRET".to_string());
-    // `.insecure()` drops the cookie's `Secure` flag for local http:// dev.
-    let auth = Arc::new(Auth::new(
-        users,
-        Sessions::new(secret.as_bytes()).insecure(),
-    ));
+    // `.insecure()` drops the cookies' `Secure` flag for local http:// dev.
+    let auth = Arc::new(
+        Auth::new(users, Sessions::new(secret.as_bytes()).insecure()).remember(remember),
+    );
 
     let (a_reg, a_login, a_logout, a_me, a_tok) = (
         auth.clone(),
@@ -91,31 +96,68 @@ fn main() -> std::io::Result<()> {
                 Ok::<_, Error>(a_reg.login(c.req, &user, json(201, &user.to_json())))
             },
         )
-        .post("/login", "Log in with email + password.", move |c| {
-            let body = c.json()?;
-            let (email, password, _) = credentials(&body)?;
-            match a_login.users.authenticate(email, password)? {
-                Some(user) => {
-                    Ok::<_, Error>(a_login.login(c.req, &user, json(200, &user.to_json())))
-                }
-                None => Err(Error::unauthorized("bad credentials")),
-            }
-        })
         .post(
-            "/logout",
-            "Log out (expires the session cookie).",
-            move |_c| {
-                Ok::<_, Error>(
-                    a_logout.logout(json(200, &Json::obj(vec![("ok", Json::Bool(true))]))),
-                )
+            "/login",
+            "Log in with email + password (\"remember\": true for a 30-day cookie). Throttled.",
+            move |c| {
+                let body = c.json()?;
+                let (email, password, _) = credentials(&body)?;
+                let ip = c
+                    .req
+                    .peer
+                    .as_deref()
+                    .map(|p| p.rsplit_once(':').map(|(host, _)| host).unwrap_or(p))
+                    .unwrap_or_default()
+                    .to_string();
+                let key = format!("login:{email}|{ip}");
+                if let Some(retry) = throttle.too_many(&key)? {
+                    return Ok(json(
+                        429,
+                        &Json::obj(vec![
+                            ("error", Json::str("too many attempts")),
+                            ("retry_after", Json::int(retry)),
+                        ]),
+                    ));
+                }
+                match a_login.users.authenticate(email, password)? {
+                    Some(user) => {
+                        throttle.clear(&key)?;
+                        let resp = json(200, &user.to_json());
+                        let remember = body.get("remember").and_then(Json::as_bool) == Some(true);
+                        Ok::<_, Error>(if remember {
+                            a_login.login_remembered(c.req, &user, resp)?
+                        } else {
+                            a_login.login(c.req, &user, resp)
+                        })
+                    }
+                    None => {
+                        throttle.hit(&key)?;
+                        Err(Error::unauthorized("bad credentials"))
+                    }
+                }
             },
         )
-        .get("/me", "The logged-in user.", move |c| {
-            match a_me.current(c.req)? {
-                Some(user) => Ok::<_, Error>(json(200, &user.to_json())),
+        .post(
+            "/logout",
+            "Log out: expires the session cookie and revokes the remember token.",
+            move |c| {
+                Ok::<_, Error>(a_logout.logout_from(
+                    c.req,
+                    json(200, &Json::obj(vec![("ok", Json::Bool(true))])),
+                ))
+            },
+        )
+        .get(
+            "/me",
+            "The logged-in user (revives a lapsed session from the remember cookie).",
+            move |c| match a_me.identify(c.req)? {
+                Some(hit) => {
+                    let resp = json(200, &hit.user.to_json());
+                    Ok::<_, Error>(hit.attach(resp))
+                }
                 None => Err(Error::unauthorized("unauthenticated")),
-            }
-        })
+            },
+        )
         .post(
             "/tokens",
             "Mint an API token for the logged-in user (plaintext shown once).",

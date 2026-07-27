@@ -6,7 +6,7 @@
 //! comparable time on unknown emails so a missing account is not
 //! distinguishable from a wrong password by timing.
 
-use crate::password::{hash_password_with, verify_password, DEFAULT_ITERATIONS};
+use crate::password::{hash_password_with, needs_rehash, verify_password, DEFAULT_ITERATIONS};
 use std::sync::OnceLock;
 use sutegi_json::Json;
 use sutegi_orm::{Backend, ColType, Column, TableSchema, Value};
@@ -180,7 +180,19 @@ impl<B: Backend> Users<B> {
                     .and_then(Json::as_str)
                     .unwrap_or("");
                 if verify_password(password, hash) {
-                    Ok(Some(user_of(&row)?))
+                    let user = user_of(&row)?;
+                    // Work factor raised since this hash was made? Upgrade it
+                    // while we hold the plaintext — best-effort, a rehash
+                    // failure must never fail a valid login.
+                    if needs_rehash(hash, self.iterations) {
+                        if let Ok(fresh) = hash_password_with(password, self.iterations) {
+                            let _ = self.backend.execute(
+                                "UPDATE users SET password_hash = ? WHERE id = ?",
+                                &[Value::Text(fresh), Value::Int(user.id)],
+                            );
+                        }
+                    }
+                    Ok(Some(user))
                 } else {
                     Ok(None)
                 }
@@ -229,6 +241,53 @@ impl<B: Backend> Users<B> {
         match self.backend.execute(
             "UPDATE users SET password_hash = ? WHERE id = ?",
             &[Value::Text(hash), Value::Int(id)],
+        )? {
+            0 => Err(format!("no user with id {id}")),
+            _ => Ok(()),
+        }
+    }
+
+    /// Replace a user's password **after verifying the current one** — the
+    /// profile-screen shape (Laravel's `current_password` rule). `Ok(false)`
+    /// = wrong current password; `Err` is reserved for store failures.
+    pub fn change_password(
+        &self,
+        id: i64,
+        current: &str,
+        new_password: &str,
+    ) -> Result<bool, String> {
+        let Some(hash) = self.password_hash_of(id)? else {
+            return Err(format!("no user with id {id}"));
+        };
+        if !verify_password(current, &hash) {
+            return Ok(false);
+        }
+        self.set_password(id, new_password)?;
+        Ok(true)
+    }
+
+    /// Change a user's display name.
+    pub fn set_name(&self, id: i64, name: &str) -> Result<(), String> {
+        match self.backend.execute(
+            "UPDATE users SET name = ? WHERE id = ?",
+            &[Value::Text(name.to_string()), Value::Int(id)],
+        )? {
+            0 => Err(format!("no user with id {id}")),
+            _ => Ok(()),
+        }
+    }
+
+    /// Change a user's email. The new address starts **unverified**
+    /// (`verified_at` resets to 0 — send a fresh verification link). Fails
+    /// on a malformed or already-taken address.
+    pub fn set_email(&self, id: i64, email: &str) -> Result<(), String> {
+        let email = normalize_email(email)?;
+        if self.find_by_email(&email)?.is_some_and(|u| u.id != id) {
+            return Err("email already registered".to_string());
+        }
+        match self.backend.execute(
+            "UPDATE users SET email = ?, verified_at = 0 WHERE id = ?",
+            &[Value::Text(email), Value::Int(id)],
         )? {
             0 => Err(format!("no user with id {id}")),
             _ => Ok(()),
@@ -429,6 +488,66 @@ mod tests {
             .unwrap()
             .is_some());
         assert!(users.set_password(999, "whatever12").is_err());
+    }
+
+    #[test]
+    fn change_password_requires_current() {
+        let users = store();
+        let u = users.register("a@b.co", "oldpassword").unwrap();
+        assert!(!users.change_password(u.id, "wrong-pass", "newpassword").unwrap());
+        assert!(users
+            .authenticate("a@b.co", "oldpassword")
+            .unwrap()
+            .is_some());
+        assert!(users.change_password(u.id, "oldpassword", "newpassword").unwrap());
+        assert!(users
+            .authenticate("a@b.co", "newpassword")
+            .unwrap()
+            .is_some());
+        assert!(users.change_password(999, "x", "whatever12").is_err());
+    }
+
+    #[test]
+    fn set_name_and_email_reset_verification() {
+        let users = store();
+        let u = users
+            .register_with("a@b.co", "password1", "Ana", "user")
+            .unwrap();
+        users.mark_verified(u.id).unwrap();
+        assert!(users.find(u.id).unwrap().unwrap().is_verified());
+
+        users.set_name(u.id, "Ane").unwrap();
+        assert_eq!(users.find(u.id).unwrap().unwrap().name, "Ane");
+
+        // Email change lands normalized and unverified.
+        users.set_email(u.id, " NEW@B.CO ").unwrap();
+        let after = users.find(u.id).unwrap().unwrap();
+        assert_eq!(after.email, "new@b.co");
+        assert!(!after.is_verified());
+        // Setting your own address again is fine; someone else's is not.
+        users.set_email(u.id, "new@b.co").unwrap();
+        let other = users.register("taken@b.co", "password1").unwrap();
+        assert!(users.set_email(u.id, "taken@b.co").is_err());
+        assert!(users.set_email(other.id, "not-an-email").is_err());
+    }
+
+    #[test]
+    fn login_rehashes_weaker_hashes() {
+        let users = store(); // iterations(1_000)
+        let u = users.register("a@b.co", "password1").unwrap();
+        // Downgrade the stored hash below the store's work factor.
+        let weak = hash_password_with("password1", 500).unwrap();
+        users
+            .backend
+            .execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?",
+                &[Value::Text(weak), Value::Int(u.id)],
+            )
+            .unwrap();
+        assert!(users.authenticate("a@b.co", "password1").unwrap().is_some());
+        let upgraded = users.password_hash_of(u.id).unwrap().unwrap();
+        assert!(upgraded.contains("i=1000"), "hash was not upgraded: {upgraded}");
+        assert!(users.authenticate("a@b.co", "password1").unwrap().is_some());
     }
 
     #[test]
