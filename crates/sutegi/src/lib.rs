@@ -13,8 +13,8 @@
 //! | `validate` | sutegi-validate | request / tool validation |
 //! | `queue`    | sutegi-queue (+ sutegi-pg) | durable, cross-pod job queue (Postgres) |
 //! | `events`   | sutegi-events (+ orm) | event sourcing: append-only event store, aggregates, projections |
-//! | `session`  | sutegi-session  | signed-cookie sessions (HMAC-SHA256) |
-//! | `auth`     | sutegi-auth (+ session/orm) | the user system: passwords, Users, guards, API tokens |
+//! | `session`  | sutegi-session  | signed-cookie sessions (HMAC-SHA256) + CSRF tokens |
+//! | `auth`     | sutegi-auth (+ session/orm) | the user system: passwords, Users, guards, API tokens, remember-me, login throttling |
 //! | `template` | sutegi-template | Blade-style template engine (`{{ }}`, `@if`, `@foreach`, `@include`) |
 //! | `mail`     | sutegi-mail (+ template) | Email builder, themed messages, Transport seam, smtp/sendmail/log drivers |
 //! | `auth-mail` | + sutegi-auth/mail | email-verification + password-reset flows |
@@ -484,8 +484,9 @@ pub mod prelude {
 
     #[cfg(feature = "auth")]
     pub use sutegi_auth::{
-        hash_password, require_auth, require_role, require_token, token_user, verify_password,
-        ApiToken, Auth, Tokens, User, Users,
+        hash_password, needs_rehash, require_auth, require_csrf, require_role, require_token,
+        require_verified, token_user, verify_password, ApiToken, Auth, Identified, Remember,
+        Throttle, Tokens, User, Users,
     };
 
     #[cfg(feature = "template")]

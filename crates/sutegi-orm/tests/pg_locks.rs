@@ -86,7 +86,7 @@ fn xact_lock_releases_at_commit() {
 
 #[test]
 fn with_lock_runs_exactly_one_of_two_racers() {
-    let Some(pg) = db() else {
+    let Some(_pg) = db() else {
         eprintln!("skipping: SUTEGI_PG_TEST_URL not set");
         return;
     };

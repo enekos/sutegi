@@ -20,7 +20,6 @@
 use crate::links::Links;
 use crate::users::{now_secs, User, Users};
 use std::sync::Arc;
-use sutegi_crypto::{hex, sha256};
 use sutegi_mail::{Mailer, Theme};
 use sutegi_orm::Backend;
 
@@ -193,7 +192,7 @@ impl AuthMail {
     fn hash_bind<B: Backend>(&self, users: &Users<B>, uid: i64) -> Result<Option<String>, String> {
         Ok(users
             .password_hash_of(uid)?
-            .map(|h| hex(&sha256(h.as_bytes()))[..16].to_string()))
+            .map(|h| crate::password::fingerprint(&h)))
     }
 }
 

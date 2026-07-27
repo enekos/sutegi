@@ -11,4 +11,4 @@ keywords = ["actors", "supervision", "fault-tolerance", "zero-dependency"]
 categories = ["concurrency"]
 
 [dependencies]
-sutegi-json = { path = "../sutegi-json", version = "0.7.0" }
+sutegi-json = { path = "../sutegi-json", version = "0.8.0" }

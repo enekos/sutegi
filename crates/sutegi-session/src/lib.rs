@@ -17,9 +17,12 @@
 
 use std::collections::BTreeMap;
 
-use sutegi_crypto::{constant_time_eq, from_hex, hex as to_hex, hmac_sha256};
+use sutegi_crypto::{constant_time_eq, from_hex, hex as to_hex, hmac_sha256, random_bytes};
 use sutegi_json::Json;
 use sutegi_web::{Request, Response};
+
+/// The session key the CSRF token lives under.
+const CSRF_KEY: &str = "_csrf";
 
 /// Session manager: holds the signing secret and cookie policy.
 pub struct Sessions {
@@ -105,6 +108,12 @@ impl Sessions {
 
     /// Attach the signed session as a `Set-Cookie` on the response.
     pub fn save(&self, session: &Session, resp: Response) -> Response {
+        resp.with_header("set-cookie", &self.cookie_for(session))
+    }
+
+    /// The `Set-Cookie` header value that [`save`](Sessions::save) would
+    /// attach — for callers that collect cookies before touching a response.
+    pub fn cookie_for(&self, session: &Session) -> String {
         let payload = Json::Obj(session.data.clone()).to_string();
         let payload_hex = to_hex(payload.as_bytes());
         let sig = self.sign(payload.as_bytes());
@@ -118,7 +127,32 @@ impl Sessions {
         if let Some(age) = self.max_age {
             cookie.push_str(&format!("; Max-Age={}", age));
         }
-        resp.with_header("set-cookie", &cookie)
+        cookie
+    }
+
+    /// Get-or-mint the session's CSRF token (Laravel's `csrf_token()`):
+    /// 32 bytes of OS randomness, hex-encoded, carried in the signed session.
+    /// Hand it to your frontend and require it back on mutating requests via
+    /// [`verify_csrf`](Sessions::verify_csrf). Minting marks the session
+    /// dirty — save it.
+    pub fn csrf(&self, session: &mut Session) -> Result<String, String> {
+        if let Some(t) = session.get_str(CSRF_KEY) {
+            return Ok(t.to_string());
+        }
+        let token = to_hex(&random_bytes(32)?);
+        session.set(CSRF_KEY, Json::str(token.clone()));
+        Ok(token)
+    }
+
+    /// Whether `presented` matches the session's CSRF token, in constant
+    /// time. A session without a token matches nothing.
+    pub fn verify_csrf(&self, session: &Session, presented: &str) -> bool {
+        match session.get_str(CSRF_KEY) {
+            Some(t) if !presented.is_empty() => {
+                constant_time_eq(t.as_bytes(), presented.as_bytes())
+            }
+            _ => false,
+        }
     }
 
     /// Expire the session cookie.
@@ -301,6 +335,44 @@ mod tests {
         sess.set("b", Json::int(2));
         sess.clear();
         assert!(sess.is_empty());
+    }
+
+    #[test]
+    fn csrf_mints_once_and_verifies_constant_time() {
+        let s = Sessions::new(b"k").insecure();
+        let mut sess = s.load(&req_with_cookie("x", ""));
+        let t1 = s.csrf(&mut sess).unwrap();
+        assert_eq!(t1.len(), 64);
+        assert!(sess.is_dirty());
+        // Idempotent within the session.
+        assert_eq!(s.csrf(&mut sess).unwrap(), t1);
+
+        assert!(s.verify_csrf(&sess, &t1));
+        assert!(!s.verify_csrf(&sess, "wrong"));
+        assert!(!s.verify_csrf(&sess, ""));
+        // No token in session → nothing verifies.
+        let empty = s.load(&req_with_cookie("x", ""));
+        assert!(!s.verify_csrf(&empty, &t1));
+
+        // And it survives the cookie roundtrip.
+        let cookie = cookie_value(&s.save(&sess, Response::new(200)), "sutegi_session");
+        let reloaded = s.load(&req_with_cookie("sutegi_session", &cookie));
+        assert!(s.verify_csrf(&reloaded, &t1));
+    }
+
+    #[test]
+    fn cookie_for_matches_save() {
+        let s = Sessions::new(b"k");
+        let mut sess = s.load(&req_with_cookie("x", ""));
+        sess.set("a", Json::int(1));
+        let via_save = s
+            .save(&sess, Response::new(200))
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_eq!(via_save, s.cookie_for(&sess));
     }
 
     #[test]
