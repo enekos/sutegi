@@ -494,12 +494,16 @@ mod tests {
     fn change_password_requires_current() {
         let users = store();
         let u = users.register("a@b.co", "oldpassword").unwrap();
-        assert!(!users.change_password(u.id, "wrong-pass", "newpassword").unwrap());
+        assert!(!users
+            .change_password(u.id, "wrong-pass", "newpassword")
+            .unwrap());
         assert!(users
             .authenticate("a@b.co", "oldpassword")
             .unwrap()
             .is_some());
-        assert!(users.change_password(u.id, "oldpassword", "newpassword").unwrap());
+        assert!(users
+            .change_password(u.id, "oldpassword", "newpassword")
+            .unwrap());
         assert!(users
             .authenticate("a@b.co", "newpassword")
             .unwrap()
@@ -546,7 +550,10 @@ mod tests {
             .unwrap();
         assert!(users.authenticate("a@b.co", "password1").unwrap().is_some());
         let upgraded = users.password_hash_of(u.id).unwrap().unwrap();
-        assert!(upgraded.contains("i=1000"), "hash was not upgraded: {upgraded}");
+        assert!(
+            upgraded.contains("i=1000"),
+            "hash was not upgraded: {upgraded}"
+        );
         assert!(users.authenticate("a@b.co", "password1").unwrap().is_some());
     }
 

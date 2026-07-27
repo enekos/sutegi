@@ -134,7 +134,10 @@ impl<B: Backend> Remember<B> {
         else {
             return Ok(None);
         };
-        let stored = row.get("validator_hash").and_then(Json::as_str).unwrap_or("");
+        let stored = row
+            .get("validator_hash")
+            .and_then(Json::as_str)
+            .unwrap_or("");
         if !constant_time_eq(hash_of(validator).as_bytes(), stored.as_bytes()) {
             // Correct selector, wrong validator: either garbage or a copy
             // that was already rotated away — revoke the row so a possibly
@@ -306,7 +309,9 @@ mod tests {
         assert!(h.starts_with("sutegi_remember=abc.def;"));
         assert!(h.contains("HttpOnly") && h.contains("Secure") && h.contains("Max-Age=60"));
         assert!(r.clear_header().contains("Max-Age=0"));
-        let ins = Remember::new(Db::memory().unwrap()).insecure().cookie_name("r");
+        let ins = Remember::new(Db::memory().unwrap())
+            .insecure()
+            .cookie_name("r");
         assert!(!ins.cookie_header("v").contains("Secure"));
         assert!(ins.cookie_header("v").starts_with("r=v;"));
     }

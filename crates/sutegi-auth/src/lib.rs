@@ -234,10 +234,7 @@ impl<B: Backend> Auth<B> {
         Ok(Some(Identified {
             user,
             via_remember: true,
-            cookies: vec![
-                self.sessions.cookie_for(&s),
-                rem.cookie_header(&rotated),
-            ],
+            cookies: vec![self.sessions.cookie_for(&s), rem.cookie_header(&rotated)],
         }))
     }
 
@@ -540,9 +537,7 @@ mod tests {
         users.migrate().unwrap();
         let remember = Remember::new(db).insecure();
         remember.migrate().unwrap();
-        Arc::new(
-            Auth::new(users, Sessions::new(b"test-secret").insecure()).remember(remember),
-        )
+        Arc::new(Auth::new(users, Sessions::new(b"test-secret").insecure()).remember(remember))
     }
 
     fn cookies_of(resp: &Response) -> Vec<(String, String)> {
@@ -612,7 +607,10 @@ mod tests {
             .find(|(k, _)| k == "sutegi_session")
             .map(|(_, v)| v.clone())
             .unwrap();
-        let next = request(vec![("Cookie".into(), format!("sutegi_session={session_cookie}"))]);
+        let next = request(vec![(
+            "Cookie".into(),
+            format!("sutegi_session={session_cookie}"),
+        )]);
         assert_eq!(auth.current(&next).unwrap().unwrap().id, user.id);
 
         // The pre-rotation remember cookie is dead (and burns the row).
@@ -669,9 +667,7 @@ mod tests {
     #[test]
     fn csrf_guard_gates_mutations() {
         let auth = rig();
-        let (token, resp) = auth
-            .csrf(&request(vec![]), Response::new(200))
-            .unwrap();
+        let (token, resp) = auth.csrf(&request(vec![]), Response::new(200)).unwrap();
         let cookie = cookie_of(&resp);
         let guard = require_csrf(auth.clone());
 

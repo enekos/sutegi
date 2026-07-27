@@ -41,9 +41,8 @@ fn main() -> std::io::Result<()> {
     let secret = std::env::var("SESSION_SECRET")
         .unwrap_or_else(|_| "dev-only-secret-set-SESSION_SECRET".to_string());
     // `.insecure()` drops the cookies' `Secure` flag for local http:// dev.
-    let auth = Arc::new(
-        Auth::new(users, Sessions::new(secret.as_bytes()).insecure()).remember(remember),
-    );
+    let auth =
+        Arc::new(Auth::new(users, Sessions::new(secret.as_bytes()).insecure()).remember(remember));
 
     let (a_reg, a_login, a_logout, a_me, a_tok) = (
         auth.clone(),
@@ -141,10 +140,10 @@ fn main() -> std::io::Result<()> {
             "/logout",
             "Log out: expires the session cookie and revokes the remember token.",
             move |c| {
-                Ok::<_, Error>(a_logout.logout_from(
-                    c.req,
-                    json(200, &Json::obj(vec![("ok", Json::Bool(true))])),
-                ))
+                Ok::<_, Error>(
+                    a_logout
+                        .logout_from(c.req, json(200, &Json::obj(vec![("ok", Json::Bool(true))]))),
+                )
             },
         )
         .get(
