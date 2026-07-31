@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sutegi_json::Json;
-use sutegi_orm::Backend;
 use sutegi_orm::pg::Pg;
+use sutegi_orm::Backend;
 use sutegi_queue::Queue;
 
 // Both tests share one `sutegi_jobs` table, so they must not run concurrently
@@ -52,7 +52,11 @@ fn dispatch_process_and_retry() {
 
     let seen = Arc::clone(&processed);
     queue.register("greet", move |job| {
-        let who = job.payload().get("who").and_then(Json::as_str).unwrap_or("?");
+        let who = job
+            .payload()
+            .get("who")
+            .and_then(Json::as_str)
+            .unwrap_or("?");
         seen.lock().unwrap().push(who.to_string());
         Ok(())
     });
@@ -103,7 +107,10 @@ fn dispatch_process_and_retry() {
     );
 
     workers.stop();
-    queue.store().execute("DROP TABLE sutegi_jobs", &[]).unwrap();
+    queue
+        .store()
+        .execute("DROP TABLE sutegi_jobs", &[])
+        .unwrap();
 }
 
 #[test]
@@ -170,7 +177,11 @@ fn dedupe_keys_and_named_queues_behave_as_on_sqlite() {
     assert_eq!(first, second, "the live row is returned, not a duplicate");
     assert!(!queue.run_once().unwrap(), "default queue is empty");
     assert_eq!(
-        queue.stats_for("video").unwrap().get("ready").and_then(Json::as_i64),
+        queue
+            .stats_for("video")
+            .unwrap()
+            .get("ready")
+            .and_then(Json::as_i64),
         Some(1)
     );
 

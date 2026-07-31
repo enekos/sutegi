@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sutegi_json::Json;
-use sutegi_orm::Backend;
 use sutegi_orm::db::Db;
+use sutegi_orm::Backend;
 use sutegi_orm::Value;
 use sutegi_queue::{now_ms, Queue};
 
@@ -74,7 +74,8 @@ fn count(db: &Db, sql: &str) -> i64 {
 #[test]
 fn migrate_is_idempotent_and_creates_the_table() {
     let (_tmp, db, q) = queue("migrate");
-    q.migrate().expect("second migrate is a no-op, not an error");
+    q.migrate()
+        .expect("second migrate is a no-op, not an error");
     assert_eq!(count(&db, "SELECT COUNT(*) AS n FROM sutegi_jobs"), 0);
 }
 
@@ -84,7 +85,11 @@ fn a_dispatched_job_runs_with_its_payload_and_leaves_no_row() {
     let seen = Arc::new(Mutex::new(Vec::<String>::new()));
     let sink = Arc::clone(&seen);
     q.register("greet", move |job| {
-        let who = job.payload().get("who").and_then(Json::as_str).unwrap_or("?");
+        let who = job
+            .payload()
+            .get("who")
+            .and_then(Json::as_str)
+            .unwrap_or("?");
         sink.lock().unwrap().push(who.to_string());
         Ok(())
     });
@@ -121,7 +126,10 @@ fn a_failing_job_retries_until_its_budget_runs_out_then_dead_letters() {
         .expect("dispatch");
     q.run_once().expect("attempt 1");
     assert_eq!(
-        count(&db, "SELECT COUNT(*) AS n FROM sutegi_jobs WHERE failed_at IS NULL"),
+        count(
+            &db,
+            "SELECT COUNT(*) AS n FROM sutegi_jobs WHERE failed_at IS NULL"
+        ),
         1,
         "still queued for a retry"
     );
@@ -140,7 +148,10 @@ fn a_failing_job_retries_until_its_budget_runs_out_then_dead_letters() {
         failed[0].get("last_error").and_then(Json::as_str),
         Some("always")
     );
-    assert!(!q.run_once().expect("run"), "a dead letter is not claimable");
+    assert!(
+        !q.run_once().expect("run"),
+        "a dead letter is not claimable"
+    );
 
     // …and can be put back by hand.
     assert!(q.retry(id, 1).expect("retry"));
@@ -205,7 +216,11 @@ fn priority_wins_over_arrival_order() {
     let order = Arc::new(Mutex::new(Vec::<String>::new()));
     let sink = Arc::clone(&order);
     q.register("task", move |job| {
-        let tag = job.payload().get("tag").and_then(Json::as_str).unwrap_or("");
+        let tag = job
+            .payload()
+            .get("tag")
+            .and_then(Json::as_str)
+            .unwrap_or("");
         sink.lock().unwrap().push(tag.to_string());
         Ok(())
     });
@@ -245,7 +260,13 @@ fn named_queues_do_not_see_each_others_work() {
     let stop = AtomicBool::new(false);
     assert!(q.run_once_on("video", &stop).expect("run"));
     assert_eq!(ran.lock().unwrap().as_slice(), ["default", "video"]);
-    assert_eq!(q.stats_for("video").unwrap().get("total").and_then(Json::as_i64), Some(0));
+    assert_eq!(
+        q.stats_for("video")
+            .unwrap()
+            .get("total")
+            .and_then(Json::as_i64),
+        Some(0)
+    );
 }
 
 #[test]
@@ -383,7 +404,11 @@ fn concurrent_workers_run_each_job_exactly_once() {
 
     let mut seen = done.lock().unwrap().clone();
     seen.sort_unstable();
-    assert_eq!(seen.len(), JOBS as usize, "every job ran exactly once: {seen:?}");
+    assert_eq!(
+        seen.len(),
+        JOBS as usize,
+        "every job ran exactly once: {seen:?}"
+    );
     assert_eq!(seen, (0..JOBS).collect::<Vec<_>>());
 }
 
@@ -431,7 +456,10 @@ fn stats_and_purge_report_the_states_an_operator_asks_about() {
 
     assert_eq!(q.purge_failed(Duration::from_secs(3600)).expect("purge"), 0);
     assert_eq!(q.purge_failed(Duration::ZERO).expect("purge"), 1);
-    assert_eq!(q.stats().unwrap().get("failed").and_then(Json::as_i64), Some(0));
+    assert_eq!(
+        q.stats().unwrap().get("failed").and_then(Json::as_i64),
+        Some(0)
+    );
 }
 
 #[test]
