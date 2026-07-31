@@ -6,8 +6,17 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Durable, cross-pod job queue for sutegi, backed by PostgreSQL (via the pure-std sutegi-pg driver): atomic FOR UPDATE SKIP LOCKED claim, visibility-timeout crash recovery, retries, delayed dispatch, dead-letter, introspectable stats."
+description = "Durable job queue for sutegi, over the ORM Backend seam: one set of SQL on bundled SQLite or PostgreSQL — atomic UPDATE…RETURNING claim, visibility-timeout crash recovery, retries with backoff, priorities, named queues, dedupe keys, dead-letter, introspectable stats."
 
 [dependencies]
-sutegi-pg = { path = "../sutegi-pg", version = "0.8.0" }
+sutegi-orm = { path = "../sutegi-orm", version = "0.8.0" }
 sutegi-json = { path = "../sutegi-json", version = "0.8.0" }
+
+# The queue is backend-agnostic — these only decide which backend its own tests
+# can reach. An app enables its backend on sutegi-orm (or the sutegi facade).
+[features]
+sqlite = ["sutegi-orm/sqlite"]
+postgres = ["sutegi-orm/postgres"]
+
+[dev-dependencies]
+sutegi-orm = { path = "../sutegi-orm", version = "0.8.0", features = ["sqlite"] }

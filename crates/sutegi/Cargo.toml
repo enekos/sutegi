@@ -38,14 +38,14 @@ sutegi-actors = { path = "../sutegi-actors", version = "0.8.0", optional = true 
 [features]
 # Batteries-included by default; opt out with `default-features = false` and
 # add back only what you need to shrink the binary.
-# `queue` is NOT default: the durable queue needs a PostgreSQL database, so it
-# is opt-in rather than force-compiled into every minimal build.
+# `queue` is NOT default: not every app has background work, and the jobs
+# table it creates should be an explicit choice.
 default = ["derive", "orm", "validate"]
 
 # Each pillar is an independent compile-time feature.
 orm = ["dep:sutegi-orm", "sutegi-web/orm", "sutegi-repl?/orm"] # schema + query builder + Ctx::db/model
 validate = ["dep:sutegi-validate", "sutegi-web/validate"] # request / tool validation + Ctx::validate(d)
-queue = ["dep:sutegi-queue"]                              # durable, cross-pod job queue (Postgres-backed)
+queue = ["dep:sutegi-queue", "orm"]                       # durable job queue over the Backend seam (SQLite or Postgres)
 events = ["dep:sutegi-events", "orm"]                     # event sourcing: event store + aggregates + projections
 derive = ["dep:sutegi-macros", "orm"]                     # #[derive(Model)] / #[derive(Validate)]
 sqlite = ["orm", "sutegi-orm/sqlite"]                     # runnable bundled SQLite (per-pod)
