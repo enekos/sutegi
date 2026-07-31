@@ -11,7 +11,7 @@
 //! | `postgres` | sutegi-pg (pure std) | Postgres: the multi-pod execution layer |
 //! | `derive`   | sutegi-macros (build-time only) | `#[derive(Model)]` |
 //! | `validate` | sutegi-validate | request / tool validation |
-//! | `queue`    | sutegi-queue (+ sutegi-pg) | durable, cross-pod job queue (Postgres) |
+//! | `queue`    | sutegi-queue (+ orm) | durable job queue over the Backend seam (SQLite or Postgres) |
 //! | `events`   | sutegi-events (+ orm) | event sourcing: append-only event store, aggregates, projections |
 //! | `session`  | sutegi-session  | signed-cookie sessions (HMAC-SHA256) + CSRF tokens |
 //! | `auth`     | sutegi-auth (+ session/orm) | the user system: passwords, Users, guards, API tokens, remember-me, login throttling |
@@ -449,7 +449,7 @@ pub mod prelude {
         Vector,
     };
     #[cfg(feature = "queue")]
-    pub use sutegi_queue::{Queue, Workers};
+    pub use sutegi_queue::{JobCtx, Queue, Workers};
     #[cfg(feature = "repl")]
     pub use sutegi_repl::Repl;
     #[cfg(feature = "validate")]

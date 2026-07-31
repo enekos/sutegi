@@ -95,7 +95,7 @@ fn main() -> std::io::Result<()> {
 | `sutegi-storage` | File/object storage behind one `Storage` trait: local fs, database blobs (over `Backend`), and a pure-`std` S3 SigV4 presigner. |
 | `sutegi-macros` | `#[derive(Model)]` (schema, hydration, `save`, `from_input`) and `#[derive(Validate)]` (field-attr rulesets). Compile-time only (syn/quote never reach your binary). |
 | `sutegi-validate` | Fluent `Validator`-style rule sets **and** a JSON Schema subset validator, with structured errors. |
-| `sutegi-queue` | Durable, cross-pod job queue backed by Postgres (`FOR UPDATE SKIP LOCKED` claim, visibility-timeout retries, dead-letter). |
+| `sutegi-queue` | Durable job queue over the `Backend` seam — same SQL on SQLite or Postgres (`UPDATE … RETURNING` claim, `SKIP LOCKED` where the backend has it, visibility-timeout retries, priorities, named queues, dedupe keys, dead-letter). |
 | `sutegi-hexagon`  | Opinionated hexagonal/clean-architecture primitives: `AppError`, `UseCase` ports, `respond` adapter glue. |
 | `sutegi`      | Facade crate + `prelude`. |
 | `sutegi-cli`  | The `sutegi` command: scaffold apps/models/routes, `introspect` a live app. |
@@ -113,7 +113,7 @@ what you use:
 | `validate` | ✓ | request / tool validation + `Ctx::validate`/`validated` |
 | `sqlite`   |   | SQLite backend — the **single-node** runnable store (bundled) |
 | `postgres` |   | Postgres backend — the **multi-pod** runnable store (pure std) |
-| `queue`    |   | durable, cross-pod job queue (Postgres-backed) |
+| `queue`    |   | durable job queue (SQLite or Postgres) |
 | `graceful` |   | SIGTERM/SIGINT draining (libc) |
 | `hexagon`  |   | hexagonal/clean-architecture primitives |
 | `session`  |   | signed-cookie sessions (HMAC-SHA256) |
@@ -384,27 +384,46 @@ state, returning a ready `404`/`500` `Error` you can `?`:
 .get("/api/todos/:id", "show", |c| c.model::<Todo, Db>("id").map(|t| t.to_json()))
 ```
 
-### Background jobs (durable, cross-pod)
+### Background jobs (durable)
 
-The queue is Postgres-backed (`queue` feature), so jobs survive a crash and are
-claimed exactly once across pods (`FOR UPDATE SKIP LOCKED` + a visibility
-timeout, with retries and a dead-letter column):
+The queue (`queue` feature) runs over the `Backend` seam, so one jobs table and
+one set of SQL work on bundled SQLite and on Postgres. Jobs survive a crash: the
+claim stamps a lease instead of deleting the row, so a dead worker's job becomes
+visible again after the visibility timeout (at-least-once). Retries, delays,
+priorities and dedupe keys are columns, so a restart forgets nothing.
+
+Claims are exclusive on both backends — `FOR UPDATE SKIP LOCKED` on Postgres,
+and on SQLite the serialized writer already gives it, since the second `UPDATE`
+no longer sees the claimed row. Postgres additionally makes that exclusivity
+*cross-pod*; `queue.cross_pod()` tells you which one you have.
 
 ```rust
 use std::sync::Arc;
 use sutegi::queue::Queue;
 
-let mut queue = Queue::new(pg.pool().clone());   // over a Pg connection pool
-queue.register("notify", |args| { /* send … */ Ok(()) });  // named handler
-queue.migrate()?;                                 // create sutegi_jobs
+let mut queue = Queue::new(db.clone());            // any Backend: Db or Pg
+queue.register("notify", |job| { /* send job.payload() … */ Ok(()) });
+queue.migrate()?;                                  // create sutegi_jobs
 
-// Enqueue from anywhere (any pod):
+// Enqueue from anywhere (any pod, on Postgres):
 queue.dispatch("notify", Json::obj(vec![("to", Json::str("a@b.com"))]))?;
 
-// Run workers (crash-safe, at-least-once, cross-pod):
-let workers = Arc::new(queue).start(4);           // 4 worker threads
-// … later: workers.stop();
+// Or shape the dispatch: its own pool, one in flight per key, 3 tries.
+queue
+    .job("video.ingest", Json::obj(vec![("id", Json::str("abc"))]))
+    .queue("video")
+    .unique("yt:abc")
+    .max_attempts(3)
+    .dispatch()?;
+
+let queue = Arc::new(queue);
+let fast = Arc::clone(&queue).start(4);             // 4 workers on "default"
+let slow = Arc::clone(&queue).start_on("video", 1); // 1 on the slow queue
+// … later: fast.stop(); slow.stop();
 ```
+
+A handler that can outrun the visibility timeout should say it is still alive
+(`job.heartbeat()`) and notice shutdown (`job.should_stop()`).
 
 ## Auth: the user system
 

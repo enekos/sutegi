@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`sutegi-queue` runs on any `Backend`, not just Postgres.** The durable queue moved off `sutegi_pg::Pool` onto the ORM's `Backend` seam, so one jobs table and one set of SQL now work on bundled SQLite (a single box) and on Postgres (many pods) — the same parity `tsvector`↔FTS5 and `jsonb`↔JSON1 already had. Claims stay exclusive on both: `FOR UPDATE SKIP LOCKED` wherever `capabilities().skip_locked` says it exists, and on SQLite the serialized writer already provides it, since the second `UPDATE … RETURNING` no longer sees the claimed row. `queue.cross_pod()` reports which guarantee you actually have instead of letting the docs imply the stronger one. The `queue` feature no longer drags in a Postgres driver.
+- Queue: **times are epoch milliseconds supplied by the caller**, not `now()` + `interval` SQL. That is what lets one statement work in both dialects, and it makes schedules testable without sleeping.
+- Queue: `Queue::new` takes any `Backend + Send + Sync + 'static` (`Queue::with_store` for a store already behind an `Arc`), and handlers receive a `&JobCtx` rather than a `&Json` — **breaking** against 0.5.1: the payload is now `job.payload()`.
+- Queue: `sutegi_jobs` gains `priority` and `unique_key`, and its timestamp columns are integers. Existing tables are not migrated — drop and recreate (pre-1.0, and the queue is not a history table).
+
+### Added
+
+- Queue: **named queues with their own worker pools** — `queue.job(name, payload).queue("video")` plus `Arc::clone(&q).start_on("video", 1)`. This is how a slow job class is kept from starving a fast one, which a single pool cannot express.
+- Queue: **dedupe keys** — `.unique("yt:abc")` hands back the live row's id instead of enqueueing a second copy, backed by a partial unique index that deliberately excludes dead letters, so a failure never owns a key forever.
+- Queue: **priorities** — `.priority(10)` runs ahead of older work within a queue.
+- Queue: **`JobCtx`** — `payload()`, `attempts`/`max_attempts`, `is_last_attempt()` (so a handler can tell a retryable blip from a terminal failure *before* writing a user-visible error), `heartbeat()` (pushes the visibility window forward, which is what lets a job outlive the timeout), and `should_stop()` for handlers that loop.
+- Queue: **a panicking handler is a failed job, not a lost worker** — the panic is caught, the row retries or dead-letters like any other, and the pool keeps going.
+- Queue: **dispatch wakes an idle worker** over a condvar instead of making it wait out the poll interval; the interval stays as the safety net for delayed jobs and for work enqueued by another pod.
+- Queue ops: `failed(limit)` lists dead letters, `retry(id, max_attempts)` revives one, `purge_failed(age)` clears them (inclusive bound, so `Duration::ZERO` really does clear the lot), and `stats_for(queue)` reports a single pool. `stats()` no longer uses Postgres-only `FILTER`.
+- Queue tests: a full SQLite suite (`tests/sqlite.rs`, 16 cases — claim exclusivity under six concurrent workers, crash recovery through an expired lease, a heartbeat defeating a steal, dedupe, priority, named-queue isolation, panics, dead-letter/retry/purge) that needs no server, plus the Postgres leg (`tests/durable.rs`, `--features postgres`) pinning the same contract. Both verified against real backends.
+
 ## [0.8.0] - 2026-07-27
 
 The production user-system release: everything Laravel's auth scaffolding does, still zero third-party dependencies.
