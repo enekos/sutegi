@@ -9,8 +9,8 @@ authors.workspace = true
 description = "Durable job queue for sutegi, over the ORM Backend seam: one set of SQL on bundled SQLite or PostgreSQL — atomic UPDATE…RETURNING claim, visibility-timeout crash recovery, retries with backoff, priorities, named queues, dedupe keys, dead-letter, introspectable stats."
 
 [dependencies]
-sutegi-orm = { path = "../sutegi-orm", version = "0.8.0" }
-sutegi-json = { path = "../sutegi-json", version = "0.8.0" }
+sutegi-orm = { path = "../sutegi-orm", version = "0.9.0" }
+sutegi-json = { path = "../sutegi-json", version = "0.9.0" }
 
 # The queue is backend-agnostic — these only decide which backend its own tests
 # can reach. An app enables its backend on sutegi-orm (or the sutegi facade).
@@ -19,4 +19,4 @@ sqlite = ["sutegi-orm/sqlite"]
 postgres = ["sutegi-orm/postgres"]
 
 [dev-dependencies]
-sutegi-orm = { path = "../sutegi-orm", version = "0.8.0", features = ["sqlite"] }
+sutegi-orm = { path = "../sutegi-orm", version = "0.9.0", features = ["sqlite"] }
