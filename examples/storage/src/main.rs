@@ -1,7 +1,8 @@
-//! A file server on sutegi's storage layer — [`FsStorage`] for the bytes
-//! (single-node, zero-ops: one directory on disk), plus the agent-native S3
-//! shape: `presign_upload` / `presign_download` tools that mint time-limited
-//! URLs so the **agent moves the bytes itself**, straight to the object store.
+//! A file server on sutegi's storage layer, with **the backend chosen at boot
+//! and the routes never told which**: a directory on disk by default, an
+//! S3/R2 bucket when `STORAGE=s3`. Plus the agent-native S3 shape —
+//! `presign_upload` / `presign_download` tools that mint time-limited URLs so
+//! the **agent moves the bytes itself**, straight to the object store.
 //!
 //! ```text
 //! curl -T report.pdf localhost:8080/files/report.pdf
@@ -12,9 +13,12 @@
 //!      -d '{"key":"report.pdf"}'            # S3 URL (needs S3_* env)
 //! ```
 //!
-//! S3 presigning activates when `S3_BUCKET`, `S3_ACCESS_KEY` and
-//! `S3_SECRET_KEY` are set (`S3_REGION` defaults to `us-east-1`;
-//! `S3_ENDPOINT` points at R2/MinIO/… and switches to path-style).
+//! The S3 credentials come from `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`
+//! (`S3_REGION` defaults to `us-east-1`; `S3_ENDPOINT` points at R2/MinIO/… and
+//! switches to path-style). They power presigning on their own; add
+//! `STORAGE=s3` and the file routes themselves move their bytes through the
+//! bucket. `S3_INSECURE=1` selects plaintext + the pure-`std` transport for an
+//! in-cluster MinIO; otherwise `https` goes through the system `curl`.
 
 use sutegi::prelude::*;
 
@@ -32,6 +36,27 @@ fn s3_from_env() -> Option<S3Store> {
         s3 = s3.with_endpoint(&endpoint);
     }
     Some(s3)
+}
+
+/// The storage backend as the routes see it: a trait object, so the choice
+/// below is the only code in this file that knows where bytes live.
+type Store = Box<dyn Storage + Send + Sync>;
+
+/// `STORAGE=s3` puts the file routes on the bucket; anything else is a
+/// directory on disk. This is the whole cost of swapping the backend.
+fn store_from_env() -> Store {
+    if std::env::var("STORAGE").as_deref() == Ok("s3") {
+        let s3 = s3_from_env().expect("STORAGE=s3 needs S3_BUCKET / S3_ACCESS_KEY / S3_SECRET_KEY");
+        return if std::env::var("S3_INSECURE").is_ok() {
+            // Plaintext to a store on a trusted network path: no TLS, no
+            // subprocess, pure std. SigV4 still signs the payload hash.
+            Box::new(s3.insecure_http().storage(PlainHttp::new()))
+        } else {
+            Box::new(s3.storage(SystemCurl::new()))
+        };
+    }
+    let root = std::env::var("STORAGE_ROOT").unwrap_or_else(|_| "files".to_string());
+    Box::new(FsStorage::new(root).expect("open storage root"))
 }
 
 fn presign(s3: &Option<S3Store>, args: &Json, put: bool) -> Result<Json, Error> {
@@ -60,8 +85,7 @@ fn presign(s3: &Option<S3Store>, args: &Json, put: bool) -> Result<Json, Error> 
 }
 
 fn main() -> std::io::Result<()> {
-    let root = std::env::var("STORAGE_ROOT").unwrap_or_else(|_| "files".to_string());
-    let store = FsStorage::new(root).expect("open storage root");
+    let store = store_from_env();
     let s3_up = s3_from_env();
     let s3_down = s3_up.clone();
     // Gate the agent surface: presigning mints URLs for arbitrary object keys,
@@ -86,7 +110,7 @@ fn main() -> std::io::Result<()> {
         .state(store)
         .get("/", "Health check.", |_| "sutegi storage up")
         .get("/files", "List stored files.", |c| {
-            let items = c.state::<FsStorage>().list("")?;
+            let items = c.state::<Store>().list("")?;
             Ok::<_, Error>(json(
                 200,
                 &Json::arr(items.iter().map(ObjectMeta::to_json).collect()),
@@ -94,14 +118,14 @@ fn main() -> std::io::Result<()> {
         })
         .put("/files/:name", "Store the raw request body as a file.", |c| {
             let ct = c.header("content-type").unwrap_or("");
-            c.state::<FsStorage>().put(name(c), &c.req.body, ct)?;
+            c.state::<Store>().put(name(c), &c.req.body, ct)?;
             Ok::<_, Error>(json(201, &Json::obj(vec![("key", Json::str(name(c)))])))
         })
         .get(
             "/files/:name",
             "Download a file with its stored content type.",
             |c| -> Result<Response, Error> {
-                let store = c.state::<FsStorage>();
+                let store = c.state::<Store>();
                 match store.stat(name(c))? {
                     Some(meta) => {
                         let bytes = store.get(name(c))?.unwrap_or_default();
@@ -114,7 +138,7 @@ fn main() -> std::io::Result<()> {
             },
         )
         .delete("/files/:name", "Delete a file.", |c| {
-            let removed = c.state::<FsStorage>().delete(name(c))?;
+            let removed = c.state::<Store>().delete(name(c))?;
             Ok::<_, Error>(json(
                 200,
                 &Json::obj(vec![("deleted", Json::Bool(removed))]),

@@ -6,8 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "File/object storage for sutegi: one Storage trait, local-fs and database-blob backends, plus a pure-std S3 SigV4 presigner. Zero third-party dependencies."
-keywords = ["storage", "s3", "presign", "zero-dependency"]
+description = "File/object storage for sutegi: one Storage trait over local-fs, database-blob, and S3/R2 backends, with a pure-std SigV4 signer/presigner and a pluggable HTTP transport. Zero third-party dependencies."
+keywords = ["storage", "s3", "r2", "presign", "zero-dependency"]
 categories = ["web-programming", "filesystem"]
 
 [dependencies]
