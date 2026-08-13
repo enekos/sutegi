@@ -92,7 +92,7 @@ fn main() -> std::io::Result<()> {
 | `sutegi-web`  | Router, `App` builder, middleware, groups, extractors, streaming (`sse`/`stream`), `/__introspect`, and the agent tool surface (`App::tool`/`stream_tool`, `schema` helpers, `ToolCtx`, `/__tools`). |
 | `sutegi-orm`  | Typed schema, fluent parameterized query builder, one `Backend` trait, a JSON key/value store, and two runnable backends: **SQLite** (`sqlite`, single-node) and **Postgres** (`postgres`, multi-pod). |
 | `sutegi-pg`   | Pure-`std` PostgreSQL driver: wire protocol v3 over blocking TCP, SCRAM-SHA-256 auth, connection pool. No async runtime, no C library. |
-| `sutegi-storage` | File/object storage behind one `Storage` trait: local fs, database blobs (over `Backend`), and a pure-`std` S3 SigV4 presigner. |
+| `sutegi-storage` | File/object storage behind one `Storage` trait: local fs, database blobs (over `Backend`), and S3/R2 buckets over a pluggable HTTP transport — plus a pure-`std` SigV4 presigner. |
 | `sutegi-macros` | `#[derive(Model)]` (schema, hydration, `save`, `from_input`) and `#[derive(Validate)]` (field-attr rulesets). Compile-time only (syn/quote never reach your binary). |
 | `sutegi-validate` | Fluent `Validator`-style rule sets **and** a JSON Schema subset validator, with structured errors. |
 | `sutegi-queue` | Durable job queue over the `Backend` seam — same SQL on SQLite or Postgres (`UPDATE … RETURNING` claim, `SKIP LOCKED` where the backend has it, visibility-timeout retries, priorities, named queues, dedupe keys, dead-letter). |
@@ -121,7 +121,7 @@ what you use:
 | `template` |   | Blade-style template engine (`{{ }}`, `@if`, `@foreach`, `@include`) |
 | `mail`     |   | `Email` builder + themed messages + `Transport` seam + drivers |
 | `auth-mail` |  | email-verification + password-reset flows on top of both |
-| `storage`  |   | file storage: local fs backend + S3 presigned URLs (pure std) |
+| `storage`  |   | file storage: local fs, S3/R2 objects, presigned URLs (pure std) |
 | `storage-db` |  | blobs in SQLite/Postgres over the same `Backend` seam |
 
 ```toml
@@ -580,17 +580,27 @@ opinion per backend:
 - **`DbStorage<B>`** (`storage-db`) — blobs in a database table over any ORM
   `Backend`. On Postgres that is **multi-pod file storage with zero new
   infrastructure**; honest ceiling ~a few MB per object.
-- **`S3Store`** — a pure-`std` **S3 SigV4 presigner** (AWS, R2, MinIO, …). It
-  mints time-limited GET/PUT/DELETE URLs and the bytes flow **directly between
-  the client and the object store** — no HTTP client, no TLS stack, no bytes
-  proxied. Signing reuses the Postgres driver's SCRAM crypto and is verified
-  against AWS's published known-answer vector.
+- **`S3Storage<T>`** — a real S3-compatible bucket: AWS S3, **Cloudflare R2**,
+  MinIO, Garage, Ceph RGW. The backend for objects past a database row's
+  comfort, and the one that survives ephemeral pods. It moves the bytes itself
+  over an injected `HttpTransport`, which is how sutegi ships an S3 client
+  while still having **no TLS stack and no third-party dependency**.
+- **`S3Store`** — the credentials behind it, and on its own a pure-`std` **SigV4
+  presigner**: time-limited GET/PUT/DELETE URLs whose bytes flow **directly
+  between the client and the object store**, never proxied. Signing reuses the
+  Postgres driver's SCRAM crypto and is verified against AWS's published
+  known-answer vectors — for presigned URLs *and* signed headers.
 
 ```rust
 use sutegi::prelude::*;
 
 let store = FsStorage::new("data/files")?;        // or DbStorage::new(pg)
 store.put("reports/q2.pdf", &bytes, "application/pdf")?;
+
+// Same trait, same call sites, a bucket instead of a disk:
+let r2 = S3Store::r2(&account, "media", &ak, &sk).storage(SystemCurl::new());
+r2.put("reports/q2.pdf", &bytes, "application/pdf")?;
+let objects = r2.list("reports/")?;              // Vec<ObjectMeta>
 
 // The agent-native shape: a tool mints an upload URL, the agent PUTs the
 // bytes itself — your app only ever handles metadata.
@@ -603,10 +613,35 @@ app.tool("presign_upload", "Mint a time-limited S3 upload URL.",
     })
 ```
 
+### The transport seam (how S3 works without TLS in the tree)
+
+`S3Storage` never opens a socket itself. It hands a signed request to an
+`HttpTransport` — one method — and two implementations ship with it:
+
+- **`SystemCurl`** — `https` by delegating the handshake and certificate
+  verification to the system `curl`. The crypto that must not be hand-rolled
+  isn't, and the dependency count stays at zero. Credentials never reach
+  `argv`: the URL and every signed header go in on **stdin** (`--config -`), so
+  `Authorization` is invisible to `ps`. Protocol pinned with `--proto =https`,
+  redirects off (a 3xx must not replay a signature elsewhere), TLS 1.2 floor,
+  and no knob anywhere that disables verification.
+- **`PlainHttp`** — pure `std`, and it **refuses `https`** rather than
+  pretending. For a store on a trusted path: in-cluster MinIO, sidecar Garage,
+  a dev container. Same stance as the Postgres driver and the SMTP transport.
+- **yours** — `impl HttpTransport for MyClient` if you already pay for `ureq`
+  or `reqwest`.
+
+Every request is signed with the **real payload hash** (`x-amz-content-sha256`,
+never `UNSIGNED-PAYLOAD`), so a body altered in flight is refused by the store —
+integrity that holds even over `PlainHttp`. Downloads and uploads are checked
+against the `ETag` when it is a plain MD5, giving end-to-end verification on top
+of it. `list` follows continuation tokens and is bounded by `max_list_keys`: a
+ten-million-object bucket errors, never silently truncates.
+
 `S3Store` deliberately does not implement `Storage`: minting a URL is a
-different contract than moving bytes. A full proxying S3 client joins the
-trait once TLS lands. See `examples/storage` for the working file server +
-presign tools.
+different contract than moving bytes. `S3Store::storage(transport)` is the
+crossing point. See `examples/storage` for the working file server + presign
+tools.
 
 ## Collections
 

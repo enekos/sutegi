@@ -7,16 +7,23 @@
 //!   `Backend`. On Postgres this is **multi-pod file storage with zero new
 //!   infrastructure** — the database you already run is the blob store. Good
 //!   to roughly a few MB per object; past that, reach for real object storage.
-//! - [`S3Store`] — a pure-`std` **SigV4 presigner** for S3-compatible object
-//!   stores (AWS, R2, MinIO, …). It mints time-limited GET/PUT/DELETE URLs;
-//!   the bytes flow **directly between the client (or agent) and S3**, never
-//!   through sutegi. That is why it needs no HTTP client and no TLS — signing
-//!   is HMAC-SHA256, reused from the Postgres driver's SCRAM implementation.
+//! - [`S3Storage`] — an S3-compatible bucket: AWS S3, **Cloudflare R2**, MinIO,
+//!   Garage, Ceph RGW. The backend for objects too big for a database row, and
+//!   the one that keeps working when the pods are ephemeral. It moves the bytes
+//!   itself over an injected [`transport::HttpTransport`], which is how sutegi
+//!   gets a real S3 client while still shipping **no TLS stack and no
+//!   third-party dependency**: [`transport::SystemCurl`] borrows the system
+//!   `curl` for `https`, [`transport::PlainHttp`] is pure `std` for a store on
+//!   a trusted network, and your own client is one method away.
+//! - [`S3Store`] — the credentials behind [`S3Storage`], and on its own a
+//!   pure-`std` **SigV4 presigner**: it mints time-limited GET/PUT/DELETE URLs
+//!   so the bytes flow **directly between the client (or agent) and S3**, never
+//!   through sutegi. Presigning needs no HTTP client at all — signing is
+//!   HMAC-SHA256, reused from the Postgres driver's SCRAM implementation.
 //!
-//! `S3Store` deliberately does **not** implement [`Storage`]: handing out a
-//! URL is a different contract than moving bytes. When a full S3 client lands
-//! (blocked on TLS), it will join the trait; until then the swap seam spans
-//! fs ↔ db, and S3 is the presign-only escape hatch.
+//! `S3Store` deliberately does **not** implement [`Storage`]: handing out a URL
+//! is a different contract than moving bytes. [`S3Store::storage`] is the
+//! crossing point — same credentials, the other contract.
 //!
 //! Keys are `/`-separated paths (`avatars/42.png`), validated identically
 //! across backends — see [`validate_key`].
@@ -35,8 +42,12 @@ use sutegi_json::Json;
 
 pub mod fs;
 pub mod s3;
+pub mod s3_storage;
+pub mod transport;
 pub use fs::FsStorage;
 pub use s3::S3Store;
+pub use s3_storage::S3Storage;
+pub use transport::{HttpTransport, PlainHttp, SystemCurl};
 
 #[cfg(feature = "db")]
 pub mod db;
@@ -70,9 +81,9 @@ impl ObjectMeta {
     }
 }
 
-/// A byte-level object store. Implemented by [`FsStorage`] and [`DbStorage`];
-/// app code holds `impl Storage` (or a concrete type) and swaps backends by
-/// changing the type it constructs, not the call sites.
+/// A byte-level object store. Implemented by [`FsStorage`], [`DbStorage`] and
+/// [`S3Storage`]; app code holds `impl Storage` (or a concrete type) and swaps
+/// backends by changing the type it constructs, not the call sites.
 pub trait Storage {
     /// Store `bytes` at `key` (create or overwrite), recording `content_type`.
     fn put(&self, key: &str, bytes: &[u8], content_type: &str) -> Result<(), String>;

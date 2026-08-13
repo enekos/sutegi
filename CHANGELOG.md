@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+The S3 release: object storage joins the `Storage` trait, and still nothing third-party enters the tree.
+
+### Added
+
+- Storage: **`S3Storage<T>` implements `Storage`** — AWS S3, **Cloudflare R2**, MinIO, Garage, Ceph RGW behind the same `put`/`get`/`stat`/`delete`/`list`/`get_reader` call sites as `FsStorage` and `DbStorage`. This closes the gap the presigner left open: the swap seam now spans fs ↔ db ↔ bucket, so an app outgrows a single disk (or a Postgres row's few-MB ceiling) by changing the type it constructs. `S3Store::storage(transport)` is the crossing point from credentials to trait, and `S3Store::r2(account, bucket, ak, sk)` is R2 preconfigured (region `auto`, path-style endpoint).
+- Storage: **an outbound-HTTP seam, `HttpTransport`** — one method, so a real S3 client exists without sutegi growing a TLS stack or a dependency. `SystemCurl` delegates the `https` handshake and certificate verification to the system `curl` (the crypto that must not be hand-rolled isn't); `PlainHttp` is pure `std` and **refuses `https`** rather than pretending, for stores on a trusted network path; your own client is `impl HttpTransport`.
+- Storage: **`Authorization`-header SigV4** alongside query presigning (`S3Store::sign_request`, public so the rest of the S3 API — multipart, `CopyObject`, tagging — is reachable through the same transport). The **payload hash is signed** (`x-amz-content-sha256`, never `UNSIGNED-PAYLOAD`), so a body altered in flight is refused by the store — integrity that holds even over `PlainHttp`. Verified against AWS's published known-answer vectors for header-signed `GET Object` and `PUT Object`, next to the presign vector already pinned.
+- Storage: **`ETag` verification on upload and download**, on by default — when the store reports a plain MD5 ETag (single-part, no SSE-C/KMS), the bytes are checked end-to-end; multipart/encrypted ETags are skipped, not faked. `verify_etag(false)` opts out.
+- Storage: `list` follows `ListObjectsV2` continuation tokens and is bounded by `max_list_keys` (default 100 000) — a ten-million-object bucket **errors instead of silently truncating**, and a store that keeps replaying one token cannot spin forever. Keys arrive `encoding-type=url` and are decoded; keys no backend can address (the empty `dir/` markers S3 GUIs create) are skipped.
+- Storage tests: 58 unit cases plus a 9-case wire suite (`tests/s3_roundtrip.rs`) driving the client against a tiny in-process S3 stub over a real socket — full lifecycle, 2400-key pagination across three round trips, unicode/space/plus keys through both path and XML encodings, a tampered download caught by ETag, a dead endpoint, and the same lifecycle again through a real `curl` subprocess (including a 2 MB upload, whose `Expect: 100-continue` interim block the parser skips).
+
+### Security
+
+- Storage: **`S3Store`'s `Debug` redacts credentials.** It previously derived `Debug` over `access_key`/`secret_key`/`session_token`, so printing a store — or any struct holding one — leaked the secret key into logs.
+- Storage: `SystemCurl` keeps credentials out of `argv` (config on stdin, so `Authorization` is invisible to `ps`/`/proc`), pins `--proto =https`, disables redirect following so a 3xx cannot replay a signature at an attacker-chosen host, floors TLS at 1.2, caps the body with `--max-filesize`, and exposes no way to disable certificate verification. `PUT` bodies stage through a `0600`, `O_EXCL` temp file removed on completion (`tmp_dir` points it at a tmpfs).
+- Storage: header values are rejected if they carry control characters, so a caller-supplied `content_type` cannot inject a header; URLs carrying userinfo or whitespace are refused; response bodies, header counts and line lengths are all bounded.
+
 ## [0.9.0] - 2026-07-31
 
 The portable-queue release: a durable job queue no longer requires a Postgres server.

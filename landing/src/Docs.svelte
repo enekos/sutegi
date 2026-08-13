@@ -453,8 +453,10 @@ let msg = MailMessage::new()
     .line("If you didn't sign up, ignore this email.");
 mailer.send(msg.build("Acme"))?;`;
 
-  const cStorage = `// FsStorage: single-node, one directory on disk. Same Storage trait as DbStorage / S3.
-let store = FsStorage::new("files")?;
+  const cStorage = `// One trait, three backends. Swap the type you construct, not the call sites.
+let store = FsStorage::new("files")?;                        // single-node, one directory
+let store = S3Store::r2(&acct, "media", &ak, &sk)            // …or a Cloudflare R2 bucket
+    .storage(SystemCurl::new());
 
 .put("/files/:name", "Upload", |c| {
     let ct = c.header("content-type").unwrap_or("");
@@ -1133,9 +1135,14 @@ App::new("api")
             (<code>put</code>/<code>get</code>/<code>stat</code>/<code>delete</code>/<code>list</code>/
             <code>get_reader</code>, with traversal-validated keys). <code>FsStorage</code> writes to a local directory
             (atomic temp-and-rename); <code>DbStorage</code> (the <code>storage-db</code> feature) stores blobs in
-            SQLite or Postgres for multi-pod files with no new infrastructure; and <code>S3Store</code> is a pure-std
-            SigV4 presigner for AWS/R2/MinIO. Presigning is the agent-native trick: mint a time-limited URL and let the
-            client (or agent) move the bytes straight to the object store — they never pass through your server.
+            SQLite or Postgres for multi-pod files with no new infrastructure; and <code>S3Storage</code> puts the same
+            trait on a real bucket — AWS S3, Cloudflare R2, MinIO, Garage. It moves the bytes over an injected
+            <code>HttpTransport</code>, which is how an S3 client exists here with no TLS stack and no dependency:
+            <code>SystemCurl</code> borrows the system <code>curl</code> for https, <code>PlainHttp</code> is pure std
+            for a store on a trusted path. Requests are SigV4-signed over the real payload hash, and downloads are
+            ETag-verified. The same credentials also presign, which is the agent-native trick: mint a time-limited URL
+            and let the client (or agent) move the bytes straight to the object store — they never pass through your
+            server.
           </p>
           {@render code(cStorage, 'storage')}
         </article>

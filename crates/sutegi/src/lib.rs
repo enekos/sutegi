@@ -18,7 +18,7 @@
 //! | `template` | sutegi-template | Blade-style template engine (`{{ }}`, `@if`, `@foreach`, `@include`) |
 //! | `mail`     | sutegi-mail (+ template) | Email builder, themed messages, Transport seam, smtp/sendmail/log drivers |
 //! | `auth-mail` | + sutegi-auth/mail | email-verification + password-reset flows |
-//! | `storage`  | sutegi-storage (pure std) | file storage: local fs + S3 presigned URLs |
+//! | `storage`  | sutegi-storage (pure std) | file storage: local fs, S3/R2 objects, presigned URLs |
 //! | `storage-db` | + sutegi-orm  | blobs in SQLite/Postgres over the `Backend` seam |
 //! | `ws`       | sutegi-ws       | WebSockets: `App::ws` on the sharded kqueue/epoll reactor |
 //! | `pubsub`   | sutegi-pubsub   | in-process topic fan-out behind the `Broker` seam |
@@ -499,7 +499,9 @@ pub mod prelude {
     pub use sutegi_auth::AuthMail;
 
     #[cfg(feature = "storage")]
-    pub use sutegi_storage::{FsStorage, ObjectMeta, S3Store, Storage};
+    pub use sutegi_storage::{
+        FsStorage, HttpTransport, ObjectMeta, PlainHttp, S3Storage, S3Store, Storage, SystemCurl,
+    };
 
     #[cfg(feature = "sqlite")]
     pub use sutegi_orm::db::Db;
