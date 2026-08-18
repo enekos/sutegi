@@ -826,6 +826,17 @@ impl App {
 
             // Inner closure so we can post-process (record metrics) on every path.
             let resp = (|| {
+                // Routed segments, computed once. The router trims leading and
+                // trailing slashes before splitting, so `//__tools/x` and
+                // `/__tools/x/` reach exactly the same route as `/__tools/x` —
+                // which means a gate keyed on the raw path string (`starts_with
+                // ("/__")`) is bypassable with one extra slash, leaving tool
+                // invocation and every other `/__`-mounted route reachable
+                // unauthenticated (CWE-288). Gate on the segments the router
+                // actually matches instead.
+                let segs = split_segments(&req.path);
+                let ops_surface = segs.first().is_some_and(|s| s.starts_with("__"));
+
                 // Liveness/readiness probes: always open and matched before any
                 // guard — orchestrator probes must not need app credentials and
                 // they disclose nothing sensitive.
@@ -842,14 +853,14 @@ impl App {
                     _ => {}
                 }
 
-                // Agent/ops surface guard. Gates every other `/__`-prefixed
+                // Agent/ops surface guard. Gates every other `__`-prefixed
                 // endpoint — `/__introspect`, `/__metrics`, `/__tools*` (tool
                 // invocation) and any `/__`-mounted route like `/__migrations`.
                 // Runs before the global middleware chain AND before routing, so
                 // it protects the internal surface (tool routes live in the
                 // route table; introspect/metrics are matched below). Unset =
                 // open, the historical default.
-                if req.path.starts_with("/__") {
+                if ops_surface {
                     if let Some(guard) = &*ops_guard {
                         if let Some(resp) = guard(&req) {
                             return resp;
@@ -881,7 +892,6 @@ impl App {
                 }
 
                 // Route table (run group-scoped middleware before the handler).
-                let segs = split_segments(&req.path);
                 if let Some((route, params)) = match_route(&routes, req.method, &segs) {
                     for mw in &route.middleware {
                         if let Some(resp) = mw(&req) {
