@@ -1399,6 +1399,18 @@ pub fn cors_credentialed(
 ) -> impl Fn(&Request, Response) -> Response + Send + Sync + 'static {
     let origin = origin.to_string();
     move |_req: &Request, resp: Response| {
+        // Idempotent, because this also runs over the responses the preflight
+        // middleware already finished. Two `Access-Control-Allow-Origin`
+        // headers is not a lenient version of one — the browser fails the
+        // request outright — and `curl` reports a perfectly good `204` either
+        // way, so the mistake survives every check that is not a real browser.
+        if resp
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("access-control-allow-origin"))
+        {
+            return resp;
+        }
         resp.with_header("access-control-allow-origin", &origin)
             .with_header("access-control-allow-credentials", "true")
             .with_header("vary", "origin")
@@ -1849,6 +1861,25 @@ mod tests {
         let stamped = after(&req(Method::Get, b""), Response::new(200));
         assert!(has(&stamped, "access-control-allow-origin", "https://app.hirusta.io"));
         assert!(has(&stamped, "access-control-allow-credentials", "true"));
+    }
+
+    /// Both middlewares run over a preflight, and a response carrying
+    /// `Access-Control-Allow-Origin` twice is one the browser refuses. This is
+    /// the whole pairing working as deployed, so it is asserted as a count.
+    #[test]
+    fn credentialed_cors_never_doubles_the_origin_header() {
+        let pre = cors_preflight_credentialed("https://app.hirusta.io");
+        let after = cors_credentialed("https://app.hirusta.io");
+        // Exactly what the server does: preflight answers, after-middleware
+        // then stamps every response on the way out.
+        let preflight = pre(&req(Method::Options, b"")).unwrap();
+        let stamped = after(&req(Method::Options, b""), preflight);
+        let origins = stamped
+            .headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("access-control-allow-origin"))
+            .count();
+        assert_eq!(origins, 1, "a duplicated allow-origin fails the request");
     }
 
     /// `Allow-Headers: *` is a literal once credentials are in play, so a
