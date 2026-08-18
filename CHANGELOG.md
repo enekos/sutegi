@@ -7,10 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-The S3 release: object storage joins the `Storage` trait, and still nothing third-party enters the tree.
+## [0.10.0] - 2026-08-18
+
+The S3 release: object storage joins the `Storage` trait, and still nothing third-party enters the tree. It also carries a path-matching fix on the ops surface worth reading even if you never touch storage.
 
 ### Added
 
+- Web: **credentialed CORS** — `cors_preflight_credentialed` and `cors_credentialed`, for a browser frontend on a different origin that must send a session cookie. The existing `cors`/`cors_preflight` stamp `Access-Control-Allow-Origin` and nothing else, which is correct for a public API and quietly useless here. Three things have to be right and each fails silently alone: `Access-Control-Allow-Credentials` must be on the **real** response and not only the preflight (without it the browser discards a body it has already received, reporting no CORS error anyone sees); `Allow-Headers: *` stops being a wildcard once credentials are in play, so the first JSON `POST` is refused by a server that believes it allows everything; and a preflight without `Max-Age` is paid on every mutating call. The pair is idempotent, so composing both halves cannot emit a duplicate `Allow-Origin` — which a browser rejects outright while `curl -i` shows a perfectly good `204`. Added next to the originals rather than as flags on them: making `cors` credentialed by default would silently widen every app already using it.
 - Storage: **`S3Storage<T>` implements `Storage`** — AWS S3, **Cloudflare R2**, MinIO, Garage, Ceph RGW behind the same `put`/`get`/`stat`/`delete`/`list`/`get_reader` call sites as `FsStorage` and `DbStorage`. This closes the gap the presigner left open: the swap seam now spans fs ↔ db ↔ bucket, so an app outgrows a single disk (or a Postgres row's few-MB ceiling) by changing the type it constructs. `S3Store::storage(transport)` is the crossing point from credentials to trait, and `S3Store::r2(account, bucket, ak, sk)` is R2 preconfigured (region `auto`, path-style endpoint).
 - Storage: **an outbound-HTTP seam, `HttpTransport`** — one method, so a real S3 client exists without sutegi growing a TLS stack or a dependency. `SystemCurl` delegates the `https` handshake and certificate verification to the system `curl` (the crypto that must not be hand-rolled isn't); `PlainHttp` is pure `std` and **refuses `https`** rather than pretending, for stores on a trusted network path; your own client is `impl HttpTransport`.
 - Storage: **`Authorization`-header SigV4** alongside query presigning (`S3Store::sign_request`, public so the rest of the S3 API — multipart, `CopyObject`, tagging — is reachable through the same transport). The **payload hash is signed** (`x-amz-content-sha256`, never `UNSIGNED-PAYLOAD`), so a body altered in flight is refused by the store — integrity that holds even over `PlainHttp`. Verified against AWS's published known-answer vectors for header-signed `GET Object` and `PUT Object`, next to the presign vector already pinned.
@@ -20,6 +23,7 @@ The S3 release: object storage joins the `Storage` trait, and still nothing thir
 
 ### Security
 
+- Web: **the ops-surface guard is gated on router segments, not on the raw path** (CWE-288). It tested `req.path.starts_with("/__")`, but the router trims leading and trailing slashes before splitting — so `//__tools/x` reached exactly the same route as `/__tools/x` while failing that test. One extra character left tool invocation, `/__introspect`, `/__metrics` and every other `/__`-mounted route reachable without the configured credential. The check and the dispatch now agree by construction rather than by both parsing the path the same way. **Worth auditing your reverse proxy too**: Apache's idiomatic `<LocationMatch "^/__">` has the identical blind spot, so a deployment can look doubly protected and be neither. (`MergeSlashes`, on by default since Apache 2.4.39, collapses it — which makes the anchored form correct by accident and one directive away from not being. `^/+__` is free.)
 - Storage: **`S3Store`'s `Debug` redacts credentials.** It previously derived `Debug` over `access_key`/`secret_key`/`session_token`, so printing a store — or any struct holding one — leaked the secret key into logs.
 - Storage: `SystemCurl` keeps credentials out of `argv` (config on stdin, so `Authorization` is invisible to `ps`/`/proc`), pins `--proto =https`, disables redirect following so a 3xx cannot replay a signature at an attacker-chosen host, floors TLS at 1.2, caps the body with `--max-filesize`, and exposes no way to disable certificate verification. `PUT` bodies stage through a `0600`, `O_EXCL` temp file removed on completion (`tmp_dir` points it at a tmpfs).
 - Storage: header values are rejected if they carry control characters, so a caller-supplied `content_type` cannot inject a header; URLs carrying userinfo or whitespace are refused; response bodies, header counts and line lengths are all bounded.
@@ -124,5 +128,6 @@ The production user-system release: everything Laravel's auth scaffolding does, 
 
 - Performance release (see commit `4f2655f`).
 
+[0.10.0]: https://github.com/enekos/sutegi/compare/v0.9.0...v0.10.0
 [0.5.1]: https://github.com/enekos/sutegi/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/enekos/sutegi/releases/tag/v0.5.0

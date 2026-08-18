@@ -9,8 +9,8 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-sutegi-crypto = { version = "0.9.0", path = "../sutegi-crypto" }
-sutegi-http = { version = "0.9.0", path = "../sutegi-http" }
+sutegi-crypto = { version = "0.10.0", path = "../sutegi-crypto" }
+sutegi-http = { version = "0.10.0", path = "../sutegi-http" }
 # The one non-Rust-std ingredient: raw kqueue/epoll/pipe syscalls. Same
 # posture as sutegi-web's `graceful` feature — libc is a binding, not a
 # framework, and there is no std API for readiness-based I/O.
