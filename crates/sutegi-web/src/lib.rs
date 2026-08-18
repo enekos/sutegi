@@ -1337,6 +1337,74 @@ pub fn cors(origin: &str) -> impl Fn(&Request, Response) -> Response + Send + Sy
     move |_req: &Request, resp: Response| resp.with_header("access-control-allow-origin", &origin)
 }
 
+/// A pre-middleware answering CORS preflight for a **credentialed** frontend —
+/// one whose `fetch` carries `credentials: 'include'` so a session cookie
+/// reaches an API on another origin.
+///
+/// This is not [`cors_preflight`] with one extra header. Three things differ,
+/// and each is a way a credentialed setup fails while looking configured:
+///
+///   * **The origin must be exact.** `*` is illegal once credentials are in
+///     play, and the browser's response is to drop the reply — not to report a
+///     CORS error anyone will see in the network tab. There is deliberately no
+///     wildcard path through this function.
+///   * **`Allow-Headers: *` stops being a wildcard.** With credentials it is
+///     matched literally, so the very first JSON `POST` — `content-type:
+///     application/json`, which is not a safelisted value — is refused by a
+///     server that believes it allows everything. The requested headers are
+///     echoed back instead.
+///   * **A preflight is either cached or paid for on every mutating call.**
+///     Without `Max-Age` each `POST` costs two round trips.
+///
+/// Pair with [`cors_credentialed`], which stamps the same pair of headers onto
+/// the real response; a preflight that passes and a reply the browser then
+/// discards is the confusing half-configured state.
+pub fn cors_preflight_credentialed(
+    origin: &str,
+) -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static {
+    let origin = origin.to_string();
+    move |req: &Request| {
+        if req.method != Method::Options {
+            return None;
+        }
+        // Echoing what was asked for keeps this correct as the client grows new
+        // headers; the origin check above is what actually gates access.
+        let requested = req
+            .header("access-control-request-headers")
+            .unwrap_or("content-type");
+        Some(
+            Response::new(204)
+                .with_header("access-control-allow-origin", &origin)
+                .with_header("access-control-allow-credentials", "true")
+                .with_header(
+                    "access-control-allow-methods",
+                    "GET,POST,PUT,DELETE,OPTIONS",
+                )
+                .with_header("access-control-allow-headers", requested)
+                .with_header("access-control-max-age", "86400")
+                .with_header("vary", "origin, access-control-request-headers"),
+        )
+    }
+}
+
+/// An after-middleware pairing with [`cors_preflight_credentialed`]: the exact
+/// origin plus `Access-Control-Allow-Credentials`, on every response.
+///
+/// Both headers are required on the *real* response, not just the preflight.
+/// Omitting them here is the failure that reads as "CORS works, but every
+/// request returns nothing": the preflight passes, the request is made, the
+/// server answers, and the browser refuses to hand the body to the page.
+pub fn cors_credentialed(
+    origin: &str,
+) -> impl Fn(&Request, Response) -> Response + Send + Sync + 'static {
+    let origin = origin.to_string();
+    move |_req: &Request, resp: Response| {
+        resp.with_header("access-control-allow-origin", &origin)
+            .with_header("access-control-allow-credentials", "true")
+            .with_header("vary", "origin")
+    }
+}
+
 /// A pre-middleware requiring `Authorization: Bearer <token>`; else `401`.
 pub fn bearer(token: &str) -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static {
     let expected = format!("Bearer {}", token);
@@ -1758,6 +1826,49 @@ mod tests {
             .headers
             .iter()
             .any(|(k, v)| k == "access-control-allow-origin" && v == "*"));
+    }
+
+    /// The header a credentialed frontend cannot work without, on **both**
+    /// halves. Missing it on the real response is the failure that looks like
+    /// success: preflight passes, the server answers, the browser bins the body.
+    #[test]
+    fn credentialed_cors_allows_credentials_on_both_halves() {
+        let has = |resp: &Response, k: &str, v: &str| {
+            resp.headers.iter().any(|(hk, hv)| hk == k && hv == v)
+        };
+
+        let pre = cors_preflight_credentialed("https://app.hirusta.io");
+        let resp = pre(&req(Method::Options, b"")).unwrap();
+        assert_eq!(resp.status, 204);
+        assert!(has(&resp, "access-control-allow-origin", "https://app.hirusta.io"));
+        assert!(has(&resp, "access-control-allow-credentials", "true"));
+        // Non-OPTIONS is not this middleware's business.
+        assert!(pre(&req(Method::Get, b"")).is_none());
+
+        let after = cors_credentialed("https://app.hirusta.io");
+        let stamped = after(&req(Method::Get, b""), Response::new(200));
+        assert!(has(&stamped, "access-control-allow-origin", "https://app.hirusta.io"));
+        assert!(has(&stamped, "access-control-allow-credentials", "true"));
+    }
+
+    /// `Allow-Headers: *` is a literal once credentials are in play, so a
+    /// JSON `POST` — the ordinary case — must come back explicitly allowed.
+    #[test]
+    fn credentialed_preflight_echoes_the_requested_headers() {
+        let mut r = req(Method::Options, b"");
+        r.headers.push((
+            "access-control-request-headers".into(),
+            "content-type".into(),
+        ));
+        let resp = cors_preflight_credentialed("https://app.hirusta.io")(&r).unwrap();
+        assert!(resp
+            .headers
+            .iter()
+            .any(|(k, v)| k == "access-control-allow-headers" && v == "content-type"));
+        assert!(resp
+            .headers
+            .iter()
+            .any(|(k, v)| k == "access-control-allow-headers" && v != "*"));
     }
 
     #[test]

@@ -427,10 +427,11 @@ pub mod prelude {
     pub use crate::config::Config;
     pub use sutegi_json::Json;
     pub use sutegi_web::{
-        basic, bearer, cors, cors_preflight, form_body, html, json, json_body, logger, mw,
-        no_content, not_found, query_params, rate_limit, redirect, schema, secure_headers, sse,
-        status, stream, text, App, Ctx, Error, Group, IntoResponse, Limits, Method, Mw, Params,
-        Request, Response, SseSink, StreamSink, ToolCtx,
+        basic, bearer, cors, cors_credentialed, cors_preflight, cors_preflight_credentialed,
+        form_body, html, json, json_body, logger, mw, no_content, not_found, query_params,
+        rate_limit, redirect, schema, secure_headers, sse, status, stream, text, App, Ctx, Error,
+        Group, IntoResponse, Limits, Method, Mw, Params, Request, Response, SseSink, StreamSink,
+        ToolCtx,
     };
 
     #[cfg(feature = "events")]
