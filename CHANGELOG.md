@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.10.0] - 2026-08-18
+### Added
+
+- Web: **`App::listener` — non-HTTP socket loops as first-class app citizens.** A UDP ingest port, a raw TCP protocol, a discovery beacon: `std::net` could always run them on a hand-spawned thread, but that thread was invisible to the app — it outlived graceful drains, saw none of the shared state, and appeared nowhere an agent could discover it. `app.listener(name, doc, run)` registers a closure that runs on its own named thread for the life of the server and receives a `ListenerCtx`: `should_stop()` (the same flag `run_graceful` flips on SIGTERM) plus the typed `state::<T>()` / `db::<B>()` access handlers and tools already have. Shutdown is now whole-app: `run`/`run_until` stop accepting, drain in-flight HTTP requests, then **join listener threads before returning**, so a rolling deploy waits for your loop's last iteration. The contract is cooperative — block with a socket read timeout and poll `should_stop()`, because the join waits for the loop to notice. A panicking listener is caught and reported on stderr instead of dying silently; `/__introspect` gains a `listeners` block (name + doc), keeping the non-HTTP surface agent-discoverable; `App::service()` never spawns listeners, so in-process tests and benches stay socket-free. See `docs/LISTENERS.md`.
 
 The S3 release: object storage joins the `Storage` trait, and still nothing third-party enters the tree. It also carries a path-matching fix on the ops surface worth reading even if you never touch storage.
 

@@ -430,8 +430,8 @@ pub mod prelude {
         basic, bearer, cors, cors_credentialed, cors_preflight, cors_preflight_credentialed,
         form_body, html, json, json_body, logger, mw, no_content, not_found, query_params,
         rate_limit, redirect, schema, secure_headers, sse, status, stream, text, App, Ctx, Error,
-        Group, IntoResponse, Limits, Method, Mw, Params, Request, Response, SseSink, StreamSink,
-        ToolCtx,
+        Group, IntoResponse, Limits, ListenerCtx, Method, Mw, Params, Request, Response, SseSink,
+        StreamSink, ToolCtx,
     };
 
     #[cfg(feature = "events")]
