@@ -1852,14 +1852,22 @@ mod tests {
         let pre = cors_preflight_credentialed("https://app.hirusta.io");
         let resp = pre(&req(Method::Options, b"")).unwrap();
         assert_eq!(resp.status, 204);
-        assert!(has(&resp, "access-control-allow-origin", "https://app.hirusta.io"));
+        assert!(has(
+            &resp,
+            "access-control-allow-origin",
+            "https://app.hirusta.io"
+        ));
         assert!(has(&resp, "access-control-allow-credentials", "true"));
         // Non-OPTIONS is not this middleware's business.
         assert!(pre(&req(Method::Get, b"")).is_none());
 
         let after = cors_credentialed("https://app.hirusta.io");
         let stamped = after(&req(Method::Get, b""), Response::new(200));
-        assert!(has(&stamped, "access-control-allow-origin", "https://app.hirusta.io"));
+        assert!(has(
+            &stamped,
+            "access-control-allow-origin",
+            "https://app.hirusta.io"
+        ));
         assert!(has(&stamped, "access-control-allow-credentials", "true"));
     }
 
