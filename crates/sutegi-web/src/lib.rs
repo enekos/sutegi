@@ -242,6 +242,41 @@ impl ToolCtx {
     }
 }
 
+pub struct ListenerCtx {
+    name: String,
+    state: Arc<StateMap>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl ListenerCtx {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn should_stop(&self) -> bool {
+        self.shutdown.load(Ordering::Relaxed)
+    }
+
+    pub fn state<T: Any + Send + Sync>(&self) -> &T {
+        state_or_panic(&self.state)
+    }
+
+    pub fn try_state<T: Any + Send + Sync>(&self) -> Option<&T> {
+        state_ref(&self.state)
+    }
+
+    #[cfg(feature = "orm")]
+    pub fn db<B: sutegi_orm::Backend + Any + Send + Sync>(&self) -> &B {
+        self.state::<B>()
+    }
+}
+
+struct ListenerDef {
+    name: String,
+    doc: String,
+    run: Box<dyn FnOnce(ListenerCtx) + Send + 'static>,
+}
+
 /// A request handler: takes a [`Ctx`], returns a [`Response`]. Registered forms
 /// accept any [`IntoResponse`]; this is the boxed, erased form the router runs.
 pub type Handler = Box<dyn Fn(&Ctx) -> Response + Send + Sync + 'static>;
@@ -343,6 +378,7 @@ pub struct App {
     tools: Vec<Json>,
     tool_defs: Vec<ToolDef>,
     state: StateMap,
+    listeners: Vec<ListenerDef>,
     workers: usize,
     readiness: Option<Box<dyn Fn() -> bool + Send + Sync + 'static>>,
     after: Vec<AfterMiddleware>,
@@ -415,6 +451,7 @@ impl App {
             tools: Vec::new(),
             tool_defs: Vec::new(),
             state: StateMap::new(),
+            listeners: Vec::new(),
             workers: 8,
             readiness: None,
             after: Vec::new(),
@@ -621,6 +658,18 @@ impl App {
         self
     }
 
+    pub fn listener<F>(mut self, name: &str, doc: &str, run: F) -> App
+    where
+        F: FnOnce(ListenerCtx) + Send + 'static,
+    {
+        self.listeners.push(ListenerDef {
+            name: name.to_string(),
+            doc: doc.to_string(),
+            run: Box::new(run),
+        });
+        self
+    }
+
     /// Register a group of routes sharing a path `prefix` and group-scoped
     /// `middleware`: `app.group("/api", vec![mw(auth)], |g| g.get(...))`.
     pub fn group(
@@ -795,6 +844,19 @@ impl App {
         if !self.search.is_empty() {
             doc.push(("search", Json::arr(self.search.clone())));
         }
+        if !self.listeners.is_empty() {
+            let listeners = self
+                .listeners
+                .iter()
+                .map(|l| {
+                    Json::obj(vec![
+                        ("name", Json::str(l.name.clone())),
+                        ("doc", Json::str(l.doc.clone())),
+                    ])
+                })
+                .collect();
+            doc.push(("listeners", Json::arr(listeners)));
+        }
         Json::obj(doc)
     }
 
@@ -804,6 +866,8 @@ impl App {
     ) -> (
         usize,
         Limits,
+        Vec<ListenerDef>,
+        Arc<StateMap>,
         impl Fn(Request) -> Response + Send + Sync + 'static,
     ) {
         // Mount any registered AI tools as routes + introspection entries.
@@ -812,12 +876,14 @@ impl App {
         }
         let limits = self.limits;
         let introspect = self.introspection();
+        let listeners = std::mem::take(&mut self.listeners);
         let routes = Arc::new(self.routes);
         let middleware = Arc::new(self.middleware);
         let ops_guard = Arc::new(self.ops_guard);
         let after = Arc::new(self.after);
         let readiness = Arc::new(self.readiness);
         let state = Arc::new(self.state);
+        let listener_state = Arc::clone(&state);
         let metrics = Arc::new(Metrics::default());
         let workers = self.workers;
 
@@ -921,30 +987,44 @@ impl App {
             resp
         };
 
-        (workers, limits, service)
+        (workers, limits, listeners, listener_state, service)
     }
 
     /// The app as its bare request-service closure — the same function every
     /// `run*` variant serves over TCP, minus the socket. Feed it a [`Request`]
     /// and get the [`Response`] back: in-process tests and benchmarks without
-    /// binding a port.
+    /// binding a port. Registered listeners are not spawned.
     pub fn service(self) -> impl Fn(Request) -> Response + Send + Sync + 'static {
-        let (_, _, service) = self.into_service();
+        let (_, _, _, _, service) = self.into_service();
         service
     }
 
     /// Bind to `addr` and serve forever.
     pub fn run(self, addr: &str) -> std::io::Result<()> {
-        let (workers, limits, service) = self.into_service();
-        sutegi_http::serve(addr, workers, limits, service)
+        let (workers, limits, listeners, state, service) = self.into_service();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handles = spawn_listeners(listeners, &state, &shutdown);
+        let result = sutegi_http::serve(addr, workers, limits, service);
+        shutdown.store(true, Ordering::SeqCst);
+        for handle in handles {
+            let _ = handle.join();
+        }
+        result
     }
 
     /// Serve until `shutdown` is set, then drain in-flight requests and return.
     /// Flip the flag from a signal handler (see [`App::run_graceful`]) or your
     /// own logic for zero-drop rolling deploys.
     pub fn run_until(self, addr: &str, shutdown: Arc<AtomicBool>) -> std::io::Result<()> {
-        let (workers, limits, service) = self.into_service();
-        sutegi_http::serve_until(addr, workers, limits, service, shutdown)
+        let (workers, limits, listeners, state, service) = self.into_service();
+        let handles = spawn_listeners(listeners, &state, &shutdown);
+        let result =
+            sutegi_http::serve_until(addr, workers, limits, service, Arc::clone(&shutdown));
+        shutdown.store(true, Ordering::SeqCst);
+        for handle in handles {
+            let _ = handle.join();
+        }
+        result
     }
 
     /// Serve until SIGTERM/SIGINT (what Kubernetes sends on pod termination),
@@ -971,6 +1051,10 @@ impl App {
         });
         println!("sutegi · {} on http://{addr}", self.name);
         println!("  ops: /__health /__ready /__metrics /__introspect");
+        if !self.listeners.is_empty() {
+            let names: Vec<&str> = self.listeners.iter().map(|l| l.name.as_str()).collect();
+            println!("  listeners: {}", names.join(" "));
+        }
         #[cfg(feature = "graceful")]
         {
             self.run_graceful(&addr)
@@ -1017,6 +1101,34 @@ impl App {
         );
         self
     }
+}
+
+fn spawn_listeners(
+    listeners: Vec<ListenerDef>,
+    state: &Arc<StateMap>,
+    shutdown: &Arc<AtomicBool>,
+) -> Vec<std::thread::JoinHandle<()>> {
+    listeners
+        .into_iter()
+        .map(|def| {
+            let ctx = ListenerCtx {
+                name: def.name.clone(),
+                state: Arc::clone(state),
+                shutdown: Arc::clone(shutdown),
+            };
+            let run = def.run;
+            std::thread::Builder::new()
+                .name(format!("sutegi-listener-{}", def.name))
+                .spawn(move || {
+                    let name = ctx.name.clone();
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(ctx))).is_err()
+                    {
+                        eprintln!("sutegi: listener '{name}' panicked and stopped");
+                    }
+                })
+                .expect("sutegi: failed to spawn listener thread")
+        })
+        .collect()
 }
 
 fn manifest_entry(name: &str, description: &str, parameters: Json, streaming: bool) -> Json {
@@ -2043,6 +2155,106 @@ mod tests {
             ..req(Method::Get, b"")
         });
         assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn introspection_lists_listeners() {
+        let intro = App::new("t")
+            .listener("udp-echo", "Echoes datagrams.", |_ctx| {})
+            .introspection();
+        let entries = intro.get("listeners").and_then(Json::as_array).unwrap();
+        assert_eq!(
+            entries[0].get("name").and_then(Json::as_str),
+            Some("udp-echo")
+        );
+        assert_eq!(
+            entries[0].get("doc").and_then(Json::as_str),
+            Some("Echoes datagrams.")
+        );
+        assert!(App::new("t").introspection().get("listeners").is_none());
+    }
+
+    #[test]
+    fn service_never_spawns_listeners() {
+        let svc = App::new("t")
+            .listener("noop", "Would panic if spawned.", |_ctx| {
+                panic!("spawned by service()")
+            })
+            .service();
+        let resp = svc(Request {
+            path: "/__introspect".into(),
+            ..req(Method::Get, b"")
+        });
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn listener_reads_state_and_stops_on_shutdown() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let app = App::new("t")
+            .state(Arc::clone(&counter))
+            .get("/", "home", |_c| text(200, "ok"))
+            .listener("ticker", "Counts until shutdown.", |ctx| {
+                while !ctx.should_stop() {
+                    ctx.state::<Arc<AtomicU64>>()
+                        .fetch_add(1, Ordering::Relaxed);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            });
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&shutdown);
+        let server = std::thread::spawn(move || app.run_until("127.0.0.1:18501", flag));
+        for _ in 0..200 {
+            if counter.load(Ordering::Relaxed) > 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(counter.load(Ordering::Relaxed) > 2);
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap().unwrap();
+        let settled = counter.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(counter.load(Ordering::Relaxed), settled);
+    }
+
+    #[test]
+    fn udp_listener_echoes_and_joins_on_shutdown() {
+        use std::net::UdpSocket;
+        let udp_addr = "127.0.0.1:18503";
+        let app = App::new("t")
+            .get("/", "home", |_c| text(200, "ok"))
+            .listener("udp-echo", "Echoes datagrams.", move |ctx| {
+                let sock = UdpSocket::bind(udp_addr).unwrap();
+                sock.set_read_timeout(Some(Duration::from_millis(10)))
+                    .unwrap();
+                let mut buf = [0u8; 1024];
+                while !ctx.should_stop() {
+                    if let Ok((n, from)) = sock.recv_from(&mut buf) {
+                        let _ = sock.send_to(&buf[..n], from);
+                    }
+                }
+            });
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&shutdown);
+        let server = std::thread::spawn(move || app.run_until("127.0.0.1:18502", flag));
+
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut buf = [0u8; 16];
+        let mut echoed = None;
+        for _ in 0..100 {
+            let _ = client.send_to(b"ping", udp_addr);
+            if let Ok((n, _)) = client.recv_from(&mut buf) {
+                echoed = Some(buf[..n].to_vec());
+                break;
+            }
+        }
+        assert_eq!(echoed.as_deref(), Some(&b"ping"[..]));
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap().unwrap();
     }
 
     #[test]
