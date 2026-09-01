@@ -9,8 +9,9 @@
 //! A [`Migration`] is a `version` (a sortable id like `20260701_120000`), a
 //! human `name`, an `up` closure, and an optional `down`. The closures receive
 //! a [`MigrationOps`] handle — the object-safe subset of [`Backend`] (raw
-//! `execute`/`query` plus schema `migrate`) — so a migration can create tables
-//! from a [`TableSchema`] *or* run arbitrary DDL/DML.
+//! `execute`/`query` plus schema `migrate` and the SQL [`Dialect`]) — so a
+//! migration can create tables from a [`TableSchema`] *or* run arbitrary
+//! DDL/DML.
 //!
 //! ```ignore
 //! use sutegi::orm::migrate::{Migration, Migrator};
@@ -25,11 +26,37 @@
 //! }
 //! ```
 //!
-//! Each migration runs inside its own `BEGIN`/`COMMIT` (rolled back on error),
-//! so a failing migration leaves neither a half-applied schema nor a history
-//! row behind.
+//! ## The reliability contract
+//!
+//! Running migrations is the one moment an app rewrites its own foundations,
+//! so [`Migrator::run`] and [`Migrator::rollback`] are built so that **no
+//! outcome leaves the database in a state the migrator cannot account for**:
+//!
+//! - **Each migration is atomic.** Its body and its history row commit in one
+//!   *real* transaction pinned to a single connection
+//!   ([`Transactional::run_in_tx`]) — never `BEGIN`/`COMMIT` strings sprayed
+//!   across a connection pool, where each statement can land on a different
+//!   connection and "rollback" rolls back nothing. A failing migration leaves
+//!   neither a half-applied schema nor a history row.
+//! - **Concurrent runners serialize.** The run holds the backend's named
+//!   advisory lock (`sutegi:migrations`) — cluster-wide on Postgres via a
+//!   dedicated session that auto-releases on crash, process-wide on SQLite.
+//!   Where the lock cannot reach (two OS processes on one SQLite file), each
+//!   migration *re-checks the history table inside its own write transaction*
+//!   before running, so a lost race means a skip, never a double-apply.
+//! - **Nothing runs before the plan is validated.** Duplicate or malformed
+//!   versions, an out-of-order pending migration (older than something already
+//!   applied — the merged-stale-branch hazard), an applied migration whose
+//!   file was edited (checksum) or renamed, and a rollback batch containing a
+//!   forward-only or code-deleted migration are all rejected **up front**,
+//!   before the database is touched at all.
+//!
+//! A migration that *must not* run in a transaction (Postgres
+//! `CREATE INDEX CONCURRENTLY`) can opt out with
+//! [`Migration::no_transaction`]; it trades atomicity for that capability and
+//! must be written idempotently.
 
-use crate::backend::Backend;
+use crate::backend::{Backend, CapScope, Isolation, LockGuard, Transactional};
 use crate::schema_diff::{apply, diff, render, Plan, SchemaOp};
 use crate::value::{Dialect, TableSchema, Value};
 use sutegi_json::Json;
@@ -37,6 +64,14 @@ use sutegi_json::Json;
 /// The history table every migrator maintains. Portable DDL: `TEXT`/`INTEGER`
 /// are spelled the same on SQLite and Postgres.
 const HISTORY_TABLE: &str = "_sutegi_migrations";
+
+/// The advisory-lock name serializing concurrent migration runners.
+const MIGRATION_LOCK: &str = "sutegi:migrations";
+
+/// How long [`Migrator::run`]/[`rollback`](Migrator::rollback) wait for the
+/// migration lock before giving up (override with
+/// [`Migrator::lock_timeout`]).
+const DEFAULT_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The object-safe slice of [`Backend`] a migration body is handed.
 ///
@@ -52,6 +87,9 @@ pub trait MigrationOps {
     fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Json>, String>;
     /// Create a table from a schema if it does not already exist.
     fn migrate_schema(&self, schema: &TableSchema) -> Result<(), String>;
+    /// The SQL dialect on the other side — for a closure migration that must
+    /// write dialect-specific DDL by hand.
+    fn dialect(&self) -> Dialect;
 }
 
 impl<B: Backend + ?Sized> MigrationOps for B {
@@ -63,6 +101,29 @@ impl<B: Backend + ?Sized> MigrationOps for B {
     }
     fn migrate_schema(&self, schema: &TableSchema) -> Result<(), String> {
         Backend::migrate(self, schema)
+    }
+    fn dialect(&self) -> Dialect {
+        Backend::dialect(self)
+    }
+}
+
+/// [`MigrationOps`] over a `&dyn Backend` — the sized adapter that lets a
+/// migration body run against the transaction handle `run_in_tx` provides
+/// (an unsized `dyn Backend` can't coerce to `dyn MigrationOps` directly).
+struct DynOps<'a>(&'a dyn Backend);
+
+impl MigrationOps for DynOps<'_> {
+    fn execute(&self, sql: &str, params: &[Value]) -> Result<usize, String> {
+        self.0.execute(sql, params)
+    }
+    fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Json>, String> {
+        self.0.query(sql, params)
+    }
+    fn migrate_schema(&self, schema: &TableSchema) -> Result<(), String> {
+        self.0.migrate(schema)
+    }
+    fn dialect(&self) -> Dialect {
+        self.0.dialect()
     }
 }
 
@@ -87,6 +148,7 @@ pub struct Migration {
     version: String,
     name: String,
     body: Body,
+    transactional: bool,
 }
 
 impl Migration {
@@ -97,6 +159,7 @@ impl Migration {
             version: version.into(),
             name: name.into(),
             body: Body::Closure { up, down: None },
+            transactional: true,
         }
     }
 
@@ -114,6 +177,7 @@ impl Migration {
                 up,
                 down: Some(down),
             },
+            transactional: true,
         }
     }
 
@@ -129,7 +193,20 @@ impl Migration {
             version: version.into(),
             name: name.into(),
             body: Body::Ops(ops),
+            transactional: true,
         }
+    }
+
+    /// Opt this migration out of the per-migration transaction — for DDL that
+    /// refuses to run inside one, like Postgres `CREATE INDEX CONCURRENTLY`.
+    ///
+    /// The trade is explicit: if the process dies between the body finishing
+    /// and the history row committing, the next run executes the body
+    /// **again** — so a non-transactional migration must be idempotent
+    /// (`IF NOT EXISTS` its DDL, key its backfills).
+    pub fn no_transaction(mut self) -> Migration {
+        self.transactional = false;
+        self
     }
 
     pub fn version(&self) -> &str {
@@ -137,6 +214,10 @@ impl Migration {
     }
     pub fn name(&self) -> &str {
         &self.name
+    }
+    /// True unless [`no_transaction`](Migration::no_transaction) opted out.
+    pub fn runs_in_transaction(&self) -> bool {
+        self.transactional
     }
     /// True if this migration can be rolled back (declarative migrations always
     /// can; closure migrations only if they were given a `down`).
@@ -205,17 +286,17 @@ impl Migration {
     }
 
     /// Run the forward step against `conn`.
-    fn run_up<B: Backend>(&self, conn: &B) -> Result<(), String> {
+    fn run_up(&self, conn: &dyn Backend) -> Result<(), String> {
         match &self.body {
-            Body::Closure { up, .. } => up(conn),
+            Body::Closure { up, .. } => up(&DynOps(conn)),
             Body::Ops(ops) => exec_ops(conn, ops),
         }
     }
 
     /// Run the reverse step against `conn` (errors for a forward-only closure).
-    fn run_down<B: Backend>(&self, conn: &B) -> Result<(), String> {
+    fn run_down(&self, conn: &dyn Backend) -> Result<(), String> {
         match &self.body {
-            Body::Closure { down: Some(d), .. } => d(conn),
+            Body::Closure { down: Some(d), .. } => d(&DynOps(conn)),
             Body::Closure { down: None, .. } => Err(format!(
                 "cannot roll back {} ({}): migration is forward-only",
                 self.version, self.name
@@ -228,11 +309,21 @@ impl Migration {
     }
 }
 
+/// True for the version/name strings the migrator accepts: non-empty ASCII
+/// letters, digits, `_`, `-`, `.`. One path component by construction, so a
+/// version can never traverse out of the migrations directory, and `<` on the
+/// string is a sane apply order.
+fn valid_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
 /// Execute a list of schema ops against `conn`: render each to the backend's
 /// dialect and run it, threading a shadow schema forward so SQLite's table
 /// rebuilds see the correct pre-op state. The shadow starts from the live
 /// database so ops that touch pre-existing tables render correctly.
-fn exec_ops<B: Backend>(conn: &B, ops: &[SchemaOp]) -> Result<(), String> {
+fn exec_ops(conn: &dyn Backend, ops: &[SchemaOp]) -> Result<(), String> {
     let dialect = conn.dialect();
     let mut shadow = conn.introspect()?;
     for op in ops {
@@ -257,16 +348,39 @@ pub struct MigrationStatus {
     pub orphan: bool,
 }
 
+/// What [`Migrator::plan_run`] would do for one pending migration, without
+/// doing it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlannedMigration {
+    pub version: String,
+    pub name: String,
+    /// The SQL a declarative migration would execute, rendered for the
+    /// backend's dialect against the current schema. `None` for a closure
+    /// migration — its statements only exist at run time. (Rendering after a
+    /// closure is best-effort: the closure's schema effects are unknowable
+    /// without running it.)
+    pub statements: Option<Vec<String>>,
+}
+
 /// An ordered set of migrations plus the run/rollback/status machinery.
-#[derive(Default)]
 pub struct Migrator {
     migrations: Vec<Migration>,
+    allow_out_of_order: bool,
+    lock_timeout: std::time::Duration,
+}
+
+impl Default for Migrator {
+    fn default() -> Migrator {
+        Migrator::new()
+    }
 }
 
 impl Migrator {
     pub fn new() -> Migrator {
         Migrator {
             migrations: Vec::new(),
+            allow_out_of_order: false,
+            lock_timeout: DEFAULT_LOCK_TIMEOUT,
         }
     }
 
@@ -275,6 +389,25 @@ impl Migrator {
     #[allow(clippy::should_implement_trait)] // builder-style `add`, not `Add::add`
     pub fn add(mut self, migration: Migration) -> Migrator {
         self.migrations.push(migration);
+        self
+    }
+
+    /// Accept a pending migration whose version sorts *before* one already
+    /// applied. Off by default: an out-of-order pending migration usually
+    /// means a stale branch was merged, and applying it changes a schema that
+    /// later migrations already built on — [`run`](Migrator::run) errors and
+    /// names the versions instead. Opt in when parallel teams genuinely ship
+    /// interleaved versions.
+    pub fn allow_out_of_order(mut self) -> Migrator {
+        self.allow_out_of_order = true;
+        self
+    }
+
+    /// How long [`run`](Migrator::run)/[`rollback`](Migrator::rollback) wait
+    /// for the `sutegi:migrations` advisory lock before erroring (default
+    /// 300 s). Raise it when a fleet's slowest migration outlives it.
+    pub fn lock_timeout(mut self, timeout: std::time::Duration) -> Migrator {
+        self.lock_timeout = timeout;
         self
     }
 
@@ -307,6 +440,72 @@ impl Migrator {
         let mut v: Vec<&Migration> = self.migrations.iter().collect();
         v.sort_by(|a, b| a.version.cmp(&b.version));
         v
+    }
+
+    /// Reject a malformed migration set before anything touches the database:
+    /// empty or non-portable version/name strings, and duplicate versions
+    /// (two files, a file shadowing a coded migration, a copy-paste slip) —
+    /// running under a duplicate would apply one body but record a version
+    /// that ambiguously names two.
+    fn validate(&self) -> Result<(), String> {
+        let mut seen = std::collections::BTreeMap::new();
+        for m in &self.migrations {
+            if !valid_ident(&m.version) {
+                return Err(format!(
+                    "invalid migration version {:?} ({}): use ASCII letters, digits, `_`, `-`, `.`",
+                    m.version, m.name
+                ));
+            }
+            if !valid_ident(&m.name) {
+                return Err(format!(
+                    "invalid migration name {:?} ({}): use ASCII letters, digits, `_`, `-`, `.`",
+                    m.name, m.version
+                ));
+            }
+            if let Some(other) = seen.insert(m.version.as_str(), m.name.as_str()) {
+                return Err(format!(
+                    "duplicate migration version {}: registered as both {:?} and {:?}",
+                    m.version, other, m.name
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Hold the backend's migration lock for the duration of the returned
+    /// guard. Backends without advisory locks (`CapScope::None`) proceed
+    /// without one — the in-transaction history re-check still prevents
+    /// double-apply there.
+    ///
+    /// Waits by **polling `try_lock`**, never by a server-side blocking wait:
+    /// on Postgres a session parked inside `pg_advisory_lock()` holds a
+    /// snapshot for the whole wait, and the holder running a
+    /// [`no_transaction`](Migration::no_transaction) `CREATE INDEX
+    /// CONCURRENTLY` must wait for every such snapshot — a deadlock between
+    /// the waiters and the very migration they're waiting on. A polling
+    /// waiter is snapshot-free between attempts, so the holder always
+    /// finishes.
+    fn acquire_lock<B: Backend>(&self, conn: &B) -> Result<Option<LockGuard>, String> {
+        if conn.capabilities().advisory_locks == CapScope::None {
+            return Ok(None);
+        }
+        let poll = std::time::Duration::from_millis(200);
+        let deadline = std::time::Instant::now() + self.lock_timeout;
+        loop {
+            if let Some(guard) = conn.try_lock(MIGRATION_LOCK)? {
+                return Ok(Some(guard));
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(format!(
+                    "could not acquire the migration lock within {:?} — another \
+                     migration runner appears to be active; retry once it finishes, \
+                     or raise Migrator::lock_timeout",
+                    self.lock_timeout
+                ));
+            }
+            std::thread::sleep(poll.min(deadline - now));
+        }
     }
 
     /// Create the history table if absent. Idempotent; tolerant of a
@@ -356,23 +555,12 @@ impl Migrator {
         Ok(out)
     }
 
-    /// Apply every pending migration in version order, each in its own
-    /// transaction. Returns the versions applied (empty if already up to date).
-    ///
-    /// On Postgres a session-level advisory lock serializes concurrent runners
-    /// (many pods booting at once) so migrations can't race. An already-applied
-    /// migration whose checksum no longer matches its stored one is a hard error
-    /// — a file was edited after being applied.
-    pub fn run<B: Backend>(&self, conn: &B) -> Result<Vec<String>, String> {
-        let _guard = AdvisoryLock::acquire(conn)?;
-        self.ensure_history(conn)?;
-        let applied = self.applied(conn)?;
-        let done: std::collections::BTreeSet<&str> =
-            applied.iter().map(|r| r.version.as_str()).collect();
-        let next_batch = applied.iter().map(|r| r.batch).max().unwrap_or(0) + 1;
-        let now = sutegi_crypto::now_secs();
-
-        // Tamper check: a migration already in history must still hash the same.
+    /// The tamper checks run before anything is applied: an already-applied
+    /// migration must still hash to its stored checksum (a file edited after
+    /// apply) and must still carry its recorded name (a rename after apply).
+    /// Both are fixed by restoring the file or, if the change was deliberate,
+    /// by [`repair`](Migrator::repair).
+    fn check_integrity(&self, applied: &[AppliedRow]) -> Result<(), String> {
         for m in self.sorted() {
             if let Some(row) = applied.iter().find(|r| r.version == m.version) {
                 let current = m.checksum();
@@ -383,51 +571,220 @@ impl Migrator {
                         m.version, m.name
                     ));
                 }
+                if !row.name.is_empty() && row.name != m.name {
+                    return Err(format!(
+                        "migration {} was renamed after being applied \
+                         ({:?} in the history, {:?} in code) — restore the name \
+                         or run `migrate repair`",
+                        m.version, row.name, m.name
+                    ));
+                }
             }
         }
+        Ok(())
+    }
+
+    /// The out-of-order guard: a pending migration sorting before the newest
+    /// applied version usually means a stale branch merged late, and its DDL
+    /// would run against a schema that later migrations already reshaped.
+    /// Rejected unless [`allow_out_of_order`](Migrator::allow_out_of_order).
+    ///
+    /// Only versions **this migrator defines** anchor the comparison — history
+    /// rows from another app sharing the database (or from migrations since
+    /// deleted from code) don't make every new migration read as stale.
+    fn check_order(
+        &self,
+        applied: &[AppliedRow],
+        done: &std::collections::BTreeSet<&str>,
+    ) -> Result<(), String> {
+        if self.allow_out_of_order {
+            return Ok(());
+        }
+        let defined: std::collections::BTreeSet<&str> =
+            self.migrations.iter().map(|m| m.version.as_str()).collect();
+        let newest_applied = match applied
+            .iter()
+            .map(|r| r.version.as_str())
+            .filter(|v| defined.contains(v))
+            .max()
+        {
+            Some(v) => v,
+            None => return Ok(()),
+        };
+        let stale: Vec<&str> = self
+            .sorted()
+            .iter()
+            .filter(|m| !done.contains(m.version.as_str()) && m.version.as_str() < newest_applied)
+            .map(|m| m.version.as_str())
+            .collect();
+        if stale.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "out-of-order migration(s) [{}] sort before the newest applied \
+                 version ({newest_applied}) — a stale branch was probably merged; \
+                 renumber them, or opt in with Migrator::allow_out_of_order()",
+                stale.join(", ")
+            ))
+        }
+    }
+
+    /// True if `version` has a history row — the in-transaction re-check that
+    /// makes a lost race a skip instead of a double-apply.
+    fn is_applied(&self, conn: &dyn Backend, version: &str) -> Result<bool, String> {
+        Ok(!conn
+            .query(
+                &format!("SELECT version FROM {HISTORY_TABLE} WHERE version = ?"),
+                &[Value::Text(version.to_string())],
+            )?
+            .is_empty())
+    }
+
+    /// Apply one pending migration atomically. Returns `false` if a concurrent
+    /// runner got there first (seen by the re-check inside the transaction).
+    fn apply_one<B: Backend + Transactional>(
+        &self,
+        conn: &B,
+        m: &Migration,
+        batch: i64,
+        now: i64,
+    ) -> Result<bool, String> {
+        let record = |ops: &dyn Backend| {
+            ops.execute(
+                &format!(
+                    "INSERT INTO {HISTORY_TABLE} (version, name, batch, checksum, applied_at) \
+                     VALUES (?, ?, ?, ?, ?)"
+                ),
+                &[
+                    Value::Text(m.version.clone()),
+                    Value::Text(m.name.clone()),
+                    Value::Int(batch),
+                    Value::Text(m.checksum()),
+                    Value::Int(now),
+                ],
+            )
+            .map(|_| ())
+        };
+
+        if !m.transactional {
+            if self.is_applied(conn, &m.version)? {
+                return Ok(false);
+            }
+            m.run_up(conn)?;
+            record(conn)?;
+            return Ok(true);
+        }
+
+        let mut applied_now = false;
+        run_write_tx(conn, &mut |tx| {
+            if self.is_applied(tx, &m.version)? {
+                return Ok(());
+            }
+            m.run_up(tx)?;
+            record(tx)?;
+            applied_now = true;
+            Ok(())
+        })?;
+        Ok(applied_now)
+    }
+
+    /// Apply every pending migration in version order, each atomically (its
+    /// body and history row in one single-connection transaction). Returns the
+    /// versions applied (empty if already up to date).
+    ///
+    /// Before anything runs, the whole plan is validated — duplicate/malformed
+    /// versions, checksum and rename tampering, out-of-order pending
+    /// migrations — and the backend's `sutegi:migrations` advisory lock is
+    /// held for the duration so concurrent runners (many pods booting at once)
+    /// serialize. See the module docs for the full reliability contract.
+    pub fn run<B: Backend + Transactional>(&self, conn: &B) -> Result<Vec<String>, String> {
+        self.validate()?;
+        let _guard = self.acquire_lock(conn)?;
+        self.ensure_history(conn)?;
+        let applied = self.applied(conn)?;
+        self.check_integrity(&applied)?;
+        let done: std::collections::BTreeSet<&str> =
+            applied.iter().map(|r| r.version.as_str()).collect();
+        self.check_order(&applied, &done)?;
+        let next_batch = applied.iter().map(|r| r.batch).max().unwrap_or(0) + 1;
+        let now = sutegi_crypto::now_secs();
 
         let mut ran = Vec::new();
         for m in self.sorted() {
             if done.contains(m.version.as_str()) {
                 continue;
             }
-            in_transaction(conn, || {
-                m.run_up(conn)?;
-                conn.execute(
-                    &format!(
-                        "INSERT INTO {HISTORY_TABLE} (version, name, batch, checksum, applied_at) \
-                         VALUES (?, ?, ?, ?, ?)"
-                    ),
-                    &[
-                        Value::Text(m.version.clone()),
-                        Value::Text(m.name.clone()),
-                        Value::Int(next_batch),
-                        Value::Text(m.checksum()),
-                        Value::Int(now),
-                    ],
-                )?;
-                Ok(())
-            })
-            .map_err(|e| format!("migration {} ({}) failed: {e}", m.version, m.name))?;
-            ran.push(m.version.clone());
+            let applied_now = self
+                .apply_one(conn, m, next_batch, now)
+                .map_err(|e| format!("migration {} ({}) failed: {e}", m.version, m.name))?;
+            if applied_now {
+                ran.push(m.version.clone());
+            }
         }
         Ok(ran)
     }
 
-    /// Re-stamp the stored checksums to match the current migration files —
-    /// the escape hatch after a deliberate edit to an applied migration. Only
-    /// touches rows that are both applied and still defined in code.
+    /// What [`run`](Migrator::run) would do, without doing it: the pending
+    /// migrations in apply order, each with the SQL it would execute (rendered
+    /// against the live schema for declarative migrations; `None` for closure
+    /// bodies, which only exist at run time). Read-only apart from creating
+    /// the (empty) history table on a fresh database.
+    pub fn plan_run<B: Backend>(&self, conn: &B) -> Result<Vec<PlannedMigration>, String> {
+        self.validate()?;
+        self.ensure_history(conn)?;
+        let applied = self.applied(conn)?;
+        let done: std::collections::BTreeSet<&str> =
+            applied.iter().map(|r| r.version.as_str()).collect();
+
+        let dialect = conn.dialect();
+        let mut shadow = conn.introspect()?;
+        let mut out = Vec::new();
+        for m in self.sorted() {
+            if done.contains(m.version.as_str()) {
+                continue;
+            }
+            let statements = match m.ops_list() {
+                Some(ops) => {
+                    let mut stmts = Vec::new();
+                    for op in ops {
+                        stmts.extend(render(op, dialect, &shadow)?);
+                        apply(&mut shadow, op)?;
+                    }
+                    Some(stmts)
+                }
+                None => None,
+            };
+            out.push(PlannedMigration {
+                version: m.version.clone(),
+                name: m.name.clone(),
+                statements,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Re-stamp the stored checksums and names to match the current migration
+    /// files — the escape hatch after a deliberate edit or rename of an
+    /// applied migration. Only touches rows that are both applied and still
+    /// defined in code.
     pub fn repair<B: Backend>(&self, conn: &B) -> Result<Vec<String>, String> {
+        self.validate()?;
         self.ensure_history(conn)?;
         let applied = self.applied(conn)?;
         let mut fixed = Vec::new();
         for m in self.sorted() {
             if let Some(row) = applied.iter().find(|r| r.version == m.version) {
                 let current = m.checksum();
-                if row.checksum != current {
+                if row.checksum != current || row.name != m.name {
                     conn.execute(
-                        &format!("UPDATE {HISTORY_TABLE} SET checksum = ? WHERE version = ?"),
-                        &[Value::Text(current), Value::Text(m.version.clone())],
+                        &format!(
+                            "UPDATE {HISTORY_TABLE} SET checksum = ?, name = ? WHERE version = ?"
+                        ),
+                        &[
+                            Value::Text(current),
+                            Value::Text(m.name.clone()),
+                            Value::Text(m.version.clone()),
+                        ],
                     )?;
                     fixed.push(m.version.clone());
                 }
@@ -436,11 +793,20 @@ impl Migrator {
         Ok(fixed)
     }
 
-    /// Roll back the most recent `batches` batch(es), newest first. Each
-    /// migration's `down` runs in its own transaction; a forward-only migration
-    /// aborts the rollback. Returns the versions rolled back.
-    pub fn rollback<B: Backend>(&self, conn: &B, batches: usize) -> Result<Vec<String>, String> {
-        let _guard = AdvisoryLock::acquire(conn)?;
+    /// Roll back the most recent `batches` batch(es), newest first, each
+    /// migration atomically (its `down` and its history delete in one
+    /// transaction). Returns the versions rolled back.
+    ///
+    /// The whole batch is **preflighted before anything is undone**: if any
+    /// victim is forward-only or no longer defined in code, the rollback
+    /// errors with the database untouched — never a half-rolled-back batch.
+    pub fn rollback<B: Backend + Transactional>(
+        &self,
+        conn: &B,
+        batches: usize,
+    ) -> Result<Vec<String>, String> {
+        self.validate()?;
+        let _guard = self.acquire_lock(conn)?;
         self.ensure_history(conn)?;
         let applied = self.applied(conn)?;
         if applied.is_empty() || batches == 0 {
@@ -461,28 +827,67 @@ impl Migrator {
             .collect();
         victims.sort_by(|a, b| b.version.cmp(&a.version));
 
-        let by_version = |v: &str| self.migrations.iter().find(|m| m.version == v);
+        // Preflight the whole batch before touching anything.
+        let mut plan: Vec<(&AppliedRow, &Migration)> = Vec::with_capacity(victims.len());
+        for row in victims {
+            let migration = self
+                .migrations
+                .iter()
+                .find(|m| m.version == row.version)
+                .ok_or_else(|| {
+                    format!(
+                        "cannot roll back {}: no such migration in code — nothing was rolled back",
+                        row.version
+                    )
+                })?;
+            if !migration.reversible_migration() {
+                return Err(format!(
+                    "cannot roll back {} ({}): migration is forward-only — nothing was rolled back",
+                    row.version, row.name
+                ));
+            }
+            plan.push((row, migration));
+        }
 
         let mut rolled = Vec::new();
-        for row in victims {
-            let migration = by_version(&row.version).ok_or_else(|| {
-                format!(
-                    "cannot roll back {}: no such migration in code",
-                    row.version
-                )
-            })?;
-            in_transaction(conn, || {
-                migration.run_down(conn)?;
-                conn.execute(
-                    &format!("DELETE FROM {HISTORY_TABLE} WHERE version = ?"),
-                    &[Value::Text(row.version.clone())],
-                )?;
-                Ok(())
-            })
-            .map_err(|e| format!("rollback of {} ({}) failed: {e}", row.version, row.name))?;
+        for (row, migration) in plan {
+            self.rollback_one(conn, migration)
+                .map_err(|e| format!("rollback of {} ({}) failed: {e}", row.version, row.name))?;
             rolled.push(row.version.clone());
         }
         Ok(rolled)
+    }
+
+    /// Undo one migration atomically, skipping if a concurrent runner already
+    /// removed its history row.
+    fn rollback_one<B: Backend + Transactional>(
+        &self,
+        conn: &B,
+        m: &Migration,
+    ) -> Result<(), String> {
+        let erase = |ops: &dyn Backend| {
+            ops.execute(
+                &format!("DELETE FROM {HISTORY_TABLE} WHERE version = ?"),
+                &[Value::Text(m.version.clone())],
+            )
+            .map(|_| ())
+        };
+
+        if !m.transactional {
+            if !self.is_applied(conn, &m.version)? {
+                return Ok(());
+            }
+            m.run_down(conn)?;
+            return erase(conn);
+        }
+
+        run_write_tx(conn, &mut |tx| {
+            if !self.is_applied(tx, &m.version)? {
+                return Ok(());
+            }
+            m.run_down(tx)?;
+            erase(tx)
+        })
     }
 
     /// The status of every migration — code-defined and orphaned — sorted by
@@ -533,6 +938,7 @@ impl Migrator {
                         ("name", Json::str(m.name.clone())),
                         ("reversible", Json::Bool(m.reversible_migration())),
                         ("declarative", Json::Bool(m.ops_list().is_some())),
+                        ("transactional", Json::Bool(m.transactional)),
                     ])
                 })
                 .collect(),
@@ -566,9 +972,28 @@ impl Migrator {
     /// Build the shadow schema by **replaying** all migrations against a fresh
     /// scratch backend (e.g. an in-memory SQLite) and introspecting the result.
     /// Handles closure migrations, which [`shadow`](Migrator::shadow) can't fold.
-    pub fn shadow_via<B: Backend>(&self, scratch: &B) -> Result<Vec<TableSchema>, String> {
+    pub fn shadow_via<B: Backend + Transactional>(
+        &self,
+        scratch: &B,
+    ) -> Result<Vec<TableSchema>, String> {
         self.run(scratch)?;
         Ok(normalize_all(scratch.introspect()?))
+    }
+}
+
+/// Run `f` in a real single-connection transaction, taking the write lock up
+/// front where the backend can express it (`BEGIN IMMEDIATE` on SQLite via
+/// `Isolation::RepeatableRead`) so a cross-process racer serializes at BEGIN
+/// instead of deadlocking on a mid-transaction lock upgrade. Backends without
+/// isolation levels get a plain transaction.
+fn run_write_tx<B: Backend + Transactional>(
+    conn: &B,
+    f: &mut dyn FnMut(&dyn Backend) -> Result<(), String>,
+) -> Result<(), String> {
+    if conn.capabilities().isolation_levels {
+        conn.run_in_tx_with(Isolation::RepeatableRead, f)
+    } else {
+        conn.run_in_tx(f)
     }
 }
 
@@ -604,7 +1029,7 @@ pub fn generate(
 
 /// Like [`generate`], but replays the migration history (including closures)
 /// against `scratch` to obtain the shadow — use when closure migrations exist.
-pub fn generate_via<B: Backend>(
+pub fn generate_via<B: Backend + Transactional>(
     migrator: &Migrator,
     scratch: &B,
     desired: &[TableSchema],
@@ -634,13 +1059,24 @@ fn is_drop(op: &SchemaOp) -> bool {
 /// columns/indexes/foreign keys, apply safe column widenings. Returns the
 /// summaries of what it applied.
 ///
+/// The whole sync — introspection, planning, and every op — runs inside one
+/// single-connection transaction, so a failure (or a crash mid-way through a
+/// SQLite table rebuild) leaves the database exactly as it was.
+///
 /// It never drops anything (extra columns and tables are left untouched), and it
 /// refuses — with an error pointing at `migrate gen` — any change that could
 /// lose data or fail on existing rows (a `NOT NULL` column with no default, a
 /// lossy type change). This is the honest replacement for the old
 /// create-if-missing [`Model::migrate`](crate::Model::migrate): a convenience
 /// for local iteration, not a substitute for reviewed migrations in production.
-pub fn sync<B: Backend>(conn: &B, desired: &[TableSchema]) -> Result<Vec<String>, String> {
+pub fn sync<B: Backend + Transactional>(
+    conn: &B,
+    desired: &[TableSchema],
+) -> Result<Vec<String>, String> {
+    conn.transact(|tx| sync_in_tx(tx, desired))
+}
+
+fn sync_in_tx(conn: &dyn Backend, desired: &[TableSchema]) -> Result<Vec<String>, String> {
     let dialect = conn.dialect();
     let live = conn.introspect()?;
 
@@ -689,7 +1125,10 @@ pub fn sync<B: Backend>(conn: &B, desired: &[TableSchema]) -> Result<Vec<String>
 
 /// Single-table [`sync`] — the engine behind the reimplemented
 /// [`Model::migrate`](crate::Model::migrate).
-pub fn sync_table<B: Backend>(conn: &B, schema: &TableSchema) -> Result<(), String> {
+pub fn sync_table<B: Backend + Transactional>(
+    conn: &B,
+    schema: &TableSchema,
+) -> Result<(), String> {
     sync(conn, std::slice::from_ref(schema)).map(|_| ())
 }
 
@@ -760,8 +1199,18 @@ pub fn drift_with_shadow<B: Backend>(
 }
 
 /// Write a declarative migration to `<dir>/<version>_<name>.json` (creating the
-/// directory if needed) and return the path. Errors for a closure migration.
+/// directory if needed) and return the path. Errors for a closure migration,
+/// and for a version/name that isn't a plain identifier (which could otherwise
+/// escape `dir`).
 pub fn write_migration_file(dir: &str, migration: &Migration) -> Result<String, String> {
+    if !valid_ident(migration.version()) || !valid_ident(migration.name()) {
+        return Err(format!(
+            "cannot write migration {:?} ({:?}): version and name must be ASCII \
+             letters, digits, `_`, `-`, `.`",
+            migration.version(),
+            migration.name()
+        ));
+    }
     let json = migration
         .to_json()
         .ok_or("cannot write a closure migration to a file")?;
@@ -777,41 +1226,6 @@ struct AppliedRow {
     name: String,
     batch: i64,
     checksum: String,
-}
-
-/// A Postgres session advisory lock held for the duration of a run/rollback so
-/// concurrent runners serialize. A no-op on SQLite (single-node). Released on
-/// drop.
-struct AdvisoryLock<'a, B: Backend> {
-    conn: Option<&'a B>,
-}
-
-/// A fixed key (any constant) identifying the sutegi-migrations lock.
-const ADVISORY_LOCK_KEY: i64 = 0x5537_4547_4900; // "SUTEGI" ish
-
-impl<'a, B: Backend> AdvisoryLock<'a, B> {
-    fn acquire(conn: &'a B) -> Result<AdvisoryLock<'a, B>, String> {
-        if conn.dialect() == Dialect::Postgres {
-            conn.query(
-                "SELECT pg_advisory_lock(?)",
-                &[Value::Int(ADVISORY_LOCK_KEY)],
-            )?;
-            Ok(AdvisoryLock { conn: Some(conn) })
-        } else {
-            Ok(AdvisoryLock { conn: None })
-        }
-    }
-}
-
-impl<B: Backend> Drop for AdvisoryLock<'_, B> {
-    fn drop(&mut self) {
-        if let Some(conn) = self.conn {
-            let _ = conn.query(
-                "SELECT pg_advisory_unlock(?)",
-                &[Value::Int(ADVISORY_LOCK_KEY)],
-            );
-        }
-    }
 }
 
 /// Render a status list as JSON (`[{version,name,applied,batch,orphan}]`).
@@ -830,26 +1244,6 @@ pub fn status_json(statuses: &[MigrationStatus]) -> Json {
             })
             .collect(),
     )
-}
-
-/// Run `body` between `BEGIN` and `COMMIT`, rolling back on error. Uses the
-/// backend's own `execute`, so it works identically on SQLite and Postgres
-/// (both give transactional DDL).
-fn in_transaction<B: Backend>(
-    conn: &B,
-    body: impl FnOnce() -> Result<(), String>,
-) -> Result<(), String> {
-    conn.execute("BEGIN", &[])?;
-    match body() {
-        Ok(()) => {
-            conn.execute("COMMIT", &[])?;
-            Ok(())
-        }
-        Err(e) => {
-            let _ = conn.execute("ROLLBACK", &[]);
-            Err(e)
-        }
-    }
 }
 
 #[cfg(all(test, feature = "sqlite"))]
@@ -983,6 +1377,10 @@ mod tests {
             Some("0001_create_users")
         );
         assert_eq!(arr[0].get("reversible").and_then(Json::as_bool), Some(true));
+        assert_eq!(
+            arr[0].get("transactional").and_then(Json::as_bool),
+            Some(true)
+        );
     }
 
     // ---- P5: declarative ops migrations + generation ----
@@ -1196,5 +1594,224 @@ mod tests {
         Backend::execute(&db, "ALTER TABLE todos ADD COLUMN sneaky TEXT", &[]).unwrap();
         let report = drift(&db, &migrator, &[todos_v1()]).unwrap();
         assert!(!report.db_vs_migrations.is_empty());
+    }
+
+    // ---- reliability guard rails ----
+
+    #[test]
+    fn duplicate_version_is_rejected_before_running() {
+        let db = Db::memory().unwrap();
+        let m = Migrator::new()
+            .add(Migration::new("0001_x", "first", |_| Ok(())))
+            .add(Migration::new("0001_x", "second", |_| Ok(())));
+        let err = m.run(&db).unwrap_err();
+        assert!(err.contains("duplicate migration version"), "got: {err}");
+        // Nothing ran, not even the history table row.
+        assert!(m.status(&db).is_ok());
+    }
+
+    #[test]
+    fn malformed_version_is_rejected() {
+        let db = Db::memory().unwrap();
+        for bad in ["", "0001/evil", "0001 x", "0001;drop"] {
+            let m = Migrator::new().add(Migration::new(bad, "n", |_| Ok(())));
+            let err = m.run(&db).unwrap_err();
+            assert!(err.contains("invalid migration version"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn write_migration_file_rejects_path_escapes() {
+        let plan = crate::schema_diff::diff(&[], &[todos_v1()], Dialect::Sqlite);
+        let m = Migration::ops("../../0001", "create_todos", plan.ops);
+        let err = write_migration_file("/tmp/nowhere", &m).unwrap_err();
+        assert!(err.contains("version and name"), "got: {err}");
+    }
+
+    #[test]
+    fn out_of_order_pending_is_rejected_unless_opted_in() {
+        let db = Db::memory().unwrap();
+        Migrator::new()
+            .add(Migration::new("0002_later", "later", |db| {
+                db.execute("CREATE TABLE later (id INTEGER PRIMARY KEY)", &[])
+                    .map(|_| ())
+            }))
+            .run(&db)
+            .unwrap();
+
+        // A stale branch lands 0001 after 0002 is already applied.
+        let stale = Migration::new("0001_stale", "stale", |db| {
+            db.execute("CREATE TABLE stale (id INTEGER PRIMARY KEY)", &[])
+                .map(|_| ())
+        });
+        let m = Migrator::new()
+            .add(Migration::new("0002_later", "later", |_| Ok(())))
+            .add(stale);
+        let err = m.run(&db).unwrap_err();
+        assert!(err.contains("out-of-order"), "got: {err}");
+        assert!(err.contains("0001_stale"), "got: {err}");
+        // The stale migration did not run.
+        assert!(db.select(&QueryBuilder::table("stale")).is_err());
+
+        // Explicit opt-in applies it.
+        let m = Migrator::new()
+            .add(Migration::new("0002_later", "later", |_| Ok(())))
+            .add(Migration::new("0001_stale", "stale", |db| {
+                db.execute("CREATE TABLE stale (id INTEGER PRIMARY KEY)", &[])
+                    .map(|_| ())
+            }))
+            .allow_out_of_order();
+        assert_eq!(m.run(&db).unwrap(), vec!["0001_stale"]);
+    }
+
+    #[test]
+    fn renamed_applied_migration_trips_the_guard_and_repair_fixes_it() {
+        let db = Db::memory().unwrap();
+        Migrator::new()
+            .add(Migration::new("0001_x", "old_name", |_| Ok(())))
+            .run(&db)
+            .unwrap();
+
+        let renamed = Migrator::new().add(Migration::new("0001_x", "new_name", |_| Ok(())));
+        let err = renamed.run(&db).unwrap_err();
+        assert!(err.contains("renamed after being applied"), "got: {err}");
+
+        assert_eq!(renamed.repair(&db).unwrap(), vec!["0001_x"]);
+        assert!(renamed.run(&db).unwrap().is_empty());
+        let status = renamed.status(&db).unwrap();
+        assert_eq!(status[0].name, "new_name");
+        assert!(!status[0].orphan);
+    }
+
+    #[test]
+    fn rollback_preflights_the_whole_batch_before_undoing_anything() {
+        let db = Db::memory().unwrap();
+        // One batch: a forward-only migration below a reversible one.
+        let m = Migrator::new()
+            .add(Migration::new("0001_forward", "forward", |db| {
+                db.execute("CREATE TABLE fwd (id INTEGER PRIMARY KEY)", &[])
+                    .map(|_| ())
+            }))
+            .add(Migration::reversible(
+                "0002_rev",
+                "rev",
+                |db| {
+                    db.execute("CREATE TABLE rev (id INTEGER PRIMARY KEY)", &[])
+                        .map(|_| ())
+                },
+                |db| db.execute("DROP TABLE rev", &[]).map(|_| ()),
+            ));
+        m.run(&db).unwrap();
+
+        // 0002 would be undone first — but 0001 is forward-only, so the
+        // preflight must refuse with NOTHING rolled back (0002 still applied).
+        let err = m.rollback(&db, 1).unwrap_err();
+        assert!(err.contains("forward-only"), "got: {err}");
+        assert!(db.select(&QueryBuilder::table("rev")).is_ok());
+        let status = m.status(&db).unwrap();
+        assert!(status.iter().all(|s| s.applied), "{status:?}");
+    }
+
+    #[test]
+    fn rollback_refuses_a_code_deleted_migration_without_undoing_others() {
+        let db = Db::memory().unwrap();
+        migrator().run(&db).unwrap();
+
+        // Code lost 0001_create_users; its history row is now an orphan.
+        let partial = Migrator::new().add(Migration::reversible(
+            "0002_add_posts",
+            "add_posts",
+            |_| Ok(()),
+            |db| db.execute("DROP TABLE posts", &[]).map(|_| ()),
+        ));
+        let err = partial.rollback(&db, 1).unwrap_err();
+        assert!(err.contains("no such migration in code"), "got: {err}");
+        // 0002 was NOT rolled back on the way to discovering the orphan.
+        assert!(db.select(&QueryBuilder::table("posts")).is_ok());
+    }
+
+    #[test]
+    fn plan_run_previews_sql_without_executing() {
+        let db = Db::memory().unwrap();
+        let v1 = crate::schema_diff::diff(&[], &[todos_v1()], Dialect::Sqlite);
+        let m = Migrator::new()
+            .add(Migration::ops("0001_todos", "create_todos", v1.ops))
+            .add(Migration::new("0002_backfill", "backfill", |_| Ok(())));
+
+        let plan = m.plan_run(&db).unwrap();
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].version, "0001_todos");
+        let stmts = plan[0].statements.as_ref().unwrap();
+        assert!(
+            stmts
+                .iter()
+                .any(|s| s.contains("CREATE TABLE") && s.contains("todos")),
+            "{stmts:?}"
+        );
+        // Closure bodies have no renderable SQL.
+        assert!(plan[1].statements.is_none());
+
+        // Nothing executed: the table does not exist, nothing is applied.
+        assert!(db.select(&QueryBuilder::table("todos")).is_err());
+        assert!(m.status(&db).unwrap().iter().all(|s| !s.applied));
+
+        // After running, the plan is empty.
+        m.run(&db).unwrap();
+        assert!(m.plan_run(&db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn no_transaction_migration_applies_and_reruns_after_partial_failure() {
+        let db = Db::memory().unwrap();
+        let ok = Migrator::new().add(
+            Migration::new("0001_idem", "idem", |db| {
+                db.execute(
+                    "CREATE TABLE IF NOT EXISTS idem (id INTEGER PRIMARY KEY)",
+                    &[],
+                )
+                .map(|_| ())
+            })
+            .no_transaction(),
+        );
+        assert_eq!(ok.run(&db).unwrap(), vec!["0001_idem"]);
+        assert!(ok.run(&db).unwrap().is_empty());
+
+        // A failing non-transactional migration keeps its side effects (the
+        // documented trade) but records nothing, so the fixed body re-runs.
+        let boom = Migrator::new().add(
+            Migration::new("0002_boom", "boom", |db| {
+                db.execute(
+                    "CREATE TABLE IF NOT EXISTS half (id INTEGER PRIMARY KEY)",
+                    &[],
+                )?;
+                Err("deliberate".into())
+            })
+            .no_transaction(),
+        );
+        assert!(boom.run(&db).is_err());
+        assert!(db.select(&QueryBuilder::table("half")).is_ok());
+        let fixed = Migrator::new().add(
+            Migration::new("0002_boom", "boom", |db| {
+                db.execute(
+                    "CREATE TABLE IF NOT EXISTS half (id INTEGER PRIMARY KEY)",
+                    &[],
+                )
+                .map(|_| ())
+            })
+            .no_transaction(),
+        );
+        assert_eq!(fixed.run(&db).unwrap(), vec!["0002_boom"]);
+    }
+
+    #[test]
+    fn migration_ops_exposes_the_dialect() {
+        let db = Db::memory().unwrap();
+        let m = Migrator::new().add(Migration::new("0001_d", "dialect_probe", |ops| {
+            if ops.dialect() != Dialect::Sqlite {
+                return Err("expected sqlite".into());
+            }
+            Ok(())
+        }));
+        m.run(&db).unwrap();
     }
 }

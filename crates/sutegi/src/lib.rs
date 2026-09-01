@@ -152,17 +152,18 @@ pub mod config;
 /// ```
 ///
 /// Then `myapp migrate` applies pending migrations, `myapp migrate:rollback [n]`
-/// rolls back the last `n` batches (default 1), and `myapp migrate:status`
-/// prints the ledger. Same binary serves and migrates — the Rails/Laravel shape.
+/// rolls back the last `n` batches (default 1), `myapp migrate:status` prints
+/// the ledger, and `myapp migrate:pending` dry-runs the pending SQL. Same
+/// binary serves and migrates — the Rails/Laravel shape.
 #[cfg(feature = "orm")]
 pub mod migrate {
     use sutegi_json::Json;
     pub use sutegi_orm::migrate::{
         drift, generate, generate_via, status_json, write_migration_file, DriftReport, Migration,
-        MigrationOps, MigrationStatus, Migrator,
+        MigrationOps, MigrationStatus, Migrator, PlannedMigration,
     };
     pub use sutegi_orm::schema_diff::{self, Plan, SchemaOp};
-    use sutegi_orm::{Backend, TableSchema};
+    use sutegi_orm::{Backend, TableSchema, Transactional};
 
     /// The conventional directory for generated migration files.
     pub const MIGRATIONS_DIR: &str = "migrations";
@@ -172,10 +173,14 @@ pub mod migrate {
     /// stop and exit), `false` if there was no migrate subcommand (carry on and
     /// serve). On a migration error it prints the error and exits the process
     /// with status 1, so CI and deploy scripts see a real failure.
-    pub fn dispatch<B: Backend>(migrator: &Migrator, conn: &B) -> bool {
+    pub fn dispatch<B: Backend + Transactional>(migrator: &Migrator, conn: &B) -> bool {
         let args: Vec<String> = std::env::args().collect();
         match args.get(1).map(String::as_str) {
             Some("migrate") => finish("migrate", migrator.run(conn).map(report_applied)),
+            Some("migrate:pending") => finish(
+                "migrate:pending",
+                migrator.plan_run(conn).map(report_pending),
+            ),
             Some("migrate:rollback") => {
                 let batches = args
                     .get(2)
@@ -206,7 +211,7 @@ pub mod migrate {
     ///     return Ok(());
     /// }
     /// ```
-    pub fn dispatch_full<B: Backend>(
+    pub fn dispatch_full<B: Backend + Transactional>(
         migrator: &Migrator,
         conn: &B,
         models: &[TableSchema],
@@ -299,7 +304,10 @@ pub mod migrate {
     }
 
     /// Roll back every batch, then re-run — a clean rebuild for local dev.
-    fn run_fresh<B: Backend>(migrator: &Migrator, conn: &B) -> Result<Vec<String>, String> {
+    fn run_fresh<B: Backend + Transactional>(
+        migrator: &Migrator,
+        conn: &B,
+    ) -> Result<Vec<String>, String> {
         // Roll back until nothing remains (each call undoes one batch).
         while !migrator.rollback(conn, 1)?.is_empty() {}
         migrator.run(conn)
@@ -366,6 +374,25 @@ pub mod migrate {
             println!("migrate: applied {} migration(s):", versions.len());
             for v in versions {
                 println!("  ↑ {v}");
+            }
+        }
+    }
+
+    fn report_pending(plan: Vec<sutegi_orm::migrate::PlannedMigration>) {
+        if plan.is_empty() {
+            println!("migrate:pending: up to date — nothing pending");
+            return;
+        }
+        println!("migrate:pending: {} migration(s) would run:", plan.len());
+        for p in &plan {
+            println!("  {} ({})", p.version, p.name);
+            match &p.statements {
+                Some(stmts) => {
+                    for stmt in stmts {
+                        println!("    {}", stmt.replace('\n', "\n    "));
+                    }
+                }
+                None => println!("    <closure body — SQL only exists at run time>"),
             }
         }
     }
