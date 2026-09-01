@@ -120,10 +120,11 @@
 
   // --- code snippets (kept as strings so braces are literal text) ---
   const codeCargo = `[dependencies]
-# default = ["derive", "orm", "validate", "ai"]
+# default = ["derive", "orm", "validate"] — the agent tool surface is core
 sutegi = { version = "*", features = ["sqlite", "graceful"] }  # single-node
-# multi-pod: swap in Postgres + the durable queue instead
-# sutegi = { version = "*", features = ["postgres", "queue", "graceful"] }
+# multi-pod: Postgres, the durable queue, cross-pod realtime
+# sutegi = { version = "*", features = [
+#     "postgres", "queue", "channels", "pubsub-postgres", "graceful" ] }
 # minimal HTTP service, nothing else compiled in:
 # sutegi = { version = "*", default-features = false }`;
 
@@ -291,20 +292,51 @@ let body = c.validate(&rules)?;   // Err -> { "email": ["… valid email …"] }
 }))`,
         },
         {
-          id: 'jobs', icon: Cpu, kicker: 'Step 8', title: 'Defer the slow work',
-          lead: 'Some work shouldn’t block the response — sending mail, calling a webhook. The durable queue (<code>queue</code> feature) is <strong>Postgres-backed and cross-pod</strong>: it claims jobs with <code>FOR UPDATE SKIP LOCKED</code>, so any pod can pull the next one, and visibility-timeout retries recover from a crashed worker. Register a handler by name, <code>dispatch</code> a JSON payload, and <code>start</code> N worker threads.',
-          code: `use sutegi::queue::{Queue, Workers};
+          id: 'realtime', icon: Server, kicker: 'Step 7b', title: 'Push to the browser',
+          lead: 'For live UIs, upgrade instead of polling. An upgraded socket <strong>detaches</strong> from the HTTP worker into a sharded kqueue/epoll reactor — no async runtime — so an idle connection costs ~340 bytes and zero threads (measured: 80k live sockets at 0.0% idle CPU). On top of that, <code>channels</code> gives you Phoenix-style topics, joins, replies and presence, and broadcasts ride the pubsub <code>Broker</code> seam: adding <code>.broker(PgPubSub::connect(&cfg)?)</code> is the <em>only</em> change between one pod and a fleet.',
+          code: `let hub = Channels::new()
+    .channel(Channel::new("room:*")
+        .doc("A chat room. Join with a nick.")
+        .on_join(|socket, payload| {
+            socket.assign("nick", payload.pointer("/nick").cloned().unwrap());
+            Ok(Json::Null)
+        })
+        .on("new_msg", |socket, payload| {
+            socket.broadcast("new_msg", payload);   // all members, all pods
+            Reply::None
+        }))
+    // .broker(PgPubSub::connect(&pg_cfg)?)         // <- cross-pod, that's it
+    .check_origin(["https://app.example.com"])      // MUST set if cookies auth it
+    .build();
 
-let mut queue = Queue::new(Pg::from_env(8)?.pool().clone());
+App::new("chat")
+    .channels("/channels", "The chat socket.", hub.clone())
+    .serve()   // + GET /__channels: the manifest an agent joins from`,
+          tip: 'A bundled ~4 KB dependency-free JS client (<code>sutegi_channels::JS_CLIENT</code>) handles reconnect, rejoin and heartbeats. And <code>watch(query)</code> turns a topic into a live query: any pod’s committed write pushes a <code>Change {added, updated, removed}</code> diff you can broadcast straight through.',
+        },
+        {
+          id: 'jobs', icon: Cpu, kicker: 'Step 8', title: 'Defer the slow work',
+          lead: 'Some work shouldn’t block the response — sending mail, calling a webhook. The durable queue (<code>queue</code> feature) runs over the <strong>same <code>Backend</code> seam</strong>, so one jobs table and one set of SQL work on bundled SQLite <em>and</em> on Postgres. The claim stamps a lease instead of deleting the row, so a crashed worker’s job becomes visible again after the visibility timeout. Register a handler by name, <code>dispatch</code> a payload, and <code>start</code> N worker threads.',
+          code: `use std::sync::Arc;
+use sutegi::queue::Queue;
+
+let mut queue = Queue::new(db.clone());        // any Backend: Db or Pg
 queue.migrate()?;                              // creates sutegi_jobs
-queue.register("notify", |payload| {
-    let to = payload.get("to").and_then(Json::as_str).unwrap_or("");
+queue.register("notify", |job| {
+    let to = job.payload().get("to").and_then(Json::as_str).unwrap_or("");
     /* send … */ Ok(())                        // Err -> retried w/ backoff
 });
 
 queue.dispatch("notify", Json::obj(vec![("to", Json::str("a@b.com"))]))?;
-let workers: Workers = std::sync::Arc::new(queue).start(4);   // cross-pod`,
-          note: 'The old in-process <code>Job</code> trait and <code>Queue::new(4)</code> worker-pool are gone — the queue is durable now, so a job survives a pod restart and dead-letters after its retries are spent.',
+
+// …or shape it: its own pool, one in flight per key, 3 tries.
+queue.job("video.ingest", payload).queue("video").unique("yt:abc")
+     .priority(10).max_attempts(3).dispatch()?;
+
+let queue = Arc::new(queue);
+let fast = Arc::clone(&queue).start(4);             // 4 on "default"
+let slow = Arc::clone(&queue).start_on("video", 1); // 1 on the slow queue`,
+          note: 'Claims are exclusive on both backends — <code>FOR UPDATE SKIP LOCKED</code> on Postgres, and on SQLite the serialized writer already gives it. Postgres additionally makes that exclusivity <em>cross-pod</em>; <code>queue.cross_pod()</code> tells you which guarantee you actually have.',
         },
       ],
     },
@@ -449,7 +481,7 @@ App::new("api")
         </div>
         <div class="flex gap-6 sm:gap-8 pt-4 font-mono justify-center lg:justify-start">
           <div><div class="text-xl sm:text-2xl font-bold text-white">0</div><div class="text-[11px] text-[#7a7a8a] uppercase tracking-wide">runtime deps</div></div>
-          <div><div class="text-xl sm:text-2xl font-bold text-white">362 KB</div><div class="text-[11px] text-[#7a7a8a] uppercase tracking-wide">core binary</div></div>
+          <div><div class="text-xl sm:text-2xl font-bold text-white">394 KB</div><div class="text-[11px] text-[#7a7a8a] uppercase tracking-wide">core binary</div></div>
           <div><div class="text-xl sm:text-2xl font-bold text-white">std</div><div class="text-[11px] text-[#7a7a8a] uppercase tracking-wide">only</div></div>
         </div>
       </div>
@@ -553,8 +585,12 @@ App::new("api")
           { icon: FileCode, t: '#[derive(Model, Validate)]', d: 'Schema, migrations, JSON and the validation ruleset — all from one struct, at build time.' },
           { icon: Plug, t: 'Kv store', d: 'Namespaced JSON key/value over either backend: set / get / scan / delete.' },
           { icon: Radio, t: 'Streaming & SSE', d: 'Stream bytes or Server-Sent Events with natural backpressure; same transport as stream tools.' },
-          { icon: Cpu, t: 'Durable queue', d: 'Postgres-backed, cross-pod: SKIP LOCKED claim, visibility-timeout retries, dead-letter.' },
+          { icon: Cpu, t: 'Durable queue', d: 'Over the Backend seam — SQLite or Postgres: leased claims, retries, priorities, dedupe, dead-letter.' },
           { icon: Zap, t: 'Agent-native', d: '.tool() / .stream_tool() closures auto-mount /__tools; /__introspect exposes the whole surface.' },
+          { icon: Server, t: 'Realtime', d: 'RFC 6455 sockets on a kqueue/epoll reactor (80k idle conns, zero threads), Phoenix-style channels + presence, cross-pod over PG.' },
+          { icon: Layers, t: 'Actors & supervision', d: 'Typed mailboxes, OTP restart policies and strategies, live status at /__actors.' },
+          { icon: Search, t: 'Search & embeddings', d: 'One grammar over tsvector and FTS5, vector columns, and RRF hybrid retrieval in one call.' },
+          { icon: ShieldCheck, t: 'Production auth', d: 'PBKDF2 passwords, remember-me, login throttling, CSRF, hash-bound sessions, hashed agent tokens.' },
         ] as f}
           {@const Icon = f.icon}
           <div class="group bg-[#13121a] border border-white/5 p-5 sm:p-6 rounded-xl hover:border-[#ff6a3d]/40 transition-all hover:-translate-y-1 hover:shadow-[0_0_20px_rgba(255,106,61,0.1)]">
@@ -578,7 +614,7 @@ App::new("api")
         {#each [
           { icon: Zap, t: 'Agent tool servers', d: 'Expose capabilities to an LLM with a built-in manifest and validated invocation — no glue layer.' },
           { icon: Boxes, t: 'Internal microservices', d: 'Start single-node on SQLite; scale to many pods on Postgres + the durable queue without rewriting handlers.' },
-          { icon: Plug, t: 'Edge & embedded', d: 'A ~362 KB binary with no async runtime and one embedded SQLite file fits where a full stack will not.' },
+          { icon: Plug, t: 'Edge & embedded', d: 'A ~394 KB binary with no async runtime and one embedded SQLite file fits where a full stack will not.' },
           { icon: FileCode, t: 'LLM-generated apps', d: 'Rigid scaffolding conventions mean a model can extend the codebase correctly with minimal context.' },
           { icon: Server, t: 'JSON APIs & CRUD', d: 'Routing + typed models + validation cover the everyday backend without pulling a framework zoo.' },
           { icon: Radio, t: 'Streaming endpoints', d: 'SSE token streams for chat/AI UIs, backpressured by the thread-per-connection model.' },
@@ -703,6 +739,14 @@ App::new("api")
               <a href="https://github.com/enekos/sutegi/blob/master/docs/HEXAGONAL.md" target="_blank" rel="noopener" class="bg-[#13121a] border border-white/5 rounded-xl p-4 sm:p-5 hover:border-[#ff6a3d]/40 transition-colors">
                 <div class="text-white font-mono text-sm">Hexagonal guide <span class="text-[#ff6a3d]">→</span></div>
                 <div class="text-[#9090a0] text-xs mt-1">The dependency rule, layer responsibilities, layout, and testing strategy.</div>
+              </a>
+              <a href="#/docs/internals" class="bg-[#13121a] border border-white/5 rounded-xl p-4 sm:p-5 hover:border-[#ff6a3d]/40 transition-colors">
+                <div class="text-white font-mono text-sm">Inside the server <span class="text-[#ff6a3d]">→</span></div>
+                <div class="text-[#9090a0] text-xs mt-1">The request lifecycle, panic isolation, keep-alive, and every tuning knob.</div>
+              </a>
+              <a href="#/docs/backend" class="bg-[#13121a] border border-white/5 rounded-xl p-4 sm:p-5 hover:border-[#ff6a3d]/40 transition-colors">
+                <div class="text-white font-mono text-sm">Backends &amp; capabilities <span class="text-[#ff6a3d]">→</span></div>
+                <div class="text-[#9090a0] text-xs mt-1">Locks, isolation, JSON paths, search, live queries — and which ones your store actually has.</div>
               </a>
             </div>
           </div>
