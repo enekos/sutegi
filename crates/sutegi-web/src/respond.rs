@@ -112,6 +112,17 @@ impl IntoResponse for Response {
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
+        // A 5xx message is an internal detail — a SQL error, a curl stderr, a
+        // path on disk — that reached the client verbatim for as long as this
+        // rendered `self.message` unconditionally. Log it where the operator
+        // can see it and answer with the one thing a client can do about it.
+        if self.status >= 500 {
+            eprintln!("  ! {}: {}", self.status, self.message);
+            return json(
+                self.status,
+                &Json::obj(vec![("error", Json::str("internal error"))]),
+            );
+        }
         let mut obj = vec![("error", Json::str(self.message))];
         if let Some(fields) = self.fields {
             obj.push(("errors", fields));
@@ -168,5 +179,37 @@ impl<T: IntoResponse, E: IntoResponse> IntoResponse for Result<T, E> {
             Ok(t) => t.into_response(),
             Err(e) => e.into_response(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn body_text(resp: &Response) -> String {
+        match &resp.body {
+            sutegi_http::Body::Full(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+            _ => String::new(),
+        }
+    }
+
+    #[test]
+    fn client_errors_render_their_message() {
+        let resp = Error::unprocessable("email is taken").into_response();
+        assert_eq!(resp.status, 422);
+        assert!(body_text(&resp).contains("email is taken"));
+    }
+
+    #[test]
+    fn server_errors_never_leak_internals() {
+        // `?` on a database call lands here: the message is a SQLite error
+        // string with the schema in it. The client gets the one answer it can
+        // act on; the operator gets the detail on stderr.
+        let resp = Error::from("no such table: answer_seeds".to_string()).into_response();
+        assert_eq!(resp.status, 500);
+        assert_eq!(body_text(&resp), r#"{"error":"internal error"}"#);
+
+        let resp = Error::internal("curl: (6) could not resolve host").into_response();
+        assert!(!body_text(&resp).contains("curl"));
     }
 }
