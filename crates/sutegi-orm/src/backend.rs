@@ -591,9 +591,10 @@ pub trait Model {
     /// **add any columns/indexes/foreign keys the model gained** — the fix for
     /// the old create-if-missing behaviour that silently ignored new fields.
     /// Additive and non-destructive; it errors (pointing at `migrate gen`) on a
-    /// change that needs a real migration. Use a [`Migrator`](crate::migrate)
-    /// for production.
-    fn migrate<B: Backend>(conn: &B) -> Result<(), String> {
+    /// change that needs a real migration, and runs inside one transaction so
+    /// a failure never leaves a table half-rebuilt. Use a
+    /// [`Migrator`](crate::migrate) for production.
+    fn migrate<B: Backend + Transactional>(conn: &B) -> Result<(), String> {
         crate::migrate::sync_table(conn, &Self::schema())
     }
 

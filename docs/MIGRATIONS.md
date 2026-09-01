@@ -84,13 +84,14 @@ reviewed, reversible migration.
 | `migrate` | apply all pending migrations |
 | `migrate:rollback [n]` | roll back the last `n` batches (default 1) |
 | `migrate:status` | print the ledger (✓ applied, ? orphan) |
+| `migrate:pending` | dry-run: pending migrations + the exact SQL they'd execute |
 | `migrate:gen <name>` | diff models ↔ shadow, write a migration file |
 | `migrate:plan` | show what `:gen` would write, without writing |
 | `migrate:drift` | three-way report: DB vs migrations vs models |
 | `migrate:fresh` | roll everything back and re-run (dev only) |
 
 `dispatch` (without `_full`) is the smaller runner: just `migrate` /
-`:rollback` / `:status`, for apps that hand-write migrations.
+`:rollback` / `:status` / `:pending`, for apps that hand-write migrations.
 
 ## Column attributes
 
@@ -154,18 +155,61 @@ let app = app.get("/__migrations", "Migration status + drift.",
     move |_| sutegi::web::json(200, &report));
 ```
 
-## Integrity: checksums
+## Reliability: what `run`/`rollback` guarantee
 
-The `_sutegi_migrations` history table stores a checksum of each applied ops
-migration. If a migration file is edited after being applied, `migrate` fails
-with a checksum mismatch rather than silently diverging. After a deliberate edit,
-`Migrator::repair(&db)` re-stamps the stored checksums.
+Migrations are the one moment the app rewrites its own foundations, so the
+runner is built so **no outcome leaves the database in a state it can't account
+for**:
 
-## Cross-pod safety
+- **Each migration is atomic.** Its body and its history row commit in one real
+  transaction pinned to a single connection (`Transactional::run_in_tx`). A
+  failing migration leaves neither a half-applied schema nor a history row —
+  including on a pooled backend, where a statement-level `BEGIN`/`COMMIT` would
+  spray across connections and roll back nothing.
+- **Concurrent runners serialize.** The run holds the backend's
+  `sutegi:migrations` advisory lock — cluster-wide on Postgres (a dedicated
+  session, auto-released on crash), process-wide on SQLite. The lock is waited
+  for by *polling*, never a server-side blocking wait (a session parked in
+  `pg_advisory_lock()` holds a snapshot that deadlocks against a
+  `CREATE INDEX CONCURRENTLY` holder). Timeout is 300 s; tune with
+  `Migrator::lock_timeout(...)`.
+- **Lost races skip, never double-apply.** Each migration re-checks the history
+  table *inside its own write transaction* before running, so even where the
+  lock can't reach (two OS processes on one SQLite file) a racer skips what the
+  winner already applied.
+- **The plan is validated before anything runs.** Rejected up front, with the
+  database untouched: duplicate or malformed versions; a pending migration that
+  sorts *before* one already applied (the merged-stale-branch hazard — opt in
+  with `Migrator::allow_out_of_order()` if your teams genuinely interleave); an
+  applied migration whose file was edited (checksum) or renamed. After a
+  deliberate edit/rename, `Migrator::repair(&db)` re-stamps the history.
+- **Rollback preflights the whole batch.** If any victim is forward-only or no
+  longer defined in code, the rollback errors with nothing undone — never a
+  half-rolled-back batch. Each `down` then runs atomically with its history
+  delete.
 
-On Postgres, `run`/`rollback` take a session advisory lock, so many pods booting
-at once serialize their migrations instead of racing. SQLite is single-node, so
-this is a no-op there.
+### Dry runs
+
+`Migrator::plan_run(&db)` returns the pending migrations in apply order with
+the exact SQL each declarative migration would execute (rendered for the
+backend's dialect against the live schema); closure bodies report `None`.
+Nothing is executed.
+
+### Non-transactional migrations
+
+DDL that refuses to run inside a transaction — Postgres
+`CREATE INDEX CONCURRENTLY` — opts out per migration:
+
+```rust
+Migration::new("20260901_000001", "index_users_email", |ops| {
+    ops.execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS users_email ON users (email)", &[])
+        .map(|_| ())
+}).no_transaction()
+```
+
+The trade is explicit: if the process dies between the body finishing and the
+history row committing, the next run executes the body **again** — write it
+idempotently (`IF NOT EXISTS` the DDL, key the backfills).
 
 ## Honest caveats
 
