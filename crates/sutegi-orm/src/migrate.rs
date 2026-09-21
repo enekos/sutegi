@@ -797,9 +797,13 @@ impl Migrator {
     /// migration atomically (its `down` and its history delete in one
     /// transaction). Returns the versions rolled back.
     ///
-    /// The whole batch is **preflighted before anything is undone**: if any
-    /// victim is forward-only or no longer defined in code, the rollback
-    /// errors with the database untouched — never a half-rolled-back batch.
+    /// Only batches containing at least one version **this migrator defines**
+    /// are candidates — another app sharing the database (and the history
+    /// table) can't have *its* newest batch picked as this app's rollback
+    /// target. The whole batch is then **preflighted before anything is
+    /// undone**: if any victim is forward-only or no longer defined in code,
+    /// the rollback errors with the database untouched — never a
+    /// half-rolled-back batch.
     pub fn rollback<B: Backend + Transactional>(
         &self,
         conn: &B,
@@ -813,8 +817,17 @@ impl Migrator {
             return Ok(Vec::new());
         }
 
-        // The `batches` highest distinct batch numbers.
-        let mut batch_nums: Vec<i64> = applied.iter().map(|r| r.batch).collect();
+        // The `batches` highest distinct batch numbers among batches that
+        // contain at least one version defined here (a batch is written by a
+        // single run, so this keeps another app's batches out of scope while
+        // still surfacing a code-deleted migration inside our own batch).
+        let defined: std::collections::BTreeSet<&str> =
+            self.migrations.iter().map(|m| m.version.as_str()).collect();
+        let mut batch_nums: Vec<i64> = applied
+            .iter()
+            .filter(|r| defined.contains(r.version.as_str()))
+            .map(|r| r.batch)
+            .collect();
         batch_nums.sort_unstable();
         batch_nums.dedup();
         let target: std::collections::BTreeSet<i64> =
@@ -1728,6 +1741,41 @@ mod tests {
         assert!(err.contains("no such migration in code"), "got: {err}");
         // 0002 was NOT rolled back on the way to discovering the orphan.
         assert!(db.select(&QueryBuilder::table("posts")).is_ok());
+    }
+
+    #[test]
+    fn rollback_targets_only_this_migrators_batches() {
+        // Two apps share one database (and one history table). App B's
+        // rollback must pick B's newest batch, not A's globally-newest one.
+        let db = Db::memory().unwrap();
+        let app_a = Migrator::new().add(Migration::reversible(
+            "a_0001",
+            "a1",
+            |db| {
+                db.execute("CREATE TABLE a1 (id INTEGER PRIMARY KEY)", &[])
+                    .map(|_| ())
+            },
+            |db| db.execute("DROP TABLE a1", &[]).map(|_| ()),
+        ));
+        let app_b = Migrator::new().add(Migration::reversible(
+            "b_0001",
+            "b1",
+            |db| {
+                db.execute("CREATE TABLE b1 (id INTEGER PRIMARY KEY)", &[])
+                    .map(|_| ())
+            },
+            |db| db.execute("DROP TABLE b1", &[]).map(|_| ()),
+        ));
+        app_b.run(&db).unwrap();
+        app_a.run(&db).unwrap(); // batch 2 — the globally newest
+
+        // B rolls back: undoes b_0001 (batch 1), leaves A's batch 2 alone.
+        assert_eq!(app_b.rollback(&db, 1).unwrap(), vec!["b_0001"]);
+        assert!(db.select(&QueryBuilder::table("a1")).is_ok());
+        assert!(db.select(&QueryBuilder::table("b1")).is_err());
+        let a_status = app_a.status(&db).unwrap();
+        let a1 = a_status.iter().find(|s| s.version == "a_0001").unwrap();
+        assert!(a1.applied);
     }
 
     #[test]
