@@ -6,7 +6,9 @@
 //!
 //! The history table is shared with the other suites, so every assertion here
 //! is scoped to this file's `pgmig_`-prefixed versions and tables — no global
-//! counts, no dropping `_sutegi_migrations`.
+//! counts, no dropping `_sutegi_migrations`. Rollback is the one operation
+//! that cannot be scoped — it undoes the newest batch in the table, whoever
+//! wrote it — so the tests in this file hold [`serial`] and never interleave.
 
 #![cfg(feature = "postgres")]
 
@@ -17,6 +19,12 @@ use sutegi_orm::{Backend, Value};
 fn db() -> Option<Pg> {
     let url = std::env::var("SUTEGI_PG_TEST_URL").ok()?;
     Some(Pg::connect(&url, 4).unwrap())
+}
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Remove this test's tables and history rows so reruns start clean.
@@ -50,6 +58,8 @@ fn applied_versions(pg: &Pg, prefix: &str) -> Vec<String> {
 #[test]
 fn failing_migration_is_atomic_on_the_pg_pool_under_traffic() {
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    let _serial = serial();
 
     let Some(pg) = db() else {
         eprintln!("skipping: SUTEGI_PG_TEST_URL not set");
@@ -150,6 +160,7 @@ fn racing_migrator() -> Migrator {
 
 #[test]
 fn racing_pg_runners_apply_each_migration_exactly_once() {
+    let _serial = serial();
     let Some(pg) = db() else {
         eprintln!("skipping: SUTEGI_PG_TEST_URL not set");
         return;
@@ -196,6 +207,7 @@ fn racing_pg_runners_apply_each_migration_exactly_once() {
 
 #[test]
 fn pg_rollback_of_a_failing_down_is_atomic() {
+    let _serial = serial();
     let Some(pg) = db() else {
         eprintln!("skipping: SUTEGI_PG_TEST_URL not set");
         return;
@@ -227,6 +239,7 @@ fn pg_rollback_of_a_failing_down_is_atomic() {
 
 #[test]
 fn pg_no_transaction_migration_runs_concurrent_index_ddl() {
+    let _serial = serial();
     let Some(pg) = db() else {
         eprintln!("skipping: SUTEGI_PG_TEST_URL not set");
         return;
