@@ -10,6 +10,8 @@ use crate::Aggregate;
 /// real work (a fresh transaction), so this is a contention ceiling, not a spin.
 const MAX_APPEND_RETRIES: usize = 16;
 
+const PG_APPEND_LOCK_KEY: i64 = 0x7375_7465_6769_6576;
+
 /// One event as stored: its global log `position`, per-stream `version`, and
 /// the decoded JSON `payload`/`meta`.
 #[derive(Clone, Debug, PartialEq)]
@@ -293,6 +295,13 @@ pub fn append_tx(
     expected: Expected,
     events: &[NewEvent],
 ) -> Result<i64, EventError> {
+    if tx.dialect() == sutegi_orm::Dialect::Postgres {
+        tx.execute(
+            "SELECT pg_advisory_xact_lock(?)",
+            &[Value::Int(PG_APPEND_LOCK_KEY)],
+        )
+        .map_err(EventError::Store)?;
+    }
     let current = stream_version(tx, stream).map_err(EventError::Store)?;
     if !expected.matches(current) {
         return Err(EventError::Conflict {

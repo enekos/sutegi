@@ -40,8 +40,9 @@
 //!
 //! Every event gets a gap-free global `position`, assigned inside the append
 //! transaction as `MAX(position) + 1` and protected by the primary key: two
-//! racing appends can't both commit the same position, so the loser retries
-//! with a fresh one. Readers paging `position > checkpoint` therefore never
+//! racing appends can't both commit the same position. On PostgreSQL appends
+//! queue on a transaction-scoped advisory lock; on SQLite `BEGIN IMMEDIATE`
+//! already admits one writer at a time. Readers paging `position > checkpoint` therefore never
 //! skip an event — the property projections depend on. The cost is that
 //! appends serialize at the head of the log (writes to *different* streams
 //! still conflict on `position`); plenty for a typical app, and the honest

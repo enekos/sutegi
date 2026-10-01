@@ -13,7 +13,7 @@ use sutegi_orm::{Backend, Transactional, Value};
 
 fn db() -> Option<Pg> {
     let url = std::env::var("SUTEGI_PG_TEST_URL").ok()?;
-    Some(Pg::connect(&url, 8).unwrap())
+    Some(Pg::connect(&url, 16).unwrap())
 }
 
 fn deposited(amount: i64) -> sutegi_events::NewEvent {
@@ -57,13 +57,16 @@ fn event_sourcing_over_postgres() {
     );
 
     // --- concurrent appends: racing writers, gap-free global positions ---
-    // Distinct streams so every collision is a *position* race (retried
-    // internally), exercising the head-of-log serialization.
-    let threads: Vec<_> = (0..4)
+    // Distinct streams so every collision is a *position* race,
+    // exercising the head-of-log serialization.
+    const RACERS: i64 = 16;
+    const APPENDS_PER_RACER: i64 = 50;
+    let head = 2 + RACERS * APPENDS_PER_RACER;
+    let threads: Vec<_> = (0..RACERS)
         .map(|t| {
             let store = EventStore::new(pg.clone());
             thread::spawn(move || {
-                for i in 0..10 {
+                for i in 0..APPENDS_PER_RACER {
                     store
                         .append(&format!("racer:{t}"), Expected::Any, &[deposited(i)])
                         .unwrap();
@@ -75,17 +78,17 @@ fn event_sourcing_over_postgres() {
         t.join().unwrap();
     }
     let all = store.read_all(0, 1_000).unwrap();
-    assert_eq!(all.len(), 42); // 2 setup events + 4 threads * 10
+    assert_eq!(all.len() as i64, head);
     let positions: Vec<i64> = all.iter().map(|e| e.position).collect();
-    assert_eq!(positions, (1..=42).collect::<Vec<i64>>());
-    for t in 0..4 {
+    assert_eq!(positions, (1..=head).collect::<Vec<i64>>());
+    for t in 0..RACERS {
         let versions: Vec<i64> = store
             .read_stream(&format!("racer:{t}"), 0)
             .unwrap()
             .iter()
             .map(|e| e.version)
             .collect();
-        assert_eq!(versions, (1..=10).collect::<Vec<i64>>());
+        assert_eq!(versions, (1..=APPENDS_PER_RACER).collect::<Vec<i64>>());
     }
 
     // --- projection with a transactional read model ---
@@ -119,8 +122,8 @@ fn event_sourcing_over_postgres() {
         .unwrap_or(0)
     };
     assert_eq!(total("account:1"), 15);
-    assert_eq!(total("racer:0"), 45); // 0+1+…+9
-    assert_eq!(projections.position("es_totals").unwrap(), 42);
+    assert_eq!(total("racer:0"), (0..APPENDS_PER_RACER).sum::<i64>());
+    assert_eq!(projections.position("es_totals").unwrap(), head);
 
     // --- rebuild from the log ---
     pg.execute("DELETE FROM es_totals", &[]).unwrap();
@@ -137,6 +140,9 @@ fn event_sourcing_over_postgres() {
     assert_eq!(store.version("account:1").unwrap(), 2); // rolled back
 
     let stats = store.stats().unwrap();
-    assert_eq!(stats.get("head").and_then(Json::as_i64), Some(42));
-    assert_eq!(stats.get("streams").and_then(Json::as_i64), Some(5));
+    assert_eq!(stats.get("head").and_then(Json::as_i64), Some(head));
+    assert_eq!(
+        stats.get("streams").and_then(Json::as_i64),
+        Some(1 + RACERS)
+    );
 }
