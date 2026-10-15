@@ -1,0 +1,17 @@
+[package]
+name = "contract-example"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Typed API contracts end to end: Rust types → typed routes, an SSE stream, a typed channel, and the generated TypeScript client."
+publish = false
+
+[[bin]]
+name = "contract"
+path = "src/main.rs"
+
+[dependencies]
+sutegi = { path = "../../crates/sutegi", default-features = false, features = ["contract", "channels"] }

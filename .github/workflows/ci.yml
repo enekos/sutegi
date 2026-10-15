@@ -74,6 +74,7 @@ jobs:
           -p sutegi-mail
           -p sutegi-storage
           -p sutegi-session
+          -p sutegi-contract
 
       # Differential oracle: sutegi's hand-rolled JSON parser vs serde_json,
       # in an excluded workspace so the reference dep never enters the shipped

@@ -23,6 +23,7 @@ libc = { version = "0.2", optional = true }
 sutegi-ws = { path = "../sutegi-ws", version = "0.11.0", optional = true }
 # Only pulled in by the `channels` feature: the channel protocol + hub.
 sutegi-channels = { path = "../sutegi-channels", version = "0.11.0", optional = true }
+sutegi-contract = { path = "../sutegi-contract", version = "0.11.0", optional = true }
 # Only pulled in by the `actors` feature: actor processes + supervisors.
 sutegi-actors = { path = "../sutegi-actors", version = "0.11.0", optional = true }
 
@@ -39,3 +40,4 @@ ws = ["dep:sutegi-ws"]
 channels = ["ws", "dep:sutegi-channels"]
 # `App::actors` — mount an actor Registry at /__actors.
 actors = ["dep:sutegi-actors"]
+contract = ["dep:sutegi-contract", "sutegi-channels?/contract"]

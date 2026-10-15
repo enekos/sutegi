@@ -110,24 +110,31 @@ impl IntoResponse for Response {
     }
 }
 
-impl IntoResponse for Error {
-    fn into_response(self) -> Response {
-        // A 5xx message is an internal detail — a SQL error, a curl stderr, a
-        // path on disk — that reached the client verbatim for as long as this
-        // rendered `self.message` unconditionally. Log it where the operator
-        // can see it and answer with the one thing a client can do about it.
+impl Error {
+    pub(crate) fn into_body(self) -> (u16, Json) {
         if self.status >= 500 {
             eprintln!("  ! {}: {}", self.status, self.message);
-            return json(
+            return (
                 self.status,
-                &Json::obj(vec![("error", Json::str("internal error"))]),
+                Json::obj(vec![("error", Json::str("internal error"))]),
             );
         }
         let mut obj = vec![("error", Json::str(self.message))];
         if let Some(fields) = self.fields {
             obj.push(("errors", fields));
         }
-        json(self.status, &Json::obj(obj))
+        (self.status, Json::obj(obj))
+    }
+}
+
+impl IntoResponse for Error {
+    fn into_response(self) -> Response {
+        // A 5xx message is an internal detail — a SQL error, a curl stderr, a
+        // path on disk — that reached the client verbatim for as long as this
+        // rendered `self.message` unconditionally. Log it where the operator
+        // can see it and answer with the one thing a client can do about it.
+        let (status, body) = self.into_body();
+        json(status, &body)
     }
 }
 

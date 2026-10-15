@@ -1,0 +1,17 @@
+[package]
+name = "sutegi-contract"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Typed API contracts for sutegi: Rust types are the schema; requests decode with path-keyed errors, and the app's surface renders to JSON Schema and a zero-dependency TypeScript client. Zero third-party dependencies."
+keywords = ["rpc", "typescript", "codegen", "schema", "zero-dependency"]
+categories = ["web-programming", "development-tools"]
+
+[dependencies]
+sutegi-json = { path = "../sutegi-json", version = "0.11.0" }
+
+[dev-dependencies]
+sutegi-macros = { path = "../sutegi-macros", version = "0.11.0" }

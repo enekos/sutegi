@@ -22,6 +22,11 @@ pub use respond::{Error, IntoResponse};
 
 pub mod schema;
 
+#[cfg(feature = "contract")]
+mod contract;
+#[cfg(feature = "contract")]
+pub use contract::{Emitter, Endpoint, Stream};
+
 #[cfg(feature = "ws")]
 pub mod ws;
 #[cfg(feature = "ws")]
@@ -363,6 +368,7 @@ struct Route {
     handler: Handler,
     /// Group-scoped middleware run before this route's handler.
     middleware: Vec<Mw>,
+    contract: Option<Json>,
 }
 
 /// The application: a builder you configure with routes, state, tools, and
@@ -387,6 +393,8 @@ pub struct App {
     ws_config: sutegi_ws::WsConfig,
     #[cfg(feature = "ws")]
     ws_runtime: Option<Arc<sutegi_ws::WsRuntime>>,
+    #[cfg(feature = "contract")]
+    contract: sutegi_contract::Registry,
 }
 
 /// Process-wide request counters, exposed at `/__metrics` in Prometheus text
@@ -460,6 +468,8 @@ impl App {
             ws_config: sutegi_ws::WsConfig::default(),
             #[cfg(feature = "ws")]
             ws_runtime: None,
+            #[cfg(feature = "contract")]
+            contract: sutegi_contract::Registry::new(),
         }
     }
 
@@ -532,6 +542,7 @@ impl App {
             doc: doc.to_string(),
             handler: Box::new(move |c: &Ctx| handler(c).into_response()),
             middleware: Vec::new(),
+            contract: None,
         });
         self
     }
@@ -585,6 +596,8 @@ impl App {
     #[cfg(feature = "channels")]
     pub fn channels(mut self, pattern: &str, doc: &str, hub: sutegi_channels::ChannelHub) -> App {
         let manifest = hub.manifest(pattern);
+        #[cfg(feature = "contract")]
+        self.contract.absorb(hub.contract());
         self = self.get(
             "/__channels",
             "The channel manifest: envelope protocol, topics, event schemas.",
@@ -658,6 +671,51 @@ impl App {
         self
     }
 
+    #[cfg(feature = "contract")]
+    pub fn typed<I, O>(
+        mut self,
+        endpoint: Endpoint,
+        handler: impl Fn(&Ctx, I) -> Result<O, Error> + Send + Sync + 'static,
+    ) -> App
+    where
+        I: sutegi_contract::Contract + 'static,
+        O: sutegi_contract::Contract + 'static,
+    {
+        let pattern = endpoint.pattern().to_string();
+        let route =
+            contract::unary_route(&mut self.contract, endpoint, pattern, Vec::new(), handler);
+        self.routes.push(route);
+        self
+    }
+
+    #[cfg(feature = "contract")]
+    pub fn typed_stream<I, E, O>(
+        mut self,
+        endpoint: Endpoint,
+        handler: impl Fn(&Ctx, I) -> Result<Stream<E, O>, Error> + Send + Sync + 'static,
+    ) -> App
+    where
+        I: sutegi_contract::Contract + 'static,
+        E: sutegi_contract::Contract + 'static,
+        O: sutegi_contract::Contract + 'static,
+    {
+        let pattern = endpoint.pattern().to_string();
+        let route =
+            contract::stream_route(&mut self.contract, endpoint, pattern, Vec::new(), handler);
+        self.routes.push(route);
+        self
+    }
+
+    #[cfg(feature = "contract")]
+    pub fn contract(&self) -> &sutegi_contract::Registry {
+        &self.contract
+    }
+
+    #[cfg(feature = "contract")]
+    pub fn contract_ts(&self) -> String {
+        sutegi_contract::ts::render(&self.contract)
+    }
+
     pub fn listener<F>(mut self, name: &str, doc: &str, run: F) -> App
     where
         F: FnOnce(ListenerCtx) + Send + 'static,
@@ -682,8 +740,12 @@ impl App {
             prefix: prefix.to_string(),
             middleware,
             routes: Vec::new(),
+            #[cfg(feature = "contract")]
+            contract: sutegi_contract::Registry::new(),
         });
         self.routes.extend(group.routes);
+        #[cfg(feature = "contract")]
+        self.contract.absorb(group.contract);
         self
     }
 
@@ -814,11 +876,15 @@ impl App {
             .routes
             .iter()
             .map(|r| {
-                Json::obj(vec![
+                let mut entry = vec![
                     ("method", Json::str(r.method.as_str())),
                     ("pattern", Json::str(r.pattern.clone())),
                     ("doc", Json::str(r.doc.clone())),
-                ])
+                ];
+                if let Some(c) = &r.contract {
+                    entry.push(("contract", c.clone()));
+                }
+                Json::obj(entry)
             })
             .collect();
         let mut doc = vec![
@@ -838,6 +904,16 @@ impl App {
                 ]),
             ),
         ];
+        #[cfg(feature = "contract")]
+        if !self.contract.is_empty() {
+            doc.push((
+                "contract",
+                Json::obj(vec![
+                    ("manifest", Json::str("/__contract")),
+                    ("typescript", Json::str("/__contract.ts")),
+                ]),
+            ));
+        }
         if let Some(caps) = &self.capabilities {
             doc.push(("capabilities", caps.clone()));
         }
@@ -876,6 +952,13 @@ impl App {
         }
         let limits = self.limits;
         let introspect = self.introspection();
+        #[cfg(feature = "contract")]
+        let contract_docs: Option<(Json, String)> = (!self.contract.is_empty()).then(|| {
+            (
+                self.contract.manifest(),
+                sutegi_contract::ts::render(&self.contract),
+            )
+        });
         let listeners = std::mem::take(&mut self.listeners);
         let routes = Arc::new(self.routes);
         let middleware = Arc::new(self.middleware);
@@ -955,6 +1038,18 @@ impl App {
                     }
                     "/__introspect" => return json(200, &introspect),
                     _ => {}
+                }
+                #[cfg(feature = "contract")]
+                if let Some((manifest, ts)) = &contract_docs {
+                    match req.path.as_str() {
+                        "/__contract" => return json(200, manifest),
+                        "/__contract.ts" => {
+                            return Response::new(200)
+                                .with_header("content-type", "text/plain; charset=utf-8")
+                                .with_body(ts.as_bytes().to_vec());
+                        }
+                        _ => {}
+                    }
                 }
 
                 // Route table (run group-scoped middleware before the handler).
@@ -1244,6 +1339,8 @@ pub struct Group {
     prefix: String,
     middleware: Vec<Mw>,
     routes: Vec<Route>,
+    #[cfg(feature = "contract")]
+    contract: sutegi_contract::Registry,
 }
 
 impl Group {
@@ -1262,6 +1359,7 @@ impl Group {
             doc: doc.to_string(),
             handler: Box::new(move |c: &Ctx| handler(c).into_response()),
             middleware: self.middleware.clone(),
+            contract: None,
         });
         self
     }
@@ -1297,6 +1395,51 @@ impl Group {
         h: impl Fn(&Ctx) -> R + Send + Sync + 'static,
     ) -> Group {
         self.route(Method::Delete, p, doc, h)
+    }
+
+    #[cfg(feature = "contract")]
+    pub fn typed<I, O>(
+        mut self,
+        endpoint: Endpoint,
+        handler: impl Fn(&Ctx, I) -> Result<O, Error> + Send + Sync + 'static,
+    ) -> Group
+    where
+        I: sutegi_contract::Contract + 'static,
+        O: sutegi_contract::Contract + 'static,
+    {
+        let pattern = join_prefix(&self.prefix, endpoint.pattern());
+        let route = contract::unary_route(
+            &mut self.contract,
+            endpoint,
+            pattern,
+            self.middleware.clone(),
+            handler,
+        );
+        self.routes.push(route);
+        self
+    }
+
+    #[cfg(feature = "contract")]
+    pub fn typed_stream<I, E, O>(
+        mut self,
+        endpoint: Endpoint,
+        handler: impl Fn(&Ctx, I) -> Result<Stream<E, O>, Error> + Send + Sync + 'static,
+    ) -> Group
+    where
+        I: sutegi_contract::Contract + 'static,
+        E: sutegi_contract::Contract + 'static,
+        O: sutegi_contract::Contract + 'static,
+    {
+        let pattern = join_prefix(&self.prefix, endpoint.pattern());
+        let route = contract::stream_route(
+            &mut self.contract,
+            endpoint,
+            pattern,
+            self.middleware.clone(),
+            handler,
+        );
+        self.routes.push(route);
+        self
     }
 }
 

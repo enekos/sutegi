@@ -22,6 +22,8 @@
 //! }
 //! ```
 
+mod contract;
+
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{parse_macro_input, Data, DeriveInput, Fields, Type};
@@ -124,6 +126,15 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
 /// Supported rules: `required`, `str`, `integer`, `number`, `bool`, `email`,
 /// `url`, `alpha`, `alphanum`, `min_len = N`, `max_len = N`, `min = N`,
 /// `max = N`, `same = "field"`. Validation keys are the struct field names.
+#[proc_macro_derive(Contract, attributes(contract))]
+pub fn derive_contract(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    match contract::expand(input) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
 #[proc_macro_derive(Validate, attributes(validate))]
 pub fn derive_validate(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
