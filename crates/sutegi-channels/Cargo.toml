@@ -15,8 +15,10 @@ sutegi-json = { path = "../sutegi-json", version = "0.11.0" }
 sutegi-http = { path = "../sutegi-http", version = "0.11.0" }
 sutegi-ws = { path = "../sutegi-ws", version = "0.11.0" }
 sutegi-pubsub = { path = "../sutegi-pubsub", version = "0.11.0" }
+sutegi-contract = { path = "../sutegi-contract", version = "0.11.0", optional = true }
 
 [features]
 # Presence: a per-pod tracker over the Broker seam with cross-pod state sync
 # and heartbeat expiry (see src/presence.rs for the honest caveats).
 presence = []
+contract = ["dep:sutegi-contract"]

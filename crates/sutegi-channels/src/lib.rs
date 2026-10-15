@@ -37,6 +37,8 @@
 //! you serve assets.
 
 mod channel;
+#[cfg(feature = "contract")]
+mod contract;
 mod hub;
 #[cfg(feature = "presence")]
 mod presence;

@@ -76,6 +76,8 @@ pub struct Channel {
     /// Server→client events this channel emits, for the manifest only.
     pub(crate) emits: BTreeMap<String, EventDoc>,
     pub(crate) leave: Option<LeaveFn>,
+    #[cfg(feature = "contract")]
+    pub(crate) contract: crate::contract::ChannelContract,
 }
 
 impl Channel {
@@ -96,6 +98,8 @@ impl Channel {
             event_docs: BTreeMap::new(),
             emits: BTreeMap::new(),
             leave: None,
+            #[cfg(feature = "contract")]
+            contract: crate::contract::ChannelContract::default(),
         }
     }
 

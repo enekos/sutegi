@@ -50,6 +50,8 @@ pub use sutegi_actors as actors;
 pub use sutegi_auth as auth;
 #[cfg(feature = "channels")]
 pub use sutegi_channels as channels;
+#[cfg(feature = "contract")]
+pub use sutegi_contract as contract;
 #[cfg(feature = "events")]
 pub use sutegi_events as events;
 #[cfg(feature = "hexagon")]
@@ -79,6 +81,9 @@ pub use sutegi_ws as ws;
 /// `derive` feature; `Validate` additionally needs `validate`).
 #[cfg(feature = "derive")]
 pub use sutegi_macros::{Model, Validate};
+
+#[cfg(feature = "contract")]
+pub use sutegi_macros::Contract;
 
 /// Collect a set of models' schemas into a `Vec<TableSchema>` — the desired
 /// state passed to `migrate:gen` / `migrate:drift` / [`migrate::report_json`].
@@ -485,6 +490,13 @@ pub mod prelude {
 
     #[cfg(feature = "derive")]
     pub use sutegi_macros::{Model, Validate};
+
+    #[cfg(feature = "contract")]
+    pub use sutegi_contract::Contract;
+    #[cfg(feature = "contract")]
+    pub use sutegi_macros::Contract;
+    #[cfg(feature = "contract")]
+    pub use sutegi_web::{Emitter, Endpoint, Stream};
 
     #[cfg(feature = "actors")]
     pub use sutegi_actors::{

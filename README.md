@@ -94,6 +94,7 @@ fn main() -> std::io::Result<()> {
 | `sutegi-pg`   | Pure-`std` PostgreSQL driver: wire protocol v3 over blocking TCP, SCRAM-SHA-256 auth, connection pool. No async runtime, no C library. |
 | `sutegi-storage` | File/object storage behind one `Storage` trait: local fs, database blobs (over `Backend`), and S3/R2 buckets over a pluggable HTTP transport — plus a pure-`std` SigV4 presigner. |
 | `sutegi-macros` | `#[derive(Model)]` (schema, hydration, `save`, `from_input`) and `#[derive(Validate)]` (field-attr rulesets). Compile-time only (syn/quote never reach your binary). |
+| `sutegi-contract` | Typed API contracts: the `Contract` trait, path-keyed decoding, and the renderers for JSON Schema and the zero-dependency TypeScript client (`App::typed`, `typed_stream`, typed channels; see [docs/CONTRACTS.md](docs/CONTRACTS.md)). |
 | `sutegi-validate` | Fluent `Validator`-style rule sets **and** a JSON Schema subset validator, with structured errors. |
 | `sutegi-queue` | Durable job queue over the `Backend` seam — same SQL on SQLite or Postgres (`UPDATE … RETURNING` claim, `SKIP LOCKED` where the backend has it, visibility-timeout retries, priorities, named queues, dedupe keys, dead-letter). |
 | `sutegi-hexagon`  | Opinionated hexagonal/clean-architecture primitives: `AppError`, `UseCase` ports, `respond` adapter glue. |
@@ -123,6 +124,7 @@ what you use:
 | `auth-mail` |  | email-verification + password-reset flows on top of both |
 | `storage`  |   | file storage: local fs, S3/R2 objects, presigned URLs (pure std) |
 | `storage-db` |  | blobs in SQLite/Postgres over the same `Backend` seam |
+| `contract` |   | `#[derive(Contract)]`, typed routes + SSE streams + typed channels, a generated TypeScript client ([docs/CONTRACTS.md](docs/CONTRACTS.md)) |
 
 ```toml
 # Minimal HTTP service — core only:
@@ -146,6 +148,7 @@ Built-in operational endpoints (always on, no feature needed):
 | `GET /__ready`   | readiness — 200/503 from your `App::readiness(...)` probe |
 | `GET /__metrics` | Prometheus text (requests total, in-flight, by status class) |
 | `GET /__introspect` | full app surface (routes/models/tools/endpoints) |
+| `GET /__contract` · `/__contract.ts` | with `contract`: the typed API as JSON, and the generated TypeScript client |
 
 ### Configuration
 
