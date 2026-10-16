@@ -8,10 +8,11 @@ pub mod snapshot;
 pub mod ts;
 mod ty;
 
-pub use decode::{decode, decode_lenient, decode_with, Cx, Errors};
+pub use decode::{decode, decode_lenient, decode_with, Cx};
 pub use registry::{ChannelSpec, Kind, Message, Procedure, Registry};
 pub use sutegi_json::Json;
-pub use ty::{Def, Field, Rules, Shape, Type, Variant, VariantShape};
+pub use sutegi_validate::ValidationErrors;
+pub use ty::{Def, Field, Format, Rules, Shape, Type, Variant, VariantShape};
 
 pub trait Contract: Sized {
     fn describe(reg: &mut Registry) -> Type;

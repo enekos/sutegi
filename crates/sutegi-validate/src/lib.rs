@@ -54,7 +54,33 @@ impl ValidationErrors {
             .collect();
         Json::obj(pairs)
     }
+
+    pub fn get(&self, field: &str) -> Option<&[String]> {
+        self.0.get(field).map(Vec::as_slice)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Vec<String>)> {
+        self.0.iter()
+    }
 }
+
+impl std::fmt::Display for ValidationErrors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut first = true;
+        for (field, msgs) in &self.0 {
+            for m in msgs {
+                if !first {
+                    f.write_str("; ")?;
+                }
+                first = false;
+                write!(f, "{field}: {m}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ValidationErrors {}
 
 /// A single validation rule.
 #[derive(Clone, Debug)]
@@ -131,21 +157,20 @@ impl Ruleset {
 
             if !present {
                 if required {
-                    errors.add(name, format!("The {} field is required.", name));
+                    errors.add(name, message(name, &Rule::Required, &Json::Null));
                 }
                 // Absent + optional → nothing else to check.
                 continue;
             }
 
             let value = value.unwrap();
+            let siblings = match data {
+                Json::Obj(m) => Some(m),
+                _ => None,
+            };
             for rule in rules {
-                // `Same` needs sibling-field access, so it's handled here.
-                if let Rule::Same(other) = rule {
-                    if data.get(other) != Some(value) {
-                        errors.add(name, format!("The {} must match {}.", name, other));
-                    }
-                } else {
-                    check_rule(name, rule, value, &mut errors);
+                if let Some(message) = check(name, rule, value, siblings) {
+                    errors.add(name, message);
                 }
             }
         }
@@ -153,129 +178,89 @@ impl Ruleset {
     }
 }
 
-fn check_rule(field: &str, rule: &Rule, value: &Json, errors: &mut ValidationErrors) {
-    match rule {
-        Rule::Required => {} // presence handled before per-rule checks
-        Rule::Str => {
-            if value.as_str().is_none() {
-                errors.add(field, format!("The {} must be a string.", field));
-            }
-        }
-        Rule::Integer => {
-            let ok = matches!(value, Json::Num(n) if n.fract() == 0.0);
-            if !ok {
-                errors.add(field, format!("The {} must be an integer.", field));
-            }
-        }
-        Rule::Number => {
-            if value.as_f64().is_none() {
-                errors.add(field, format!("The {} must be a number.", field));
-            }
-        }
-        Rule::Bool => {
-            if value.as_bool().is_none() {
-                errors.add(field, format!("The {} must be true or false.", field));
-            }
-        }
-        Rule::Email => {
-            let ok = value.as_str().map(is_email).unwrap_or(false);
-            if !ok {
-                errors.add(
-                    field,
-                    format!("The {} must be a valid email address.", field),
-                );
-            }
-        }
-        Rule::Alpha => {
-            let ok = value
-                .as_str()
-                .map(|s| !s.is_empty() && s.chars().all(|c| c.is_alphabetic()))
-                .unwrap_or(false);
-            if !ok {
-                errors.add(field, format!("The {} may only contain letters.", field));
-            }
-        }
-        Rule::AlphaNum => {
-            let ok = value
-                .as_str()
-                .map(|s| !s.is_empty() && s.chars().all(|c| c.is_alphanumeric()))
-                .unwrap_or(false);
-            if !ok {
-                errors.add(
-                    field,
-                    format!("The {} may only contain letters and numbers.", field),
-                );
-            }
-        }
-        Rule::Url => {
-            let ok = value.as_str().map(is_url).unwrap_or(false);
-            if !ok {
-                errors.add(field, format!("The {} must be a valid URL.", field));
-            }
-        }
-        Rule::Between(min, max) => {
-            if let Some(n) = value.as_f64() {
-                if n < *min || n > *max {
-                    errors.add(
-                        field,
-                        format!("The {} must be between {} and {}.", field, min, max),
-                    );
-                }
-            }
-        }
-        // Handled in `Ruleset::validate` (needs sibling-field access).
-        Rule::Same(_) => {}
-        Rule::Min(min) => {
-            if let Some(n) = value.as_f64() {
-                if n < *min {
-                    errors.add(field, format!("The {} must be at least {}.", field, min));
-                }
-            }
-        }
-        Rule::Max(max) => {
-            if let Some(n) = value.as_f64() {
-                if n > *max {
-                    errors.add(
-                        field,
-                        format!("The {} must not be greater than {}.", field, max),
-                    );
-                }
-            }
-        }
-        Rule::MinLen(min) => {
-            if let Some(len) = length_of(value) {
-                if len < *min {
-                    errors.add(
-                        field,
-                        format!("The {} must be at least {} long.", field, min),
-                    );
-                }
-            }
-        }
-        Rule::MaxLen(max) => {
-            if let Some(len) = length_of(value) {
-                if len > *max {
-                    errors.add(
-                        field,
-                        format!("The {} must not be longer than {}.", field, max),
-                    );
-                }
-            }
-        }
+/// Check one present `value` against one rule, returning the message to report
+/// under `field` when it fails. `siblings` is the enclosing object, which only
+/// [`Rule::Same`] reads. Presence ([`Rule::Required`]) is the caller's job.
+///
+/// This is the single place a rule is checked and worded: [`Ruleset`] and
+/// `#[derive(Contract)]` decoding both report through it.
+pub fn check(
+    field: &str,
+    rule: &Rule,
+    value: &Json,
+    siblings: Option<&BTreeMap<String, Json>>,
+) -> Option<String> {
+    let fails = match rule {
+        Rule::Required => false,
+        Rule::Str => value.as_str().is_none(),
+        Rule::Integer => !matches!(value, Json::Num(n) if n.fract() == 0.0),
+        Rule::Number => value.as_f64().is_none(),
+        Rule::Bool => value.as_bool().is_none(),
+        Rule::Email => !value.as_str().is_some_and(is_email),
+        Rule::Alpha => !value
+            .as_str()
+            .is_some_and(|s| !s.is_empty() && s.chars().all(char::is_alphabetic)),
+        Rule::AlphaNum => !value
+            .as_str()
+            .is_some_and(|s| !s.is_empty() && s.chars().all(char::is_alphanumeric)),
+        Rule::Url => !value.as_str().is_some_and(is_url),
+        Rule::Between(min, max) => value.as_f64().is_some_and(|n| n < *min || n > *max),
+        Rule::Same(other) => siblings.and_then(|m| m.get(other)) != Some(value),
+        Rule::Min(min) => value.as_f64().is_some_and(|n| n < *min),
+        Rule::Max(max) => value.as_f64().is_some_and(|n| n > *max),
+        Rule::MinLen(min) => length_of(value).is_some_and(|len| len < *min),
+        Rule::MaxLen(max) => length_of(value).is_some_and(|len| len > *max),
         Rule::In(allowed) => {
             let as_str = match value {
                 Json::Str(s) => Some(s.clone()),
                 Json::Num(_) | Json::Bool(_) => Some(value.to_string()),
                 _ => None,
             };
-            let ok = as_str
-                .map(|s| allowed.iter().any(|a| a == &s))
-                .unwrap_or(false);
-            if !ok {
-                errors.add(field, format!("The selected {} is invalid.", field));
-            }
+            !as_str.is_some_and(|s| allowed.iter().any(|a| a == &s))
         }
+    };
+    fails.then(|| message(field, rule, value))
+}
+
+fn message(field: &str, rule: &Rule, value: &Json) -> String {
+    match rule {
+        Rule::Required => format!("The {} field is required.", field),
+        Rule::Str => format!("The {} must be a string.", field),
+        Rule::Integer => format!("The {} must be an integer.", field),
+        Rule::Number => format!("The {} must be a number.", field),
+        Rule::Bool => format!("The {} must be true or false.", field),
+        Rule::Email => format!("The {} must be a valid email address.", field),
+        Rule::Alpha => format!("The {} may only contain letters.", field),
+        Rule::AlphaNum => format!("The {} may only contain letters and numbers.", field),
+        Rule::Url => format!("The {} must be a valid URL.", field),
+        Rule::Between(min, max) => {
+            format!("The {} must be between {} and {}.", field, min, max)
+        }
+        Rule::Same(other) => format!("The {} must match {}.", field, other),
+        Rule::Min(min) => format!("The {} must be at least {}.", field, min),
+        Rule::Max(max) => format!("The {} must not be greater than {}.", field, max),
+        Rule::MinLen(min) => format!(
+            "The {} must have at least {}.",
+            field,
+            count_of(*min, value)
+        ),
+        Rule::MaxLen(max) => format!(
+            "The {} must not have more than {}.",
+            field,
+            count_of(*max, value)
+        ),
+        Rule::In(_) => format!("The selected {} is invalid.", field),
     }
+}
+
+fn count_of(n: usize, value: &Json) -> String {
+    let unit = match (value, n) {
+        (Json::Arr(_), 1) => "item",
+        (Json::Arr(_), _) => "items",
+        (_, 1) => "character",
+        _ => "characters",
+    };
+    format!("{n} {unit}")
 }
 
 fn length_of(value: &Json) -> Option<usize> {

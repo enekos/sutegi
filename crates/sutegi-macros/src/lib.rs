@@ -23,6 +23,7 @@
 //! ```
 
 mod contract;
+mod rules;
 
 use proc_macro::TokenStream;
 use quote::quote;
@@ -119,14 +120,13 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
     }
 }
 
-/// `#[derive(Validate)]` — generate `impl sutegi::validate::Validate` from
-/// `#[validate(...)]` field attributes, so `Ctx::validated::<T>()` can parse and
-/// validate a request body in one step.
-///
-/// Supported rules: `required`, `str`, `integer`, `number`, `bool`, `email`,
-/// `url`, `alpha`, `alphanum`, `min_len = N`, `max_len = N`, `min = N`,
-/// `max = N`, `same = "field"`. Validation keys are the struct field names.
-#[proc_macro_derive(Contract, attributes(contract))]
+/// `#[derive(Contract)]` — generate `impl sutegi::contract::Contract`: the
+/// type's wire shape, a decoder that collects every error keyed by path, and
+/// an encoder. Field rules come from the same `#[validate(...)]` attribute
+/// `#[derive(Validate)]` reads, checked by the same code; `#[contract(...)]`
+/// holds only wire options (`rename`, `default`, `skip`, `doc`, `tag`). See
+/// `docs/CONTRACTS.md`.
+#[proc_macro_derive(Contract, attributes(contract, validate))]
 pub fn derive_contract(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     match contract::expand(input) {
@@ -135,6 +135,13 @@ pub fn derive_contract(input: TokenStream) -> TokenStream {
     }
 }
 
+/// `#[derive(Validate)]` — generate `impl sutegi::validate::Validate` from
+/// `#[validate(...)]` field attributes, so `Ctx::validated::<T>()` can parse and
+/// validate a request body in one step.
+///
+/// Supported rules: `required`, `str`, `integer`, `number`, `bool`, `email`,
+/// `url`, `alpha`, `alphanum`, `min_len = N`, `max_len = N`, `min = N`,
+/// `max = N`, `same = "field"`. Validation keys are the struct field names.
 #[proc_macro_derive(Validate, attributes(validate))]
 pub fn derive_validate(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -883,14 +890,6 @@ fn option_inner(ty: &Type) -> Option<&Type> {
 }
 
 /// Parse a numeric literal (`5` or `5.0`) as an `f64` for `min`/`max` rules.
-fn lit_f64(lit: &syn::Lit) -> syn::Result<f64> {
-    match lit {
-        syn::Lit::Int(i) => i.base10_parse::<f64>(),
-        syn::Lit::Float(f) => f.base10_parse::<f64>(),
-        other => Err(syn::Error::new_spanned(other, "expected a number")),
-    }
-}
-
 fn expand_validate(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let name = &input.ident;
     let fields = match &input.data {
@@ -914,70 +913,28 @@ fn expand_validate(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> 
     let mut field_rules: Vec<proc_macro2::TokenStream> = Vec::new();
     for f in fields {
         let ident = f.ident.as_ref().unwrap();
-        let mut rules: Vec<proc_macro2::TokenStream> = Vec::new();
-        for attr in &f.attrs {
-            if !attr.path().is_ident("validate") {
-                continue;
-            }
-            attr.parse_nested_meta(|meta| {
-                let p = &meta.path;
-                let simple = |name: &str| -> Option<proc_macro2::TokenStream> {
-                    if p.is_ident(name) {
-                        let variant = syn::Ident::new(
-                            match name {
-                                "str" => "Str",
-                                "integer" => "Integer",
-                                "number" => "Number",
-                                "bool" => "Bool",
-                                "required" => "Required",
-                                "email" => "Email",
-                                "url" => "Url",
-                                "alpha" => "Alpha",
-                                "alphanum" => "AlphaNum",
-                                _ => return None,
-                            },
-                            proc_macro2::Span::call_site(),
-                        );
-                        Some(quote! { ::sutegi::validate::Rule::#variant })
-                    } else {
-                        None
-                    }
+        let rules: Vec<proc_macro2::TokenStream> = rules::parse(&f.attrs)?
+            .into_iter()
+            .map(|r| {
+                let rule = match r.kind {
+                    rules::Kind::Required => quote!(Required),
+                    rules::Kind::Str => quote!(Str),
+                    rules::Kind::Integer => quote!(Integer),
+                    rules::Kind::Number => quote!(Number),
+                    rules::Kind::Bool => quote!(Bool),
+                    rules::Kind::Email => quote!(Email),
+                    rules::Kind::Url => quote!(Url),
+                    rules::Kind::Alpha => quote!(Alpha),
+                    rules::Kind::AlphaNum => quote!(AlphaNum),
+                    rules::Kind::MinLen(n) => quote!(MinLen(#n)),
+                    rules::Kind::MaxLen(n) => quote!(MaxLen(#n)),
+                    rules::Kind::Min(n) => quote!(Min(#n)),
+                    rules::Kind::Max(n) => quote!(Max(#n)),
+                    rules::Kind::Same(other) => quote!(Same(#other.to_string())),
                 };
-                for name in [
-                    "required", "str", "integer", "number", "bool", "email", "url", "alpha",
-                    "alphanum",
-                ] {
-                    if let Some(tok) = simple(name) {
-                        rules.push(tok);
-                        return Ok(());
-                    }
-                }
-                if p.is_ident("min_len") {
-                    let v: syn::LitInt = meta.value()?.parse()?;
-                    let n: usize = v.base10_parse()?;
-                    rules.push(quote! { ::sutegi::validate::Rule::MinLen(#n) });
-                } else if p.is_ident("max_len") {
-                    let v: syn::LitInt = meta.value()?.parse()?;
-                    let n: usize = v.base10_parse()?;
-                    rules.push(quote! { ::sutegi::validate::Rule::MaxLen(#n) });
-                } else if p.is_ident("min") {
-                    let lit: syn::Lit = meta.value()?.parse()?;
-                    let n = lit_f64(&lit)?;
-                    rules.push(quote! { ::sutegi::validate::Rule::Min(#n) });
-                } else if p.is_ident("max") {
-                    let lit: syn::Lit = meta.value()?.parse()?;
-                    let n = lit_f64(&lit)?;
-                    rules.push(quote! { ::sutegi::validate::Rule::Max(#n) });
-                } else if p.is_ident("same") {
-                    let v: syn::LitStr = meta.value()?.parse()?;
-                    let other = v.value();
-                    rules.push(quote! { ::sutegi::validate::Rule::Same(#other.to_string()) });
-                } else {
-                    return Err(meta.error("unknown #[validate(...)] rule"));
-                }
-                Ok(())
-            })?;
-        }
+                quote! { ::sutegi::validate::Rule::#rule }
+            })
+            .collect();
         if !rules.is_empty() {
             let key = ident.to_string();
             field_rules.push(quote! { .field(#key, &[ #( #rules ),* ]) });

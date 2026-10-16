@@ -2,6 +2,8 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{Attribute, Data, DeriveInput, Fields, GenericParam, Ident, LitStr};
 
+use crate::rules::{self, Kind};
+
 struct Container {
     rename: Option<String>,
     tag: Option<String>,
@@ -22,10 +24,12 @@ struct FieldSpec {
 
 #[derive(Default)]
 struct Rules {
-    min_len: Option<syn::Expr>,
-    max_len: Option<syn::Expr>,
-    min: Option<syn::Expr>,
-    max: Option<syn::Expr>,
+    min_len: Option<usize>,
+    max_len: Option<usize>,
+    min: Option<f64>,
+    max: Option<f64>,
+    format: Option<&'static str>,
+    same: Option<(String, proc_macro2::Span)>,
 }
 
 struct VariantSpec {
@@ -250,23 +254,76 @@ fn field_spec(f: &syn::Field, index: usize) -> syn::Result<FieldSpec> {
                 spec.default = true;
             } else if p.is_ident("skip") {
                 spec.skip = true;
-            } else if p.is_ident("min_len") {
-                spec.rules.min_len = Some(meta.value()?.parse()?);
-            } else if p.is_ident("max_len") {
-                spec.rules.max_len = Some(meta.value()?.parse()?);
-            } else if p.is_ident("min") {
-                spec.rules.min = Some(meta.value()?.parse()?);
-            } else if p.is_ident("max") {
-                spec.rules.max = Some(meta.value()?.parse()?);
+            } else if ["min_len", "max_len", "min", "max"]
+                .iter()
+                .any(|k| p.is_ident(k))
+            {
+                return Err(
+                    meta.error("rules go in #[validate(...)], shared with #[derive(Validate)]")
+                );
             } else {
                 return Err(meta.error(
-                    "unknown #[contract(...)] field key (expected rename, doc, default, skip, min_len, max_len, min, max)",
+                    "unknown #[contract(...)] field key (expected rename, doc, default, skip)",
                 ));
             }
             Ok(())
         })?;
     }
+    spec.rules = field_rules(f, spec.default)?;
     Ok(spec)
+}
+
+fn field_rules(f: &syn::Field, default: bool) -> syn::Result<Rules> {
+    let mut out = Rules::default();
+    for r in rules::parse(&f.attrs)? {
+        let format = match r.kind {
+            Kind::Required if default || is_option(&f.ty) => {
+                return Err(syn::Error::new(
+                    r.span,
+                    "`required` contradicts an Option or #[contract(default)] field",
+                ));
+            }
+            Kind::Required | Kind::Str | Kind::Integer | Kind::Number | Kind::Bool => None,
+            Kind::MinLen(n) => {
+                out.min_len = Some(n);
+                None
+            }
+            Kind::MaxLen(n) => {
+                out.max_len = Some(n);
+                None
+            }
+            Kind::Min(n) => {
+                out.min = Some(n);
+                None
+            }
+            Kind::Max(n) => {
+                out.max = Some(n);
+                None
+            }
+            Kind::Same(other) => {
+                out.same = Some((other, r.span));
+                None
+            }
+            Kind::Email => Some("Email"),
+            Kind::Url => Some("Url"),
+            Kind::Alpha => Some("Alpha"),
+            Kind::AlphaNum => Some("AlphaNum"),
+        };
+        if format.is_some_and(|f| out.format.replace(f).is_some()) {
+            return Err(syn::Error::new(
+                r.span,
+                "a field takes one of email, url, alpha, alphanum",
+            ));
+        }
+    }
+    Ok(out)
+}
+
+fn is_option(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::Path(p) => p.path.segments.last().is_some_and(|s| s.ident == "Option"),
+        _ => false,
+    }
 }
 
 fn unraw(i: &Ident) -> String {
@@ -335,19 +392,45 @@ fn variant_spec(v: &syn::Variant) -> syn::Result<VariantSpec> {
     })
 }
 
-fn opt_tokens(e: &Option<syn::Expr>, ty: TokenStream) -> TokenStream {
-    match e {
-        Some(e) => quote!(::std::option::Option::Some((#e) as #ty)),
+fn opt_tokens<T: quote::ToTokens>(v: Option<T>) -> TokenStream {
+    match v {
+        Some(v) => quote!(::std::option::Option::Some(#v)),
         None => quote!(::std::option::Option::None),
     }
 }
 
-fn rules_tokens(c: &syn::Path, r: &Rules) -> TokenStream {
-    let min_len = opt_tokens(&r.min_len, quote!(u64));
-    let max_len = opt_tokens(&r.max_len, quote!(u64));
-    let min = opt_tokens(&r.min, quote!(f64));
-    let max = opt_tokens(&r.max, quote!(f64));
-    quote!(#c::Rules { min_len: #min_len, max_len: #max_len, min: #min, max: #max })
+fn rules_tokens(c: &syn::Path, r: &Rules, siblings: &[FieldSpec]) -> syn::Result<TokenStream> {
+    let min_len = opt_tokens(r.min_len.map(|n| n as u64));
+    let max_len = opt_tokens(r.max_len.map(|n| n as u64));
+    let min = opt_tokens(r.min);
+    let max = opt_tokens(r.max);
+    let format = opt_tokens(r.format.map(|f| {
+        let v = format_ident!("{}", f);
+        quote!(#c::Format::#v)
+    }));
+    let same = match &r.same {
+        None => quote!(::std::option::Option::None),
+        Some((other, span)) => {
+            let wire = siblings
+                .iter()
+                .find(|f| {
+                    !f.skip && matches!(&f.member, syn::Member::Named(i) if unraw(i) == *other)
+                })
+                .map(|f| f.wire.clone())
+                .ok_or_else(|| {
+                    syn::Error::new(*span, format!("`same` names no decoded field {other:?}"))
+                })?;
+            quote!(::std::option::Option::Some(#wire))
+        }
+    };
+    Ok(quote!(#c::Rules {
+        min_len: #min_len,
+        max_len: #max_len,
+        min: #min,
+        max: #max,
+        format: #format,
+        same: #same,
+    }))
 }
 
 fn check_unique(fields: &[FieldSpec], reserved: Option<&str>) -> syn::Result<()> {
@@ -367,16 +450,16 @@ fn check_unique(fields: &[FieldSpec], reserved: Option<&str>) -> syn::Result<()>
     Ok(())
 }
 
-fn describe_fields(c: &syn::Path, fields: &[FieldSpec]) -> TokenStream {
+fn describe_fields(c: &syn::Path, fields: &[FieldSpec]) -> syn::Result<TokenStream> {
     let items = fields.iter().filter(|f| !f.skip).map(|f| {
         let (wire, doc, ty) = (&f.wire, &f.doc, &f.ty);
-        let rules = rules_tokens(c, &f.rules);
+        let rules = rules_tokens(c, &f.rules, fields)?;
         let required = if f.default {
             quote!(false)
         } else {
             quote!(<#ty as #c::Contract>::missing().is_none())
         };
-        quote! {
+        Ok(quote! {
             #c::Field {
                 name: ::std::string::String::from(#wire),
                 doc: ::std::string::String::from(#doc),
@@ -384,25 +467,27 @@ fn describe_fields(c: &syn::Path, fields: &[FieldSpec]) -> TokenStream {
                 required: #required,
                 rules: #rules,
             }
-        }
+        })
     });
-    quote!(::std::vec![#(#items),*])
+    let items = items.collect::<syn::Result<Vec<_>>>()?;
+    Ok(quote!(::std::vec![#(#items),*]))
 }
 
-fn decode_lets(c: &syn::Path, fields: &[FieldSpec]) -> TokenStream {
+fn decode_lets(c: &syn::Path, fields: &[FieldSpec]) -> syn::Result<TokenStream> {
     let lets = fields.iter().map(|f| {
         let (wire, ty, b) = (&f.wire, &f.ty, &f.binding);
         if f.skip {
-            return quote!(let #b: ::std::option::Option<#ty> = ::std::option::Option::Some(::std::default::Default::default()););
+            return Ok(quote!(let #b: ::std::option::Option<#ty> = ::std::option::Option::Some(::std::default::Default::default());));
         }
-        let rules = rules_tokens(c, &f.rules);
-        if f.default {
+        let rules = rules_tokens(c, &f.rules, fields)?;
+        Ok(if f.default {
             quote!(let #b = __cx.field_or::<#ty>(__obj, #wire, &#rules, ::std::default::Default::default);)
         } else {
             quote!(let #b = __cx.field::<#ty>(__obj, #wire, &#rules);)
-        }
+        })
     });
-    quote!(#(#lets)*)
+    let lets = lets.collect::<syn::Result<Vec<_>>>()?;
+    Ok(quote!(#(#lets)*))
 }
 
 fn construct(fields: &[FieldSpec]) -> TokenStream {
@@ -430,8 +515,8 @@ type Parts = (TokenStream, TokenStream, TokenStream, TokenStream);
 
 fn struct_parts(c: &syn::Path, fields: &[FieldSpec]) -> syn::Result<Parts> {
     check_unique(fields, None)?;
-    let describe = describe_fields(c, fields);
-    let lets = decode_lets(c, fields);
+    let describe = describe_fields(c, fields)?;
+    let lets = decode_lets(c, fields)?;
     let build = construct(fields);
     let inserts = encode_inserts(c, fields, |f| {
         let m = &f.member;
@@ -464,7 +549,7 @@ fn newtype_parts(c: &syn::Path, f: &FieldSpec) -> syn::Result<Parts> {
         ));
     }
     let ty = &f.ty;
-    let rules = rules_tokens(c, &f.rules);
+    let rules = rules_tokens(c, &f.rules, &[])?;
     Ok((
         quote!(#c::Shape::Alias(<#ty as #c::Contract>::describe(__reg))),
         quote!(__cx.checked::<#ty>(__value, &#rules).map(Self)),
@@ -546,9 +631,9 @@ fn union_parts(c: &syn::Path, tag: &str, variants: &[VariantSpec]) -> syn::Resul
             }
             VariantKind::Named(fields) => {
                 check_unique(fields, Some(tag))?;
-                let df = describe_fields(c, fields);
+                let df = describe_fields(c, fields)?;
                 describe.push(quote!(#c::Variant { name: ::std::string::String::from(#wire), doc: ::std::string::String::from(#doc), shape: #c::VariantShape::Struct(#df) }));
-                let lets = decode_lets(c, fields);
+                let lets = decode_lets(c, fields)?;
                 let build = construct(fields);
                 decode_arms
                     .push(quote!(#wire => { #lets ::std::option::Option::Some(Self::#id #build) }));

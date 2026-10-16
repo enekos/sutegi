@@ -8,12 +8,13 @@ use sutegi::prelude::*;
 #[derive(Contract, Debug, Clone, PartialEq)]
 struct Agent {
     id: AgentId,
-    #[contract(min_len = 1, max_len = 40)]
+    #[validate(min_len = 1, max_len = 40)]
     name: String,
     /// Shown under the name.
     description: Option<String>,
     approval: Approval,
-    #[contract(default, min = 1, max = 50)]
+    #[contract(default)]
+    #[validate(min = 1, max = 50)]
     max_steps: u32,
     #[contract(skip)]
     cached: Option<u8>,
@@ -72,7 +73,7 @@ struct GetAgent {
 
 #[derive(Contract, Debug)]
 struct CreateAgent {
-    #[contract(min_len = 1)]
+    #[validate(min_len = 1)]
     name: String,
     approval: Approval,
 }
@@ -130,10 +131,93 @@ fn errors_are_keyed_by_path_and_all_reported() {
     assert_eq!(errs.get("id").unwrap(), ["expected a string"]);
     assert_eq!(
         errs.get("name").unwrap(),
-        ["must have at least 1 characters"]
+        ["The name must have at least 1 character."]
     );
     assert!(errs.get("approval").unwrap()[0].contains("\"writes_only\""));
-    assert_eq!(errs.get("max_steps").unwrap(), ["must be <= 50"]);
+    assert_eq!(
+        errs.get("max_steps").unwrap(),
+        ["The max_steps must not be greater than 50."]
+    );
+}
+
+#[derive(Contract, Validate, Debug)]
+struct SignUp {
+    #[validate(required, email)]
+    email: String,
+    #[validate(required, min_len = 8)]
+    password: String,
+    #[contract(rename = "passwordConfirmation")]
+    #[validate(same = "password")]
+    password_confirmation: String,
+    #[contract(default)]
+    #[validate(alphanum, max_len = 2)]
+    handle: String,
+    #[validate(min = -3)]
+    offset: Option<i64>,
+}
+
+#[test]
+fn contract_and_validate_share_rules_and_messages() {
+    let j = Json::parse(
+        r#"{"email":"nope","password":"short","passwordConfirmation":"other","handle":"a b c","offset":-9}"#,
+    )
+    .unwrap();
+    let errs = decode::<SignUp>(&j).unwrap_err();
+    assert_eq!(
+        errs.get("email").unwrap(),
+        ["The email must be a valid email address."]
+    );
+    assert_eq!(
+        errs.get("password").unwrap(),
+        ["The password must have at least 8 characters."]
+    );
+    assert_eq!(
+        errs.get("passwordConfirmation").unwrap(),
+        ["The passwordConfirmation must match password."]
+    );
+    assert_eq!(
+        errs.get("handle").unwrap(),
+        [
+            "The handle may only contain letters and numbers.",
+            "The handle must not have more than 2 characters."
+        ]
+    );
+    assert_eq!(
+        errs.get("offset").unwrap(),
+        ["The offset must be at least -3."]
+    );
+
+    let plain = Json::parse(
+        r#"{"email":"nope","password":"short","password_confirmation":"other","handle":"a b c","offset":-9}"#,
+    )
+    .unwrap();
+    let ruleset = SignUp::rules().validate(&plain).unwrap_err();
+    for field in ["email", "password", "handle", "offset"] {
+        assert_eq!(ruleset.get(field), errs.get(field), "{field}");
+    }
+
+    let ok = Json::parse(
+        r#"{"email":"a@b.co","password":"longenough","passwordConfirmation":"longenough"}"#,
+    )
+    .unwrap();
+    let s: SignUp = decode(&ok).unwrap();
+    assert_eq!(s.handle, "");
+    assert_eq!(s.offset, None);
+}
+
+#[test]
+fn rules_reach_the_schema() {
+    let (reg, ty) = type_of::<SignUp>();
+    let schema = schema::json_schema(&reg, &ty).to_string();
+    assert!(schema.contains(r#""format":"email""#), "{schema}");
+    let Shape::Struct(fields) = &reg.def("SignUp").unwrap().shape else {
+        panic!("SignUp is a struct");
+    };
+    let confirm = fields
+        .iter()
+        .find(|f| f.name == "passwordConfirmation")
+        .unwrap();
+    assert_eq!(confirm.rules.same, Some("password"));
 }
 
 #[test]

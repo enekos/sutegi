@@ -12,6 +12,7 @@ categories = ["web-programming", "development-tools"]
 
 [dependencies]
 sutegi-json = { path = "../sutegi-json", version = "0.11.0" }
+sutegi-validate = { path = "../sutegi-validate", version = "0.11.0" }
 
 [dev-dependencies]
 sutegi-macros = { path = "../sutegi-macros", version = "0.11.0" }

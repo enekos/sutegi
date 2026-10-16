@@ -2,60 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
 use sutegi_json::Json;
+use sutegi_validate::{Rule, ValidationErrors};
 
 use crate::ty::Rules;
 use crate::Contract;
 
 const MAX_ERRORS: usize = 64;
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Errors(BTreeMap<String, Vec<String>>);
-
-impl Errors {
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    pub fn get(&self, path: &str) -> Option<&[String]> {
-        self.0.get(path).map(Vec::as_slice)
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &Vec<String>)> {
-        self.0.iter()
-    }
-
-    pub fn to_json(&self) -> Json {
-        Json::Obj(
-            self.0
-                .iter()
-                .map(|(k, v)| {
-                    (
-                        k.clone(),
-                        Json::arr(v.iter().cloned().map(Json::Str).collect()),
-                    )
-                })
-                .collect(),
-        )
-    }
-}
-
-impl std::fmt::Display for Errors {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut first = true;
-        for (path, msgs) in &self.0 {
-            for m in msgs {
-                if !first {
-                    f.write_str("; ")?;
-                }
-                first = false;
-                write!(f, "{path}: {m}")?;
-            }
-        }
-        Ok(())
-    }
-}
-
-impl std::error::Error for Errors {}
 
 #[derive(Debug)]
 enum Seg {
@@ -66,7 +18,7 @@ enum Seg {
 #[derive(Debug, Default)]
 pub struct Cx {
     path: Vec<Seg>,
-    errors: Errors,
+    errors: ValidationErrors,
     count: usize,
     lenient_all: bool,
     lenient_top: BTreeSet<String>,
@@ -131,7 +83,7 @@ impl Cx {
             return;
         }
         let path = self.path();
-        self.errors.0.entry(path).or_default().push(message.into());
+        self.errors.add(&path, message);
     }
 
     pub fn expected<T>(&mut self, what: &str) -> Option<T> {
@@ -143,15 +95,13 @@ impl Cx {
         self.count > 0
     }
 
-    pub fn finish<T>(self, value: Option<T>) -> Result<T, Errors> {
+    pub fn finish<T>(self, value: Option<T>) -> Result<T, ValidationErrors> {
         match value {
             Some(v) if self.count == 0 => Ok(v),
             _ => {
                 let mut errors = self.errors;
                 if errors.is_empty() {
-                    errors
-                        .0
-                        .insert("value".to_string(), vec!["is invalid".to_string()]);
+                    errors.add("value", "is invalid");
                 }
                 Err(errors)
             }
@@ -211,7 +161,7 @@ impl Cx {
                 Some(v) => Some(v),
                 None => cx.expected("a value: field is required"),
             },
-            Some(v) => cx.checked(v, rules),
+            Some(v) => cx.checked_in(v, rules, Some(obj)),
         })
     }
 
@@ -224,70 +174,67 @@ impl Cx {
     ) -> Option<T> {
         self.at_key(key, |cx| match obj.get(key) {
             None => Some(default()),
-            Some(v) => cx.checked(v, rules),
+            Some(v) => cx.checked_in(v, rules, Some(obj)),
         })
     }
 
     pub fn checked<T: Contract>(&mut self, value: &Json, rules: &Rules) -> Option<T> {
+        self.checked_in(value, rules, None)
+    }
+
+    fn checked_in<T: Contract>(
+        &mut self,
+        value: &Json,
+        rules: &Rules,
+        siblings: Option<&BTreeMap<String, Json>>,
+    ) -> Option<T> {
         let decoded = T::decode(value, self);
         if decoded.is_some() && !rules.is_empty() {
-            self.check_rules(value, rules);
+            self.check_rules(value, rules, siblings);
         }
         decoded
     }
 
-    fn check_rules(&mut self, value: &Json, rules: &Rules) {
-        let (len, unit) = match value {
-            Json::Str(s) => (Some(s.chars().count()), "characters"),
-            Json::Arr(a) => (Some(a.len()), "items"),
-            _ => (None, ""),
-        };
-        if let Some(len) = len {
-            let len = len as u64;
-            if let Some(min) = rules.min_len {
-                if len < min {
-                    self.error(format!("must have at least {min} {unit}"));
-                }
-            }
-            if let Some(max) = rules.max_len {
-                if len > max {
-                    self.error(format!("must have at most {max} {unit}"));
-                }
-            }
-        }
-        let num = match value {
-            Json::Num(n) => Some(*n),
-            Json::Str(s) if self.is_lenient() => s.trim().parse::<f64>().ok(),
+    fn check_rules(
+        &mut self,
+        value: &Json,
+        rules: &Rules,
+        siblings: Option<&BTreeMap<String, Json>>,
+    ) {
+        let coerced = match value {
+            Json::Str(s) if self.is_lenient() => s.trim().parse::<f64>().ok().map(Json::Num),
             _ => None,
         };
-        if let Some(n) = num {
-            if let Some(min) = rules.min {
-                if n < min {
-                    self.error(format!("must be >= {}", Json::Num(min)));
-                }
-            }
-            if let Some(max) = rules.max {
-                if n > max {
-                    self.error(format!("must be <= {}", Json::Num(max)));
-                }
+        let numeric = coerced.as_ref().unwrap_or(value);
+        let label = match self.path.last() {
+            Some(Seg::Key(k)) => k.clone(),
+            _ => "value".to_string(),
+        };
+        for rule in rules.to_validate() {
+            let subject = match rule {
+                Rule::Min(_) | Rule::Max(_) => numeric,
+                _ => value,
+            };
+            if let Some(message) = sutegi_validate::check(&label, &rule, subject, siblings) {
+                self.error(message);
             }
         }
     }
 }
 
-pub fn decode<T: Contract>(value: &Json) -> Result<T, Errors> {
+pub fn decode<T: Contract>(value: &Json) -> Result<T, ValidationErrors> {
     let mut cx = Cx::new();
     let out = T::decode(value, &mut cx);
     cx.finish(out)
 }
 
-pub fn decode_lenient<T: Contract>(value: &Json) -> Result<T, Errors> {
+pub fn decode_lenient<T: Contract>(value: &Json) -> Result<T, ValidationErrors> {
     let mut cx = Cx::lenient();
     let out = T::decode(value, &mut cx);
     cx.finish(out)
 }
 
-pub fn decode_with<T: Contract>(value: &Json, mut cx: Cx) -> Result<T, Errors> {
+pub fn decode_with<T: Contract>(value: &Json, mut cx: Cx) -> Result<T, ValidationErrors> {
     let out = T::decode(value, &mut cx);
     cx.finish(out)
 }

@@ -99,7 +99,7 @@ impl WsClient {
 
 #[derive(Contract)]
 struct JoinTable {
-    #[contract(min_len = 1)]
+    #[validate(min_len = 1)]
     viewer: String,
 }
 

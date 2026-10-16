@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use sutegi_json::Json;
 
-use crate::ty::{Field, Rules, Shape, Type, VariantShape};
+use crate::ty::{Field, Format, Rules, Shape, Type, VariantShape};
 use crate::Registry;
 
 pub fn json_schema(reg: &Registry, ty: &Type) -> Json {
@@ -176,5 +176,14 @@ fn apply_rules(m: &mut BTreeMap<String, Json>, ty: &Type, rules: &Rules) {
     }
     if let Some(n) = rules.max {
         m.insert("maximum".to_string(), Json::Num(n));
+    }
+    match rules.format {
+        Some(Format::Email) => {
+            m.insert("format".to_string(), Json::str("email"));
+        }
+        Some(Format::Url) => {
+            m.insert("format".to_string(), Json::str("uri"));
+        }
+        Some(Format::Alpha | Format::AlphaNum) | None => {}
     }
 }

@@ -7,7 +7,8 @@ use sutegi_macros::Contract;
 #[contract(crate = "::sutegi_contract")]
 struct Tree {
     label: String,
-    #[contract(default, max_len = 64)]
+    #[contract(default)]
+    #[validate(max_len = 64)]
     children: Vec<Tree>,
     weight: Option<f32>,
 }
@@ -23,7 +24,7 @@ enum Shape {
 #[derive(Contract, Debug)]
 #[contract(crate = "::sutegi_contract")]
 struct Bag {
-    #[contract(min_len = 1, max_len = 3)]
+    #[validate(min_len = 1, max_len = 3)]
     name: String,
     counts: BTreeMap<String, u16>,
     small: Vec<i8>,

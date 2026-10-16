@@ -1,4 +1,5 @@
 use sutegi_json::Json;
+use sutegi_validate::Rule;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Type {
@@ -58,12 +59,42 @@ impl Type {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Format {
+    Email,
+    Url,
+    Alpha,
+    AlphaNum,
+}
+
+impl Format {
+    pub fn name(self) -> &'static str {
+        match self {
+            Format::Email => "email",
+            Format::Url => "url",
+            Format::Alpha => "alpha",
+            Format::AlphaNum => "alphanum",
+        }
+    }
+
+    fn rule(self) -> Rule {
+        match self {
+            Format::Email => Rule::Email,
+            Format::Url => Rule::Url,
+            Format::Alpha => Rule::Alpha,
+            Format::AlphaNum => Rule::AlphaNum,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rules {
     pub min_len: Option<u64>,
     pub max_len: Option<u64>,
     pub min: Option<f64>,
     pub max: Option<f64>,
+    pub format: Option<Format>,
+    pub same: Option<&'static str>,
 }
 
 impl Rules {
@@ -72,10 +103,24 @@ impl Rules {
         max_len: None,
         min: None,
         max: None,
+        format: None,
+        same: None,
     };
 
     pub fn is_empty(&self) -> bool {
         *self == Rules::NONE
+    }
+
+    pub fn to_validate(&self) -> Vec<Rule> {
+        let len = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
+        let mut out = Vec::new();
+        out.extend(self.format.map(Format::rule));
+        out.extend(self.min_len.map(|n| Rule::MinLen(len(n))));
+        out.extend(self.max_len.map(|n| Rule::MaxLen(len(n))));
+        out.extend(self.min.map(Rule::Min));
+        out.extend(self.max.map(Rule::Max));
+        out.extend(self.same.map(|other| Rule::Same(other.to_string())));
+        out
     }
 
     pub fn to_json(&self) -> Json {
@@ -91,6 +136,12 @@ impl Rules {
         }
         if let Some(n) = self.max {
             out.push(("max", Json::Num(n)));
+        }
+        if let Some(f) = self.format {
+            out.push(("format", Json::str(f.name())));
+        }
+        if let Some(other) = self.same {
+            out.push(("same", Json::str(other)));
         }
         Json::obj(out)
     }

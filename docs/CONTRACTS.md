@@ -25,11 +25,12 @@ use sutegi::prelude::*;
 #[contract(doc = "An agent the workspace can run.")]
 struct Agent {
     id: AgentId,
-    #[contract(min_len = 1, max_len = 80)]
+    #[validate(min_len = 1, max_len = 80)]
     name: String,
     description: Option<String>,      // optional key, may be null
     approval: Approval,
-    #[contract(default, max = 50)]
+    #[contract(default)]
+    #[validate(max = 50)]
     max_steps: u32,                   // missing → Default::default()
     #[contract(skip)]
     cache: Option<Vec<u8>>,           // never on the wire
@@ -64,15 +65,23 @@ Supported field types: `bool`, every integer (range-checked, and refused beyond 
 | `doc = "…"` | type, field, variant | description in the TS JSDoc and JSON Schema (`///` doc comments work too) |
 | `default` | field | missing → `Default::default()`; optional in TS |
 | `skip` | field | not on the wire; filled with `Default::default()` |
-| `min_len`, `max_len` | field | characters for strings, items for lists |
-| `min`, `max` | field | numeric bounds |
 | `crate = "path"` | type | where the runtime lives (default `::sutegi::contract`) |
+
+Field rules live in `#[validate(...)]`, the attribute `#[derive(Validate)]` reads, and both derives check them with the same code and report the same messages, so a type can derive both and keep one set of rules:
+
+| rule | effect |
+|---|---|
+| `min_len`, `max_len` | characters for strings, items for lists |
+| `min`, `max` | numeric bounds (query strings are coerced first) |
+| `email`, `url`, `alpha`, `alphanum` | string format; at most one per field |
+| `same = "field"` | must equal another field (named by its Rust name) |
+| `required`, `str`, `integer`, `number`, `bool` | accepted for `Validate`'s sake; the Rust type already decides them. `required` on an `Option` or `default` field is a compile error |
 
 Enum variants are `snake_case` on the wire. Unknown object keys are ignored. Decoding never stops at the first problem: a `422` lists every field that failed:
 
 ```json
 { "error": "validation failed",
-  "errors": { "name": ["must have at least 1 characters"], "children[0].label": ["expected a string"] } }
+  "errors": { "name": ["The name must have at least 1 character."], "children[0].label": ["expected a string"] } }
 ```
 
 That is the same shape `Ctx::validate` and tool calls already return.

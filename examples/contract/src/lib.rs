@@ -26,7 +26,8 @@ pub struct Page<T> {
 #[derive(Contract, Debug)]
 pub struct ListNotes {
     pub tag: Option<String>,
-    #[contract(default, max = 100)]
+    #[contract(default)]
+    #[validate(max = 100)]
     pub limit: u32,
 }
 
@@ -37,18 +38,20 @@ pub struct NoteRef {
 
 #[derive(Contract, Debug)]
 pub struct NewNote {
-    #[contract(min_len = 1, max_len = 80)]
+    #[validate(min_len = 1, max_len = 80)]
     pub title: String,
     #[contract(default)]
     pub body: String,
-    #[contract(default, max_len = 8)]
+    #[contract(default)]
+    #[validate(max_len = 8)]
     pub tags: Vec<String>,
 }
 
 #[derive(Contract, Debug)]
 pub struct Summarize {
     pub id: u64,
-    #[contract(default, max = 20)]
+    #[contract(default)]
+    #[validate(max = 20)]
     pub words: u32,
 }
 
@@ -67,7 +70,7 @@ pub struct Summary {
 
 #[derive(Contract, Debug)]
 pub struct Watch {
-    #[contract(min_len = 1)]
+    #[validate(min_len = 1)]
     pub viewer: String,
 }
 
