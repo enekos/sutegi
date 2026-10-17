@@ -55,13 +55,15 @@
 //! forward while the work is still alive. Handlers that loop should also check
 //! [`JobCtx::should_stop`] so shutdown doesn't wait for them.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sutegi_json::Json;
+use sutegi_log::Value as LogValue;
 use sutegi_orm::Backend;
 use sutegi_orm::Value;
 
@@ -225,7 +227,25 @@ impl Queue {
                 Err(e) => return Err(e),
             }
         }
-        Ok(())
+        self.add_trace_column()
+    }
+
+    fn add_trace_column(&self) -> Result<(), String> {
+        if self
+            .store
+            .query("SELECT trace FROM sutegi_jobs WHERE 1 = 0", &[])
+            .is_ok()
+        {
+            return Ok(());
+        }
+        match self
+            .store
+            .execute("ALTER TABLE sutegi_jobs ADD COLUMN trace TEXT", &[])
+        {
+            Ok(_) => Ok(()),
+            Err(e) if is_already_exists(&e) || is_duplicate_column(&e) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     fn schema_sql(&self) -> Vec<String> {
@@ -249,6 +269,7 @@ impl Queue {
                  locked_at BIGINT, \
                  failed_at BIGINT, \
                  last_error TEXT, \
+                 trace TEXT, \
                  created_at BIGINT NOT NULL DEFAULT 0)"
             ),
             // The claim's exact access path: one queue, live rows only, best
@@ -313,7 +334,7 @@ impl Queue {
 
     fn enqueue(&self, d: &Dispatch) -> Result<i64, String> {
         let now = now_ms();
-        let cols: Vec<(&str, Value)> = vec![
+        let mut cols: Vec<(&str, Value)> = vec![
             ("queue", Value::Text(d.on.clone())),
             ("name", Value::Text(d.name.clone())),
             ("payload", Value::Text(d.payload.to_string())),
@@ -329,6 +350,9 @@ impl Queue {
             ("run_at", Value::Int(now + d.delay.as_millis() as i64)),
             ("created_at", Value::Int(now)),
         ];
+        if let Some(trace) = current_trace() {
+            cols.push(("trace", Value::Text(trace)));
+        }
         match self.store.insert("sutegi_jobs", &cols, "id") {
             Ok(id) => {
                 self.notify();
@@ -389,6 +413,18 @@ impl Queue {
             return Ok(false);
         };
         let payload = Json::parse(&job.payload).unwrap_or(Json::Null);
+        let inherited = trace_fields(job.trace.as_deref());
+        let fields: Vec<(&str, LogValue)> = inherited
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.clone()))
+            .chain([
+                ("job", LogValue::Str(Cow::Borrowed(job.name.as_str()))),
+                ("job_id", LogValue::Int(job.id)),
+                ("attempt", LogValue::Int(job.attempts)),
+            ])
+            .collect();
+        let _scope = sutegi_log::scope(&fields);
+        let started = Instant::now();
         let result = match self.handlers.get(&job.name) {
             Some(handler) => {
                 let ctx = JobCtx {
@@ -411,6 +447,26 @@ impl Queue {
             }
             None => Err(format!("no handler registered for job '{}'", job.name)),
         };
+        let ms = started.elapsed().as_millis();
+        match &result {
+            Ok(()) => sutegi_log::debug!("queue", "job done", queue = queue, ms = ms),
+            Err(e) if job.attempts >= job.max_attempts => sutegi_log::error!(
+                "queue",
+                "job failed terminally",
+                queue = queue,
+                ms = ms,
+                max_attempts = job.max_attempts,
+                error = e
+            ),
+            Err(e) => sutegi_log::warn!(
+                "queue",
+                "job failed, will retry",
+                queue = queue,
+                ms = ms,
+                max_attempts = job.max_attempts,
+                error = e
+            ),
+        }
         self.settle(&job, result)?;
         Ok(true)
     }
@@ -434,7 +490,7 @@ impl Queue {
                          WHERE failed_at IS NULL AND queue = ? AND run_at <= ? \
                            AND (locked_at IS NULL OR locked_at < ?) \
                          ORDER BY priority DESC, run_at, id LIMIT 1{skip}) \
-             RETURNING id, name, payload, attempts, max_attempts"
+             RETURNING id, name, payload, attempts, max_attempts, trace"
         );
         let rows = self.store.query(
             &sql,
@@ -461,6 +517,7 @@ impl Queue {
             payload: text("payload"),
             attempts: int("attempts", 1),
             max_attempts: int("max_attempts", 1),
+            trace: row.get("trace").and_then(Json::as_str).map(str::to_string),
         }))
     }
 
@@ -475,19 +532,14 @@ impl Queue {
                     &[Value::Int(job.id)],
                 )
                 .map(|_| ()),
-            Err(err) if job.attempts >= job.max_attempts => {
-                eprintln!(
-                    "[queue] job '{}' #{} failed terminally: {err}",
-                    job.name, job.id
-                );
-                self.store
-                    .execute(
-                        "UPDATE sutegi_jobs SET failed_at = ?, locked_at = NULL, \
+            Err(err) if job.attempts >= job.max_attempts => self
+                .store
+                .execute(
+                    "UPDATE sutegi_jobs SET failed_at = ?, locked_at = NULL, \
                          last_error = ? WHERE id = ?",
-                        &[Value::Int(now_ms()), Value::Text(err), Value::Int(job.id)],
-                    )
-                    .map(|_| ())
-            }
+                    &[Value::Int(now_ms()), Value::Text(err), Value::Int(job.id)],
+                )
+                .map(|_| ()),
             Err(err) => {
                 let backoff = self.retry_backoff.as_millis() as i64 * job.attempts.max(1);
                 self.store
@@ -527,7 +579,12 @@ impl Queue {
                         Ok(true) => continue, // keep draining while there's work
                         Ok(false) => q.wait_for_work(),
                         Err(e) => {
-                            eprintln!("[queue] worker error: {e}");
+                            sutegi_log::error!(
+                                "queue",
+                                "worker error",
+                                queue = queue_name,
+                                error = e
+                            );
                             thread::sleep(q.poll_interval);
                         }
                     }
@@ -689,6 +746,52 @@ struct Claimed {
     payload: String,
     attempts: i64,
     max_attempts: i64,
+    trace: Option<String>,
+}
+
+const MAX_TRACE_BYTES: usize = 2048;
+
+fn current_trace() -> Option<String> {
+    let fields = sutegi_log::context();
+    if fields.is_empty() {
+        return None;
+    }
+    let pairs: Vec<(&str, Json)> = fields
+        .iter()
+        .map(|(k, v)| (k.as_str(), log_value_to_json(v)))
+        .collect();
+    let trace = Json::obj(pairs).to_string();
+    (trace.len() <= MAX_TRACE_BYTES).then_some(trace)
+}
+
+fn log_value_to_json(value: &LogValue<'_>) -> Json {
+    match value {
+        LogValue::Null => Json::Null,
+        LogValue::Bool(b) => Json::Bool(*b),
+        LogValue::Int(i) => Json::int(*i),
+        LogValue::Uint(u) => i64::try_from(*u).map_or_else(|_| Json::str(u.to_string()), Json::int),
+        LogValue::Float(f) => Json::num(*f),
+        LogValue::Str(s) => Json::str(s.as_ref()),
+    }
+}
+
+fn trace_fields(trace: Option<&str>) -> Vec<(String, LogValue<'static>)> {
+    let Some(Json::Obj(map)) = trace.and_then(|t| Json::parse(t).ok()) else {
+        return Vec::new();
+    };
+    map.into_iter()
+        .filter_map(|(k, v)| {
+            let value = match v {
+                Json::Null => LogValue::Null,
+                Json::Bool(b) => LogValue::Bool(b),
+                Json::Num(n) if n.fract() == 0.0 && n.abs() < 9.0e15 => LogValue::Int(n as i64),
+                Json::Num(n) => LogValue::Float(n),
+                Json::Str(s) => LogValue::Str(Cow::Owned(s)),
+                Json::Arr(_) | Json::Obj(_) => return None,
+            };
+            Some((k, value))
+        })
+        .collect()
 }
 
 /// A running set of queue workers. Dropping it (or calling
@@ -728,6 +831,10 @@ impl Drop for Workers {
 fn is_already_exists(e: &str) -> bool {
     let e = e.to_ascii_lowercase();
     e.contains("already exists") || e.contains("23505") || e.contains("duplicate key")
+}
+
+fn is_duplicate_column(e: &str) -> bool {
+    e.to_ascii_lowercase().contains("duplicate column")
 }
 
 /// A unique-index violation, in either dialect.

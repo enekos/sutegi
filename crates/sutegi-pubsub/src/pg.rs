@@ -136,7 +136,12 @@ impl Broker for PgPubSub {
 
     fn publish(&self, topic: &str, message: &str) {
         if let Err(e) = self.try_publish(topic, message) {
-            eprintln!("sutegi-pubsub: cross-pod publish to {topic:?} failed: {e}");
+            sutegi_log::error!(
+                "pubsub",
+                "cross-pod publish failed",
+                topic = topic,
+                error = e
+            );
         }
     }
 }
@@ -179,9 +184,10 @@ impl Inner {
     /// own echoes and anything that isn't a well-formed envelope.
     fn dispatch(&self, payload: &str) {
         let Some((instance, topic, message)) = decode_envelope(payload) else {
-            eprintln!(
-                "sutegi-pubsub: ignoring malformed envelope on {:?}",
-                self.channel
+            sutegi_log::warn!(
+                "pubsub",
+                "ignoring malformed envelope",
+                channel = self.channel
             );
             return;
         };
@@ -205,9 +211,11 @@ fn listener_loop(inner: Arc<Inner>, mut listener: Listener) {
             }
             Err(_) if inner.shutdown.load(Ordering::Acquire) => return,
             Err(e) => {
-                eprintln!(
-                    "sutegi-pubsub: listener connection lost ({e}); reconnecting \
-                     (messages published meanwhile are missed)"
+                sutegi_log::warn!(
+                    "pubsub",
+                    "listener connection lost; reconnecting, messages published meanwhile are missed",
+                    channel = inner.channel,
+                    error = %e
                 );
                 listener = loop {
                     thread::sleep(backoff);
@@ -217,7 +225,13 @@ fn listener_loop(inner: Arc<Inner>, mut listener: Listener) {
                     backoff = (backoff * 2).min(BACKOFF_CEIL);
                     match reconnect(&inner) {
                         Ok(l) => break l,
-                        Err(e) => eprintln!("sutegi-pubsub: reconnect failed: {e}"),
+                        Err(e) => sutegi_log::warn!(
+                            "pubsub",
+                            "reconnect failed",
+                            channel = inner.channel,
+                            retry_ms = backoff.as_millis(),
+                            error = %e
+                        ),
                     }
                 };
             }

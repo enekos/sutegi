@@ -12,6 +12,7 @@ description = "Router, App builder, middleware, extractors, and runtime introspe
 sutegi-crypto = { path = "../sutegi-crypto", version = "0.11.0" }
 sutegi-http = { path = "../sutegi-http", version = "0.11.0" }
 sutegi-json = { path = "../sutegi-json", version = "0.11.0" }
+sutegi-log = { path = "../sutegi-log", version = "0.11.0" }
 # Optional pillars — pulled in only by their feature, so the zero-dep core
 # (crypto + json + http + web, no features) is unaffected. They power the ergonomic
 # `Ctx` helpers (`db`/`model`/`validate`/`validated`) and tool-arg validation.

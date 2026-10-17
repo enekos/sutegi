@@ -470,3 +470,116 @@ fn sqlite_claims_are_process_scoped_and_say_so() {
         "SQLite relies on serialized writers, not SKIP LOCKED — the capability must not overclaim"
     );
 }
+
+#[test]
+fn a_job_logs_under_the_context_it_was_dispatched_from() {
+    let (_tmp, db, mut q) = queue("trace");
+    q.register("mail", |_job| {
+        sutegi_log::info!("app", "sending");
+        Ok(())
+    });
+    {
+        let _request = sutegi_log::scope(&[
+            ("rid", sutegi_log::Value::Str("req-42".into())),
+            ("ws", sutegi_log::Value::Int(9)),
+        ]);
+        q.dispatch("mail", Json::Null).expect("dispatch");
+    }
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) AS n FROM sutegi_jobs WHERE trace IS NOT NULL"
+        ),
+        1
+    );
+
+    let (ran, records) = sutegi_log::capture(|| q.run_once().expect("run"));
+    assert!(ran);
+    let sending = records
+        .iter()
+        .find(|r| r.msg == "sending")
+        .expect("the handler logged");
+    assert_eq!(
+        sending.field("rid").and_then(|v| v.as_str()),
+        Some("req-42")
+    );
+    assert_eq!(sending.field("ws"), Some(&sutegi_log::Value::Int(9)));
+    assert_eq!(sending.field("job").and_then(|v| v.as_str()), Some("mail"));
+    assert_eq!(sending.field("attempt"), Some(&sutegi_log::Value::Int(1)));
+    let done = records
+        .iter()
+        .find(|r| r.msg == "job done")
+        .expect("the outcome is logged");
+    assert_eq!(done.field("rid").and_then(|v| v.as_str()), Some("req-42"));
+    assert!(sutegi_log::get("rid").is_none());
+}
+
+#[test]
+fn a_failed_attempt_is_logged_before_it_retries() {
+    let (_tmp, _db, mut q) = queue("trace-retry");
+    q.register("flaky", |_job| Err("upstream 503".into()));
+    q.job("flaky", Json::Null)
+        .max_attempts(2)
+        .dispatch()
+        .expect("dispatch");
+    let (_, records) = sutegi_log::capture(|| q.run_once().expect("run"));
+    let failed = records
+        .iter()
+        .find(|r| r.target == "queue")
+        .expect("the failure is logged");
+    assert_eq!(failed.level, sutegi_log::Level::Warn);
+    assert_eq!(
+        failed.field("error").and_then(|v| v.as_str()),
+        Some("upstream 503")
+    );
+}
+
+#[test]
+fn a_dispatch_outside_any_context_stores_no_trace() {
+    let (_tmp, db, q) = queue("trace-none");
+    q.dispatch("x", Json::Null).expect("dispatch");
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) AS n FROM sutegi_jobs WHERE trace IS NULL"
+        ),
+        1
+    );
+}
+
+#[test]
+fn migrate_adds_the_trace_column_to_a_table_created_before_it() {
+    let tmp = TempDb::new("trace-upgrade");
+    let db = tmp.open();
+    db.execute(
+        "CREATE TABLE sutegi_jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+         queue TEXT NOT NULL DEFAULT 'default', name TEXT NOT NULL, payload TEXT NOT NULL, \
+         priority INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, \
+         max_attempts INTEGER NOT NULL DEFAULT 1, unique_key TEXT, \
+         run_at BIGINT NOT NULL DEFAULT 0, locked_at BIGINT, failed_at BIGINT, \
+         last_error TEXT, created_at BIGINT NOT NULL DEFAULT 0)",
+        &[],
+    )
+    .expect("old schema");
+    db.execute(
+        "INSERT INTO sutegi_jobs (name, payload) VALUES ('old', 'null')",
+        &[],
+    )
+    .expect("queued before the upgrade");
+
+    let mut q = Queue::new(db.clone());
+    q.migrate().expect("migrate upgrades");
+    q.migrate().expect("and stays idempotent");
+    let ran = Arc::new(AtomicU32::new(0));
+    let seen = Arc::clone(&ran);
+    q.register("old", move |_job| {
+        seen.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    });
+    assert!(q.run_once().expect("the old row still runs"));
+    assert_eq!(ran.load(Ordering::Relaxed), 1);
+
+    let _s = sutegi_log::scope(&[("rid", sutegi_log::Value::Str("r".into()))]);
+    q.dispatch("old", Json::Null)
+        .expect("new rows carry a trace");
+}

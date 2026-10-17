@@ -117,7 +117,12 @@ impl IntoResponse for Error {
         // rendered `self.message` unconditionally. Log it where the operator
         // can see it and answer with the one thing a client can do about it.
         if self.status >= 500 {
-            eprintln!("  ! {}: {}", self.status, self.message);
+            sutegi_log::error!(
+                "http",
+                "request failed",
+                status = self.status,
+                error = self.message
+            );
             return json(
                 self.status,
                 &Json::obj(vec![("error", Json::str("internal error"))]),

@@ -549,7 +549,7 @@ impl Shard {
             if let Err(e) = self.poller.wait(&mut events, timeout) {
                 // A failing poller is unrecoverable for this shard; don't
                 // spin at 100% CPU on a persistent error.
-                eprintln!("sutegi-ws: poller error: {e}");
+                sutegi_log::error!("ws", "poller error", error = %e);
                 thread::sleep(Duration::from_millis(100));
                 continue;
             }

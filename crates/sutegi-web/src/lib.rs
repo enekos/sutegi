@@ -16,7 +16,9 @@ use std::time::Duration;
 pub use sutegi_http::{Body, Limits, Method, Request, Response, SseSink, StreamSink};
 use sutegi_json::Json;
 
+mod access;
 mod files;
+pub use access::{AccessLog, REQUEST_ID_HEADER};
 mod respond;
 pub use respond::{Error, IntoResponse};
 
@@ -382,6 +384,7 @@ pub struct App {
     workers: usize,
     readiness: Option<Box<dyn Fn() -> bool + Send + Sync + 'static>>,
     after: Vec<AfterMiddleware>,
+    access_log: Option<AccessLog>,
     limits: Limits,
     #[cfg(feature = "ws")]
     ws_config: sutegi_ws::WsConfig,
@@ -455,6 +458,7 @@ impl App {
             workers: 8,
             readiness: None,
             after: Vec::new(),
+            access_log: None,
             limits: Limits::default(),
             #[cfg(feature = "ws")]
             ws_config: sutegi_ws::WsConfig::default(),
@@ -498,6 +502,11 @@ impl App {
         transform: impl Fn(&Request, Response) -> Response + Send + Sync + 'static,
     ) -> App {
         self.after.push(Box::new(transform));
+        self
+    }
+
+    pub fn access_log(mut self, log: AccessLog) -> App {
+        self.access_log = Some(log);
         self
     }
 
@@ -879,8 +888,10 @@ impl App {
         let listeners = std::mem::take(&mut self.listeners);
         let routes = Arc::new(self.routes);
         let middleware = Arc::new(self.middleware);
-        let ops_guard = Arc::new(self.ops_guard);
         let after = Arc::new(self.after);
+        let access_log = Arc::new(self.access_log);
+        let logs_exposed = self.ops_guard.is_some();
+        let ops_guard = Arc::new(self.ops_guard);
         let readiness = Arc::new(self.readiness);
         let state = Arc::new(self.state);
         let listener_state = Arc::clone(&state);
@@ -889,6 +900,7 @@ impl App {
 
         let service = move |req: Request| -> Response {
             metrics.in_flight.fetch_add(1, Ordering::Relaxed);
+            let flight = access_log.as_ref().as_ref().map(|log| log.begin(&req));
 
             // Inner closure so we can post-process (record metrics) on every path.
             let resp = (|| {
@@ -949,9 +961,14 @@ impl App {
                 // guard and the global middleware chain above.
                 match req.path.as_str() {
                     "/__metrics" => {
+                        let mut body = metrics.prometheus();
+                        body.push_str(&access::log_metrics());
                         return Response::new(200)
                             .with_header("content-type", "text/plain; version=0.0.4")
-                            .with_body(metrics.prometheus().into_bytes());
+                            .with_body(body.into_bytes());
+                    }
+                    "/__logs" if logs_exposed => {
+                        return json(200, &access::recent_logs(&req));
                     }
                     "/__introspect" => return json(200, &introspect),
                     _ => {}
@@ -981,6 +998,10 @@ impl App {
 
             // After-middleware: transform the outgoing response (CORS, etc.).
             let resp = after.iter().fold(resp, |r, hook| hook(&req, r));
+            let resp = match (flight, access_log.as_ref()) {
+                (Some(flight), Some(log)) => log.finish(flight, &req, resp),
+                _ => resp,
+            };
 
             metrics.record(resp.status);
             metrics.in_flight.fetch_sub(1, Ordering::Relaxed);
@@ -1123,7 +1144,11 @@ fn spawn_listeners(
                     let name = ctx.name.clone();
                     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(ctx))).is_err()
                     {
-                        eprintln!("sutegi: listener '{name}' panicked and stopped");
+                        sutegi_log::error!(
+                            "sutegi.listener",
+                            "listener panicked and stopped",
+                            listener = name
+                        );
                     }
                 })
                 .expect("sutegi: failed to spawn listener thread")
@@ -1414,7 +1439,12 @@ pub fn no_content() -> Response {
 /// A pre-middleware that logs `METHOD /path` for each request and continues.
 pub fn logger() -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static {
     |req: &Request| {
-        println!("[{}] {}", req.method.as_str(), req.path);
+        sutegi_log::info!(
+            "http",
+            "request",
+            method = req.method.as_str(),
+            path = req.path
+        );
         None
     }
 }
@@ -2077,6 +2107,128 @@ mod tests {
             .collect();
         assert!(patterns.contains(&"/api/users"));
         assert!(patterns.contains(&"/api/users/:id"));
+    }
+
+    fn header_of(resp: &Response, name: &str) -> Option<String> {
+        resp.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    }
+
+    fn full_body(resp: Response) -> String {
+        match resp.body {
+            Body::Full(bytes) => String::from_utf8(bytes).unwrap(),
+            _ => panic!("expected a full body"),
+        }
+    }
+
+    #[test]
+    fn access_log_tags_every_line_of_a_request_with_one_id() {
+        let app = App::new("t")
+            .get("/work", "work", |_c| {
+                sutegi_log::info!("app", "working");
+                text(200, "ok")
+            })
+            .get("/boom", "boom", |_c| Error::internal("db down"))
+            .access_log(AccessLog::new());
+        let svc = app.service();
+        let (resp, records) = sutegi_log::capture(|| {
+            svc(Request {
+                path: "/work".into(),
+                ..req(Method::Get, b"")
+            })
+        });
+        let rid = header_of(&resp, REQUEST_ID_HEADER).expect("rid stamped");
+        assert_eq!(records.len(), 2);
+        assert!(records
+            .iter()
+            .all(|r| r.field("rid").map(|v| v.to_string()) == Some(rid.clone())));
+        let access = &records[1];
+        assert_eq!(
+            (access.target.as_str(), access.msg.as_str()),
+            ("http", "request")
+        );
+        assert_eq!(access.level, sutegi_log::Level::Info);
+        assert_eq!(access.field("status"), Some(&sutegi_log::Value::Uint(200)));
+        assert_eq!(access.field("ip").and_then(|v| v.as_str()), Some("9.9.9.9"));
+
+        let (resp, records) = sutegi_log::capture(|| {
+            let mut r = Request {
+                path: "/boom".into(),
+                ..req(Method::Get, b"")
+            };
+            r.headers.push(("x-request-id".into(), "edge-7".into()));
+            svc(r)
+        });
+        assert_eq!(
+            header_of(&resp, REQUEST_ID_HEADER).as_deref(),
+            Some("edge-7")
+        );
+        let failed = records
+            .iter()
+            .find(|r| r.msg == "request failed")
+            .expect("the 5xx cause is logged");
+        assert_eq!(failed.field("rid").and_then(|v| v.as_str()), Some("edge-7"));
+        assert_eq!(
+            failed.field("error").and_then(|v| v.as_str()),
+            Some("db down")
+        );
+        assert_eq!(
+            records.last().map(|r| r.level),
+            Some(sutegi_log::Level::Error)
+        );
+        assert!(sutegi_log::get("rid").is_none());
+    }
+
+    #[test]
+    fn access_log_keeps_probes_at_debug() {
+        let svc = App::new("t").access_log(AccessLog::new()).service();
+        let (_, records) = sutegi_log::capture(|| {
+            svc(Request {
+                path: "/__health".into(),
+                ..req(Method::Get, b"")
+            })
+        });
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].level, sutegi_log::Level::Debug);
+    }
+
+    #[test]
+    fn recent_logs_are_served_only_behind_an_ops_guard() {
+        let open = App::new("t").service();
+        let get = |svc: &dyn Fn(Request) -> Response, path: &str, query: &str| {
+            svc(Request {
+                path: path.into(),
+                query: query.into(),
+                ..req(Method::Get, b"")
+            })
+        };
+        assert_eq!(get(&open, "/__logs", "").status, 404);
+
+        let guarded = App::new("t")
+            .get("/x", "x", |_c| {
+                sutegi_log::warn!("app", "marker", marker = "logs-endpoint-test");
+                text(200, "ok")
+            })
+            .ops_guard(|_req| None)
+            .service();
+        let rid = "logs-endpoint-rid";
+        let _scope = sutegi_log::scope(&[("rid", sutegi_log::Value::Str(rid.into()))]);
+        get(&guarded, "/x", "");
+        let resp = get(&guarded, "/__logs", &format!("level=warn&rid={rid}"));
+        assert_eq!(resp.status, 200);
+        let body = Json::parse(&full_body(resp)).unwrap();
+        let lines = body.as_array().expect("an array of records");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0].get("marker").and_then(Json::as_str),
+            Some("logs-endpoint-test")
+        );
+
+        let metrics = get(&guarded, "/__metrics", "");
+        let text = full_body(metrics);
+        assert!(text.contains("sutegi_log_events_total{level=\"warn\"}"));
     }
 
     #[test]

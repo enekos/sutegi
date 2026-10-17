@@ -1,0 +1,11 @@
+[package]
+name = "sutegi-log"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Structured, context-carrying logging for sutegi: levels, per-target filters, JSON or text lines, request/job scopes."
+
+[dependencies]

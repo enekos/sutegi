@@ -206,7 +206,12 @@ impl<B: Transactional> Projections<B> {
                         }
                         Ok(_) => continue, // keep draining while behind
                         Err(e) => {
-                            eprintln!("[events] projection '{name}': {e}");
+                            sutegi_log::error!(
+                                "events",
+                                "projection failed",
+                                projection = name,
+                                error = e
+                            );
                             let (lock, cvar) = &*projections.wakeup;
                             let guard = lock.lock().unwrap();
                             let _ = cvar.wait_timeout(guard, projections.poll_interval).unwrap();
