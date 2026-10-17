@@ -13,6 +13,7 @@ categories = ["database", "web-programming"]
 [dependencies]
 sutegi-crypto = { path = "../sutegi-crypto", version = "0.11.0" }
 sutegi-json = { path = "../sutegi-json", version = "0.11.0" }
+sutegi-log = { path = "../sutegi-log", version = "0.11.0" }
 sutegi-orm = { path = "../sutegi-orm", version = "0.11.0" }
 
 [dev-dependencies]
