@@ -177,6 +177,14 @@ impl HttpTransport for PlainHttp {
                  or your own HttpTransport for TLS"
             ));
         }
+        let mut head = format!("{} {path} HTTP/1.1\r\n", req.method);
+        for (k, v) in &req.headers {
+            check_header(k, v)?;
+            head.push_str(&format!("{k}: {v}\r\n"));
+        }
+        head.push_str(&format!("content-length: {}\r\n", req.body.len()));
+        head.push_str("connection: close\r\n\r\n");
+
         let host_port = if authority.contains(':') {
             authority.to_string()
         } else {
@@ -203,14 +211,6 @@ impl HttpTransport for PlainHttp {
             .and_then(|()| stream.set_write_timeout(Some(self.io_timeout)))
             .map_err(|e| format!("set timeouts: {e}"))?;
         let _ = stream.set_nodelay(true);
-
-        let mut head = format!("{} {path} HTTP/1.1\r\n", req.method);
-        for (k, v) in &req.headers {
-            check_header(k, v)?;
-            head.push_str(&format!("{k}: {v}\r\n"));
-        }
-        head.push_str(&format!("content-length: {}\r\n", req.body.len()));
-        head.push_str("connection: close\r\n\r\n");
 
         stream
             .write_all(head.as_bytes())
