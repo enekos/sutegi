@@ -307,6 +307,11 @@ pub struct Limits {
     /// Maximum number of requests served over one connection before the
     /// server closes it (resource-pinning bound). Default 100.
     pub keep_alive_max: usize,
+    /// Accepted connections allowed to wait for a free worker. When the
+    /// queue is full the accept loop blocks, so excess clients wait in the
+    /// kernel's listen backlog instead of in this process's memory.
+    /// Default 1024.
+    pub max_pending: usize,
 }
 
 impl Default for Limits {
@@ -318,6 +323,7 @@ impl Default for Limits {
             header_timeout: Duration::from_secs(15),
             keep_alive_idle: Duration::from_secs(5),
             keep_alive_max: 100,
+            max_pending: DEFAULT_MAX_PENDING,
         }
     }
 }
@@ -762,7 +768,7 @@ where
 {
     let listener = TcpListener::bind(addr)?;
     let handler = Arc::new(handler);
-    let pool = ThreadPool::new(workers.max(1));
+    let pool = ThreadPool::with_queue(workers.max(1), limits.max_pending);
 
     for stream in listener.incoming() {
         let stream = match stream {
@@ -797,7 +803,7 @@ where
     let listener = TcpListener::bind(addr)?;
     listener.set_nonblocking(true)?;
     let handler = Arc::new(handler);
-    let pool = ThreadPool::new(workers.max(1));
+    let pool = ThreadPool::with_queue(workers.max(1), limits.max_pending);
 
     // Non-blocking accept so the shutdown flag is honored, with an adaptive
     // backoff: hot accepts poll at 250µs (sub-ms accept latency under load),
@@ -939,26 +945,44 @@ where
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
-/// A fixed-size pool of worker threads pulling jobs off a shared channel.
+const DEFAULT_MAX_PENDING: usize = 1024;
+
+/// A fixed-size pool of worker threads pulling jobs off a bounded queue.
 pub struct ThreadPool {
-    sender: Option<mpsc::Sender<Job>>,
+    sender: Option<mpsc::SyncSender<Job>>,
     workers: Vec<thread::JoinHandle<()>>,
 }
 
 impl ThreadPool {
+    /// `size` workers over a queue of the default depth (1024).
     pub fn new(size: usize) -> ThreadPool {
-        let (sender, receiver) = mpsc::channel::<Job>();
+        ThreadPool::with_queue(size, DEFAULT_MAX_PENDING)
+    }
+
+    /// `size` workers; [`execute`](ThreadPool::execute) blocks once
+    /// `max_pending` jobs are waiting for one.
+    pub fn with_queue(size: usize, max_pending: usize) -> ThreadPool {
+        let (sender, receiver) = mpsc::sync_channel::<Job>(max_pending);
         let receiver = Arc::new(Mutex::new(receiver));
         let mut workers = Vec::with_capacity(size);
-        for _ in 0..size {
+        for i in 0..size {
             let receiver = Arc::clone(&receiver);
-            workers.push(thread::spawn(move || loop {
-                let job = receiver.lock().unwrap().recv();
-                match job {
-                    Ok(job) => job(),
-                    Err(_) => break, // channel closed: shut down
-                }
-            }));
+            let worker = thread::Builder::new()
+                .name(format!("sutegi-http-{i}"))
+                .spawn(move || loop {
+                    let job = receiver
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .recv();
+                    match job {
+                        Ok(job) => {
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                        }
+                        Err(_) => break,
+                    }
+                })
+                .expect("spawn http worker thread");
+            workers.push(worker);
         }
         ThreadPool {
             sender: Some(sender),
@@ -966,6 +990,7 @@ impl ThreadPool {
         }
     }
 
+    /// Queue `f` for a worker, blocking while the queue is full.
     pub fn execute<F>(&self, f: F)
     where
         F: FnOnce() + Send + 'static,
@@ -1351,6 +1376,48 @@ mod tests {
             // Dropping the pool joins all workers, so every job has run.
         }
         assert_eq!(count.load(Ordering::Relaxed), 30);
+    }
+
+    #[test]
+    fn thread_pool_survives_a_panicking_job() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let count = Arc::new(AtomicU32::new(0));
+        {
+            let pool = ThreadPool::new(1);
+            pool.execute(|| panic!("job blew up"));
+            let c = Arc::clone(&count);
+            pool.execute(move || {
+                c.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn thread_pool_queue_is_bounded() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let pool = Arc::new(ThreadPool::with_queue(1, 1));
+        pool.execute(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        started_rx.recv().unwrap();
+        pool.execute(|| {});
+
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let p = Arc::clone(&pool);
+        let producer = thread::spawn(move || {
+            p.execute(|| {});
+            done_tx.send(()).unwrap();
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "execute must block while the queue is full"
+        );
+        release_tx.send(()).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        producer.join().unwrap();
     }
 
     // ---- security regressions -------------------------------------------

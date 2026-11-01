@@ -32,6 +32,7 @@ mod protocol;
 pub use listen::{Listener, ListenerShutdown, Notification};
 pub use pool::Pool;
 
+use std::fmt;
 use std::time::Duration;
 
 /// A scalar bound to a query parameter (sent in PostgreSQL's text format).
@@ -52,7 +53,7 @@ pub enum PgValue {
 
 /// Connection settings. Build from a URL ([`Config::from_url`]), the
 /// environment ([`Config::from_env`]), or field by field.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
     pub host: String,
     pub port: u16,
@@ -64,6 +65,20 @@ pub struct Config {
     /// Reuse server-side prepared statements per connection (the default).
     /// Set `false` to force every query through an unnamed statement.
     pub statement_cache: bool,
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("dbname", &self.dbname)
+            .field("timeout", &self.timeout)
+            .field("statement_cache", &self.statement_cache)
+            .finish()
+    }
 }
 
 impl Default for Config {
@@ -179,3 +194,17 @@ fn percent_decode(s: &str) -> String {
 }
 
 pub use protocol::Client;
+
+#[cfg(test)]
+mod config_tests {
+    use super::Config;
+
+    #[test]
+    fn debug_does_not_leak_the_password() {
+        let cfg = Config::from_url("postgres://app:top-secret@db:5432/prod").unwrap();
+        let printed = format!("{cfg:?}");
+        assert!(!printed.contains("top-secret"), "{printed}");
+        assert!(printed.contains("<redacted>"), "{printed}");
+        assert!(printed.contains("\"app\""), "{printed}");
+    }
+}

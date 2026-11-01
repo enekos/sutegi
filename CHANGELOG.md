@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Release builds unwind again.** The workspace profile set `panic = "abort"`, which turned every `catch_unwind` the framework relies on — handler 500s, queue job failures, ws callbacks, actor supervision — into a process exit in the shipped example binaries. The profile now keeps the default, and the docs that recommended `abort` say to keep `unwind`. Cost, measured: `hello` 437 → 487 KB, `todo` 1.53 → 1.63 MB.
+- HTTP: **the worker pool's queue is bounded** (`Limits::max_pending`, default 1024). An accept loop that outran its workers used to buffer connections without limit. It now blocks, and excess clients wait in the kernel's listen backlog. `ThreadPool::with_queue` sets the depth; a job that panics no longer takes its worker thread with it. Worker threads are named `sutegi-http-N`.
+- Postgres: **`Config`'s `Debug` no longer prints the password.**
+- Storage: `PlainHttp` validates headers before it resolves or connects, so a rejected `content_type` never opens a socket.
+- ws: the kqueue/epoll poller and wake pipe hold `OwnedFd`s instead of raw fds closed by hand, and every `unsafe` block states why it is sound.
+
+### Changed
+
+- The workspace denies `unsafe_code`, `unsafe_op_in_unsafe_fn`, undocumented unsafe blocks and multi-op unsafe blocks. Only `sutegi-ws`'s poller, `sutegi-web`'s `graceful` signal handler and the `ws-load` example opt back in, each at module or function scope.
+
 ### Added
 
 - **`sutegi::log` — one structured log for the framework and the app** (new crate `sutegi-log`, std only). Until now sutegi had no logging: `logger()` printed `[GET] /path` to stdout, and about a dozen framework paths (`[queue]`, `sutegi-pubsub:`, `  ! 500:`, `sutegi: listener …`) each wrote their own `eprintln!` shape, so an app with a JSON log ended up with a stream of mixed formats where the framework's own failures carried no request id. Now every event is one line on stderr — JSON off a terminal, aligned text on one — with typed values (`"ms":812`, not `"ms":"812"`), `%` for `Display` values, a 4 KiB clip per value, and redaction of any field named like a secret (`…password`, `…token`, `…secret`, `authorization`, `cookie`, `…api_key`). Levels are filtered per target with `SUTEGI_LOG=info,queue=debug,http=warn`; `SUTEGI_LOG_FORMAT` picks the format. `log::init` also routes panics through the log. `log::capture` collects a thread's events for tests. See `docs/LOGGING.md`.

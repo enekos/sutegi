@@ -1238,6 +1238,7 @@ fn tool_stream(defs: &Arc<Vec<ToolDef>>, c: &Ctx) -> Response {
 
 /// SIGTERM/SIGINT handling for graceful shutdown (only with the `graceful` feature).
 #[cfg(feature = "graceful")]
+#[allow(unsafe_code)]
 mod signal {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, OnceLock};
@@ -1253,12 +1254,12 @@ mod signal {
 
     pub fn install(flag: Arc<AtomicBool>) {
         let _ = FLAG.set(flag);
-        // SAFETY: registering a handler that only does an atomic store.
         let handler = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
-        unsafe {
-            libc::signal(libc::SIGTERM, handler);
-            libc::signal(libc::SIGINT, handler);
-        }
+        // SAFETY: `on_signal` is async-signal-safe: it only reads an
+        // already-initialised OnceLock and does an atomic store.
+        unsafe { libc::signal(libc::SIGTERM, handler) };
+        // SAFETY: as above.
+        unsafe { libc::signal(libc::SIGINT, handler) };
     }
 }
 

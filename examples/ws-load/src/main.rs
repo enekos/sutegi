@@ -341,41 +341,59 @@ fn open_ws(port: u16, src_port: u16) -> std::io::Result<TcpStream> {
 /// Answers pings inline; returns text payloads.
 /// `socket(2)` + `SO_REUSEADDR`/`SO_REUSEPORT` + `bind(2)` to a chosen source
 /// port + `connect(2)` — what `TcpStream::connect` can't express.
+#[allow(unsafe_code)]
 fn connect_bound(src_port: u16, dst_port: u16) -> std::io::Result<TcpStream> {
-    use std::os::fd::FromRawFd;
-    unsafe {
-        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let one: libc::c_int = 1;
-        for opt in [libc::SO_REUSEADDR, libc::SO_REUSEPORT] {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // SAFETY: plain integer arguments.
+    let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `raw` was just returned open by socket(2) and has no other owner.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let one: libc::c_int = 1;
+    for opt in [libc::SO_REUSEADDR, libc::SO_REUSEPORT] {
+        // SAFETY: `one` is a live c_int and the length passed matches it.
+        unsafe {
             libc::setsockopt(
-                fd,
+                fd.as_raw_fd(),
                 libc::SOL_SOCKET,
                 opt,
                 &one as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
-        let mut addr: libc::sockaddr_in = std::mem::zeroed();
-        addr.sin_family = libc::AF_INET as libc::sa_family_t;
-        addr.sin_port = src_port.to_be();
-        addr.sin_addr.s_addr = u32::from_be_bytes([127, 0, 0, 1]).to_be();
-        let len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-        if libc::bind(fd, &addr as *const _ as *const libc::sockaddr, len) != 0 {
-            let e = std::io::Error::last_os_error();
-            libc::close(fd);
-            return Err(e);
-        }
-        addr.sin_port = dst_port.to_be();
-        if libc::connect(fd, &addr as *const _ as *const libc::sockaddr, len) != 0 {
-            let e = std::io::Error::last_os_error();
-            libc::close(fd);
-            return Err(e);
-        }
-        Ok(TcpStream::from_raw_fd(fd))
+            )
+        };
     }
+    // SAFETY: sockaddr_in is a plain C struct; all-zero is a valid value.
+    let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    addr.sin_family = libc::AF_INET as libc::sa_family_t;
+    addr.sin_port = src_port.to_be();
+    addr.sin_addr.s_addr = u32::from_be_bytes([127, 0, 0, 1]).to_be();
+    let len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    // SAFETY: `addr` is a live sockaddr_in and `len` is its size.
+    if unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            &addr as *const _ as *const libc::sockaddr,
+            len,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    addr.sin_port = dst_port.to_be();
+    // SAFETY: as for bind.
+    if unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            &addr as *const _ as *const libc::sockaddr,
+            len,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(TcpStream::from(fd))
 }
 
 fn poll_frame(sock: &mut Sock) -> Option<String> {

@@ -17,3 +17,6 @@ path = "src/main.rs"
 # `sqlite` is the single-node backend; `Kv` rides on top of it. No `ai`/`queue`
 # — this is deliberately the small, embedded shape.
 sutegi = { path = "../../crates/sutegi", default-features = false, features = ["orm", "sqlite"] }
+
+[lints]
+workspace = true

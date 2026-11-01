@@ -40,3 +40,6 @@ ws = ["dep:sutegi-ws"]
 channels = ["ws", "dep:sutegi-channels"]
 # `App::actors` — mount an actor Registry at /__actors.
 actors = ["dep:sutegi-actors"]
+
+[lints]
+workspace = true

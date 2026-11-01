@@ -32,7 +32,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::os::fd::AsRawFd;
+use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -413,7 +413,7 @@ impl WsRuntime {
                 wake_pending: AtomicBool::new(false),
             });
             let poller = Poller::new()?;
-            poller.add(shared.pipe.read_fd, WAKE_TOKEN, false)?;
+            poller.add(shared.pipe.read_fd(), WAKE_TOKEN, false)?;
             let shard = Shard {
                 shared: Arc::clone(&shared),
                 poller,
@@ -660,7 +660,7 @@ impl Shard {
         };
         if self
             .poller
-            .add(stream.as_raw_fd(), token as usize, false)
+            .add(stream.as_fd(), token as usize, false)
             .is_err()
         {
             self.free.push(token);
@@ -943,7 +943,7 @@ impl Shard {
                 }
                 if state.want_write {
                     state.want_write = false;
-                    let fd = state.stream.as_raw_fd();
+                    let fd = state.stream.as_fd();
                     let _ = self.poller.set_write(fd, t, false);
                 }
                 return;
@@ -959,7 +959,7 @@ impl Shard {
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     if !state.want_write {
                         state.want_write = true;
-                        let fd = state.stream.as_raw_fd();
+                        let fd = state.stream.as_fd();
                         let _ = self.poller.set_write(fd, t, true);
                     }
                     return;
@@ -991,7 +991,7 @@ impl Shard {
         };
         self.gens[t] = self.gens[t].wrapping_add(1);
         self.free.push(token);
-        let _ = self.poller.del(state.stream.as_raw_fd());
+        let _ = self.poller.del(state.stream.as_fd());
         drop(state.stream); // close(2): kqueue/epoll deregister with the fd
         self.admission.release(state.peer.as_deref());
         if let Some(on_close) = &state.handlers.on_close {

@@ -19,3 +19,6 @@ sutegi = { path = "../../crates/sutegi", default-features = false, features = [
     "presence",
     "pubsub-postgres",
 ] }
+
+[lints]
+workspace = true

@@ -481,7 +481,7 @@ App::new("api")
         </div>
         <div class="flex gap-6 sm:gap-8 pt-4 font-mono justify-center lg:justify-start">
           <div><div class="text-xl sm:text-2xl font-bold text-white">0</div><div class="text-[11px] text-[#7a7a8a] uppercase tracking-wide">runtime deps</div></div>
-          <div><div class="text-xl sm:text-2xl font-bold text-white">394 KB</div><div class="text-[11px] text-[#7a7a8a] uppercase tracking-wide">core binary</div></div>
+          <div><div class="text-xl sm:text-2xl font-bold text-white">480 KB</div><div class="text-[11px] text-[#7a7a8a] uppercase tracking-wide">core binary</div></div>
           <div><div class="text-xl sm:text-2xl font-bold text-white">std</div><div class="text-[11px] text-[#7a7a8a] uppercase tracking-wide">only</div></div>
         </div>
       </div>
@@ -614,7 +614,7 @@ App::new("api")
         {#each [
           { icon: Zap, t: 'Agent tool servers', d: 'Expose capabilities to an LLM with a built-in manifest and validated invocation — no glue layer.' },
           { icon: Boxes, t: 'Internal microservices', d: 'Start single-node on SQLite; scale to many pods on Postgres + the durable queue without rewriting handlers.' },
-          { icon: Plug, t: 'Edge & embedded', d: 'A ~394 KB binary with no async runtime and one embedded SQLite file fits where a full stack will not.' },
+          { icon: Plug, t: 'Edge & embedded', d: 'A ~480 KB binary with no async runtime and one embedded SQLite file fits where a full stack will not.' },
           { icon: FileCode, t: 'LLM-generated apps', d: 'Rigid scaffolding conventions mean a model can extend the codebase correctly with minimal context.' },
           { icon: Server, t: 'JSON APIs & CRUD', d: 'Routing + typed models + validation cover the everyday backend without pulling a framework zoo.' },
           { icon: Radio, t: 'Streaming endpoints', d: 'SSE token streams for chat/AI UIs, backpressured by the thread-per-connection model.' },

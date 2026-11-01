@@ -9,3 +9,6 @@ authors.workspace = true
 description = "Tiny zero-dependency JSON value, serializer, and parser for the sutegi framework."
 
 [dependencies]
+
+[lints]
+workspace = true

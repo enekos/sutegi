@@ -121,7 +121,6 @@ Unsupervised actors opt in with `spawn_opts(actor, ActorOpts::new().name(..).reg
 - No process links/monitors beyond the supervisor relationship, no
   distribution (PG is the bus, per the cross-pod posture), no hot code
   reload.
-- In `release` the workspace builds with `panic = "abort"`, so
-  `catch_unwind` never runs there — a panic aborts the process. Dev/test
-  builds (unwind) get the full crash-restart semantics; production posture
-  is "the pod supervisor restarts the process", same as the ws reactor.
+- Supervision rests on `catch_unwind`, so it needs `panic = "unwind"` (the
+  Rust default). An app that sets `panic = "abort"` in its own release
+  profile turns every actor crash into a process exit.

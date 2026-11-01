@@ -11,3 +11,6 @@ description = "Opinionated hexagonal / clean-architecture primitives for sutegi:
 [dependencies]
 sutegi-json = { path = "../sutegi-json", version = "0.12.0" }
 sutegi-web = { path = "../sutegi-web", version = "0.12.0" }
+
+[lints]
+workspace = true

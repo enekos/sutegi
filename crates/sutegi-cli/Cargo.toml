@@ -16,3 +16,6 @@ path = "src/main.rs"
 sutegi-json = { path = "../sutegi-json", version = "0.12.0" }
 # Remote-only REPL (no `orm`): data lives behind the running app's surface.
 sutegi-repl = { path = "../sutegi-repl", version = "0.12.0" }
+
+[lints]
+workspace = true

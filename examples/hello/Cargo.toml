@@ -16,3 +16,6 @@ path = "src/main.rs"
 [dependencies]
 # Core only — proves you can compile away every optional pillar.
 sutegi = { path = "../../crates/sutegi", default-features = false, features = ["graceful"] }
+
+[lints]
+workspace = true
