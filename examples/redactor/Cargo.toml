@@ -17,3 +17,6 @@ path = "src/main.rs"
 # A realistic agent service: SQLite audit log + graceful shutdown. The framework
 # core stays zero-dep (derive/orm/validate/ai come from default features).
 sutegi = { path = "../../crates/sutegi", features = ["sqlite", "graceful"] }
+
+[lints]
+workspace = true

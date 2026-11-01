@@ -21,3 +21,6 @@ sutegi-json = { path = "../sutegi-json", version = "0.12.0" }
 [features]
 sqlite = ["dep:rusqlite"]
 postgres = ["dep:sutegi-pg"]
+
+[lints]
+workspace = true

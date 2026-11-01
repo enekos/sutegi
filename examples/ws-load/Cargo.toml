@@ -19,3 +19,6 @@ sutegi-ws = { path = "../../crates/sutegi-ws" }
 # Source-port binding for the client fleet: macOS allocates ephemeral ports
 # globally (~16k), so past that the client must pick its own (src, dst) tuples.
 libc = "0.2"
+
+[lints]
+workspace = true

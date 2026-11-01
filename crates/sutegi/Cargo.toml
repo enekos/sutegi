@@ -70,3 +70,6 @@ repl = ["dep:sutegi-repl"]                                # tinker-style REPL (d
 
 [package.metadata.docs.rs]
 all-features = true
+
+[lints]
+workspace = true

@@ -61,5 +61,14 @@ authors = ["Eneko Sarasola"]
 opt-level = "z"     # optimize for size
 lto = true          # link-time optimization
 codegen-units = 1   # better cross-module size optimization
-panic = "abort"     # drop the unwind tables
 strip = true        # strip symbols
+# panic stays "unwind": request, job, socket-callback and actor isolation all
+# rest on catch_unwind, which "abort" turns into a process exit.
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"

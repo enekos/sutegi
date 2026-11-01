@@ -13,7 +13,7 @@ Three design goals, held simultaneously:
 | Goal | How |
 |------|-----|
 | **From the ground up** | Every component is original std-only code you can read in one sitting. |
-| **Minimum binary size** | No async runtime; size-optimized release profile. A minimal core-only service is **~394 KB**. |
+| **Minimum binary size** | No async runtime; size-optimized release profile. A minimal core-only service is **~480 KB**. |
 | **Agent-native** | Routes, models, and tools are introspectable as JSON at runtime; tools are a first-class concept with a built-in LLM manifest + invocation endpoint. |
 
 ## Quickstart
@@ -133,8 +133,10 @@ sutegi = { version = "*", default-features = false, features = ["sqlite"] }
 sutegi = { version = "*", default-features = false, features = ["postgres"] }
 ```
 
-Measured: the core-only `hello` example is **~394 KB**; the full `todo` example
-(every pillar + bundled SQLite) is **~1.31 MB**.
+Measured: the core-only `hello` example is **~480 KB**; the full `todo` example
+(every pillar + bundled SQLite) is **~1.6 MB**. Keep `panic = "unwind"` (the
+default) in your release profile: per-request, per-job and per-actor panic
+isolation all rest on `catch_unwind`.
 
 ## Running at scale (pods)
 
@@ -255,7 +257,7 @@ and sutegi is opinionated about which:
   zero-ops, one writer. Bundled; grows the binary to ~1.3 MB.
 - **Postgres** (`--features postgres`) — the **multi-pod** store. A shared,
   durable server many replicas talk to. Pure `std`, no async runtime, no C
-  library, so the zero-dep core stays ~394 KB.
+  library, so the zero-dep core stays ~480 KB.
 
 Both implement the same [`Backend`] trait, and `Model` is written once against
 it — **swap the backend, not your handlers**:

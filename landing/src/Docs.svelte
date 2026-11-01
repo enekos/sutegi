@@ -145,7 +145,7 @@ sutegi = { version = "0.10", features = ["sqlite", "graceful"] }
 # sutegi = { version = "0.10", features = [
 #     "postgres", "queue", "channels", "pubsub-postgres", "graceful" ] }
 
-# Nothing but the HTTP core — ~394 KB, no ORM, no derives:
+# Nothing but the HTTP core — ~480 KB, no ORM, no derives:
 # sutegi = { version = "0.10", default-features = false }`;
 
   const cFirstApp = `use sutegi::prelude::*;
@@ -1149,8 +1149,8 @@ sutegi> jobs
                         ws reactor and frees the worker immediately
 
 // A handler panic is caught per request and becomes a 500 — one bad request
-// never takes a worker down. (In release the workspace builds with
-// panic = "abort", so the pod supervisor owns that failure instead.)
+// never takes a worker down. (This needs panic = "unwind", the Rust default —
+// an app that sets panic = "abort" gives that isolation up.)
 // /__metrics counts requests total, in-flight, and by status class.`;
 
   const cListeners = `use sutegi::prelude::*;
@@ -1332,7 +1332,7 @@ App::new("api")
           <p>
             Frameworks usually force a trade: batteries-included but heavy, or tiny but bare. sutegi bets you can
             refuse the trade if you build every layer on <code>std</code> and make each one an
-            <em>opt-in compile-time feature</em>. Compile in only the HTTP core and you get a ~394&nbsp;KB binary with
+            <em>opt-in compile-time feature</em>. Compile in only the HTTP core and you get a ~480&nbsp;KB binary with
             no async runtime; switch on <code>sqlite</code> and <code>graceful</code> and you get an ergonomic,
             agent-native service — with nothing else along for the ride. The full <code>todo</code> example, every
             pillar plus bundled SQLite, is ~1.31&nbsp;MB.
@@ -2332,10 +2332,9 @@ App::new("api")
             <p>
               This is supervision and fault isolation, not BEAM-scale lightweight processes: thousands of actors, not
               millions. There are no links or monitors beyond the supervisor relationship, no distribution (Postgres
-              is the bus), and no hot code reload. In <code>release</code> the workspace builds with
-              <code>panic = "abort"</code>, so <code>catch_unwind</code> never runs there — dev and test builds get the
-              full crash-restart semantics, and the production posture is &ldquo;the pod supervisor restarts the
-              process&rdquo;.
+              is the bus), and no hot code reload. Supervision rests on <code>catch_unwind</code>, so it needs
+              <code>panic = "unwind"</code> (the Rust default): an app that sets <code>panic = "abort"</code> turns every
+              actor crash into a process exit.
             </p>
           </div>
         </article>
@@ -2616,9 +2615,9 @@ App::new("api")
           <ul class="list">
             <li><strong class="text-white">A connection costs a thread while it is open.</strong> Keep-alive is therefore capped twice — <code>keep_alive_idle</code> (default 5&nbsp;s, deliberately much shorter than the socket timeout) and <code>keep_alive_max</code> (default 100 requests) — so an idle client cannot pin a worker indefinitely.</li>
             <li><strong class="text-white">Reading a request is bounded twice too.</strong> <code>timeout</code> bounds a single stalled <code>recv</code>; <code>header_timeout</code> bounds the <em>total</em> time a peer may take to deliver request line, headers and body, so a byte-per-interval dripper cannot hold a worker (slowloris, CWE-400).</li>
-            <li><strong class="text-white">Panics are isolated per request.</strong> A handler panic becomes a <code>500</code> rather than a downed worker — in dev and test builds, where the workspace unwinds. Release builds use <code>panic = "abort"</code> to drop the unwind tables, which moves that responsibility to your pod supervisor.</li>
+            <li><strong class="text-white">Panics are isolated per request.</strong> A handler panic becomes a <code>500</code> rather than a downed worker. That rests on <code>catch_unwind</code>, so keep <code>panic = "unwind"</code> (the Rust default) in your release profile.</li>
             <li><strong class="text-white">WebSockets escape the model entirely.</strong> An upgrade returns <code>Body::Upgrade</code>, the reactor adopts the socket, and the worker is released — which is how one process holds 80k connections on eight threads.</li>
-            <li><strong class="text-white">The release profile is tuned for size</strong>: <code>opt-level = "z"</code>, LTO, one codegen unit, no unwind tables, stripped symbols. That is where ~394&nbsp;KB comes from.</li>
+            <li><strong class="text-white">The release profile is tuned for size</strong>: <code>opt-level = "z"</code>, LTO, one codegen unit, stripped symbols. That is where ~480&nbsp;KB comes from; the unwind tables that panic isolation needs are about 10% of it.</li>
           </ul>
           <p>
             Ordering is fixed and worth knowing when you place a guard: ops guard → global middleware →

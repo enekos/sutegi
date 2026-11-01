@@ -9,3 +9,6 @@ authors.workspace = true
 description = "Structured, context-carrying logging for sutegi: levels, per-target filters, JSON or text lines, request/job scopes."
 
 [dependencies]
+
+[lints]
+workspace = true

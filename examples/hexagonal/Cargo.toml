@@ -15,3 +15,6 @@ path = "src/main.rs"
 
 [dependencies]
 sutegi = { path = "../../crates/sutegi", features = ["hexagon", "sqlite", "graceful"] }
+
+[lints]
+workspace = true

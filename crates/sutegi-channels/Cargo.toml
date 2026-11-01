@@ -20,3 +20,6 @@ sutegi-pubsub = { path = "../sutegi-pubsub", version = "0.12.0" }
 # Presence: a per-pod tracker over the Broker seam with cross-pod state sync
 # and heartbeat expiry (see src/presence.rs for the honest caveats).
 presence = []
+
+[lints]
+workspace = true

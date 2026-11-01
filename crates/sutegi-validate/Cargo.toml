@@ -10,3 +10,6 @@ description = "Zero-dependency validation for sutegi: fluent rule sets and a JSO
 
 [dependencies]
 sutegi-json = { path = "../sutegi-json", version = "0.12.0" }
+
+[lints]
+workspace = true

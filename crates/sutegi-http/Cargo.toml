@@ -11,3 +11,6 @@ authors.workspace = true
 description = "Zero-dependency HTTP/1.1 parser and thread-pool server (std::net only) for sutegi."
 
 [dependencies]
+
+[lints]
+workspace = true
