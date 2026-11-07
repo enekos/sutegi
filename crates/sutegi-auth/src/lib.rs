@@ -359,8 +359,11 @@ where
 
 /// Guard: on mutating methods, require an `X-CSRF-Token` header matching the
 /// session's token (see [`Auth::csrf`]). Reads (`GET`/`HEAD`/`OPTIONS`) pass,
-/// and so do requests authenticating with an `Authorization` header — bearer
-/// callers carry no ambient cookie credential, which is what CSRF forges.
+/// and so do requests authenticated **only** by an `Authorization: Bearer
+/// stg_…` API token — no session cookie rides along, so there is no ambient
+/// credential for CSRF to forge. Any other `Authorization` header (`Basic`,
+/// a non-`stg_` bearer) or any session cookie keeps the check on: a forged
+/// cross-site request can add headers the guard would otherwise trust.
 pub fn require_csrf<B>(
     auth: Arc<Auth<B>>,
 ) -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static
@@ -371,10 +374,11 @@ where
         if matches!(req.method, Method::Get | Method::Head | Method::Options) {
             return None;
         }
-        if req.header("authorization").is_some() {
+        let s = auth.sessions.load(req);
+        let api_token = bearer_of(req).is_some_and(|t| t.starts_with(TOKEN_PREFIX));
+        if api_token && s.is_empty() {
             return None;
         }
-        let s = auth.sessions.load(req);
         let presented = req.header("x-csrf-token").unwrap_or("");
         if auth.sessions.verify_csrf(&s, presented) {
             None
@@ -745,6 +749,36 @@ mod tests {
         let mut bearer = request(vec![("Authorization".into(), "Bearer stg_x".into())]);
         bearer.method = Method::Post;
         assert!(guard(&bearer).is_none());
+    }
+
+    #[test]
+    fn csrf_guard_ignores_authorization_on_cookie_requests() {
+        let auth = rig();
+        let (_, resp) = auth.csrf(&request(vec![]), Response::new(200)).unwrap();
+        let cookie = cookie_of(&resp);
+        let guard = require_csrf(auth.clone());
+
+        // Cookie session + an arbitrary Authorization header: still checked.
+        let mut basic = request(vec![
+            ("Cookie".into(), cookie.clone()),
+            ("Authorization".into(), "Basic dTpw".into()),
+        ]);
+        basic.method = Method::Post;
+        assert_eq!(guard(&basic).unwrap().status, 419);
+
+        // Even an API-token bearer doesn't exempt a request that also
+        // carries the session cookie.
+        let mut both = request(vec![
+            ("Cookie".into(), cookie),
+            ("Authorization".into(), "Bearer stg_x".into()),
+        ]);
+        both.method = Method::Post;
+        assert_eq!(guard(&both).unwrap().status, 419);
+
+        // Non-API bearer without a cookie: no exemption either.
+        let mut other = request(vec![("Authorization".into(), "Bearer abc".into())]);
+        other.method = Method::Post;
+        assert_eq!(guard(&other).unwrap().status, 419);
     }
 
     #[test]
