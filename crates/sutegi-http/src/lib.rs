@@ -630,6 +630,10 @@ fn write_head_and_body<W: Write>(
     let mut head = String::with_capacity(256);
     let _ = write!(head, "HTTP/1.1 {} {}\r\n", resp.status, reason);
     let mut has_content_type = false;
+    // Upgrade heads are written verbatim (the app's `connection: upgrade` is
+    // the point); every other body's framing belongs to the server.
+    let server_framed = !matches!(resp.body, Body::Upgrade(_));
+    let keep_alive = keep_alive && !asks_close(&resp);
     for (k, v) in &resp.headers {
         // The single output choke point for CRLF-injection defense (CWE-113):
         // a `\r`/`\n` in a name or value would otherwise split the response
@@ -639,6 +643,12 @@ fn write_head_and_body<W: Write>(
         let v_clean = strip_crlf(v);
         if k_clean.eq_ignore_ascii_case("content-type") {
             has_content_type = true;
+        }
+        // Framing is written once, below, from the body itself. An app-set
+        // copy would sit next to it — two Content-Lengths, or CL + TE — and a
+        // downstream proxy may pick the other one (CWE-444). Drop it.
+        if server_framed && is_framing_header(&k_clean) {
+            continue;
         }
         head.push_str(&k_clean);
         head.push_str(": ");
@@ -702,6 +712,24 @@ fn write_head_and_body<W: Write>(
             w.flush()
         }
     }
+}
+
+/// Response headers the server owns: it derives them from the body and the
+/// connection state, so an app-set copy is dropped rather than duplicated.
+fn is_framing_header(name: &str) -> bool {
+    ["content-length", "transfer-encoding", "connection"]
+        .iter()
+        .any(|h| name.eq_ignore_ascii_case(h))
+}
+
+/// Whether the app asked for the connection to close (`Connection: close`).
+/// The server's own `connection` header replaces the app's, so this is how
+/// that request still takes effect.
+fn asks_close(resp: &Response) -> bool {
+    resp.headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("connection")
+            && v.split(',').any(|t| t.trim().eq_ignore_ascii_case("close"))
+    })
 }
 
 /// Write the head of an upgrade response: status line + headers + blank line,
@@ -917,7 +945,10 @@ where
                     }));
                     return taken.map_err(|_| io::Error::other("upgrade takeover panicked"));
                 }
-                let persist = keep && !resp.is_stream() && served + 1 < limits.keep_alive_max;
+                let persist = keep
+                    && !resp.is_stream()
+                    && !asks_close(&resp)
+                    && served + 1 < limits.keep_alive_max;
                 // HEAD: emit exactly the headers a GET would (incl. its
                 // Content-Length), but never the body bytes.
                 write_head_and_body(&mut writer, resp, persist, is_head)?;
@@ -1675,6 +1706,46 @@ mod tests {
         assert!(!s.contains("\r\nInjected: yes"), "response splitting: {s}");
         // The CR/LF are stripped, collapsing the value onto one line.
         assert!(s.contains("x-evil: aInjected: yes\r\n"), "got: {s}");
+    }
+
+    #[test]
+    fn app_set_framing_headers_are_not_duplicated() {
+        // App-set framing headers used to be written next to the server's
+        // own, giving two Content-Lengths (or CL + TE) — ambiguous framing
+        // a downstream proxy may resolve differently (CWE-444).
+        let resp = Response::new(200)
+            .with_header("Content-Length", "999")
+            .with_header("Transfer-Encoding", "chunked")
+            .with_header("Connection", "keep-alive")
+            .with_body("hi");
+        let mut buf = Vec::new();
+        write_response(&mut buf, resp, false).unwrap();
+        let s = String::from_utf8(buf).unwrap().to_ascii_lowercase();
+        assert_eq!(s.matches("content-length:").count(), 1, "got: {s}");
+        assert!(s.contains("content-length: 2\r\n"), "got: {s}");
+        assert!(!s.contains("transfer-encoding"), "got: {s}");
+        assert_eq!(s.matches("connection:").count(), 1, "got: {s}");
+        assert!(s.contains("connection: close\r\n"), "got: {s}");
+
+        // An app asking to close wins over the server's keep-alive.
+        let resp = Response::new(200)
+            .with_header("connection", "close")
+            .with_body("hi");
+        assert!(asks_close(&resp));
+        let mut buf = Vec::new();
+        write_response(&mut buf, resp, true).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s.matches("connection:").count(), 1, "got: {s}");
+        assert!(s.contains("connection: close\r\n"), "got: {s}");
+
+        // Streams are close-framed: an app Content-Length must not leak out.
+        let resp = Response::new(200)
+            .with_header("content-length", "5")
+            .with_stream(|w| w.write_all(b"x"));
+        let mut buf = Vec::new();
+        write_response(&mut buf, resp, false).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(!s.contains("content-length"), "got: {s}");
     }
 
     #[test]
