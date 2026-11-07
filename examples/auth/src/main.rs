@@ -3,6 +3,7 @@
 //! admin routes, and API tokens for agents.
 //!
 //! ```text
+//! SESSION_SECRET=$(openssl rand -hex 32) cargo run -p auth-example   # or SUTEGI_ENV=dev
 //! curl -c /tmp/cj -X POST localhost:8080/register -d '{"email":"root@example.com","password":"password1","name":"Root"}'
 //! curl -c /tmp/cj -X POST localhost:8080/login    -d '{"email":"root@example.com","password":"password1","remember":true}'
 //! curl -b /tmp/cj -c /tmp/cj localhost:8080/me      # revives from the remember cookie if the session lapsed
@@ -22,7 +23,9 @@
 
 use std::sync::Arc;
 use sutegi::auth::login_key;
+use sutegi::crypto::{hex, random_bytes};
 use sutegi::prelude::*;
+use sutegi::session::MIN_SECRET_LEN;
 
 fn main() -> std::io::Result<()> {
     let db = Db::open(&std::env::var("AUTH_DB").unwrap_or_else(|_| "auth.db".to_string()))
@@ -43,8 +46,8 @@ fn main() -> std::io::Result<()> {
     // trivially lock a real user out, but rotating IPs buys no extra guesses.
     let account_throttle = Arc::new(Throttle::new(db.clone()).max(20));
 
-    let secret = std::env::var("SESSION_SECRET")
-        .unwrap_or_else(|_| "dev-only-secret-set-SESSION_SECRET".to_string());
+    let secret = session_secret(|k| std::env::var(k).ok())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     // `.insecure()` drops the cookies' `Secure` flag for local http:// dev.
     let auth =
         Arc::new(Auth::new(users, Sessions::new(secret.as_bytes()).insecure()).remember(remember));
@@ -257,6 +260,29 @@ fn main() -> std::io::Result<()> {
         .serve()
 }
 
+/// `SESSION_SECRET` (≥ 32 bytes) signs sessions and email links. There is
+/// no baked-in fallback — a known default would let anyone forge sessions
+/// on a deployment that forgot to set it. For local hacking, opt in with
+/// `SUTEGI_ENV=dev` to get a random per-process secret (sessions don't
+/// survive a restart).
+fn session_secret(env: impl Fn(&str) -> Option<String>) -> Result<String, String> {
+    match env("SESSION_SECRET") {
+        Some(s) if s.len() >= MIN_SECRET_LEN => Ok(s),
+        Some(s) => Err(format!(
+            "SESSION_SECRET is {} bytes; need at least {MIN_SECRET_LEN} \
+             (generate one with `openssl rand -hex 32`)",
+            s.len()
+        )),
+        None if env("SUTEGI_ENV").as_deref() == Some("dev") => {
+            eprintln!("SUTEGI_ENV=dev: using a random per-process SESSION_SECRET");
+            Ok(hex(&random_bytes(32)?))
+        }
+        None => Err("SESSION_SECRET is not set (or set SUTEGI_ENV=dev for a \
+                     throwaway local secret)"
+            .to_string()),
+    }
+}
+
 fn credentials(body: &Json) -> Result<(&str, &str, &str), Error> {
     let email = body
         .get("email")
@@ -268,4 +294,41 @@ fn credentials(body: &Json) -> Result<(&str, &str, &str), Error> {
         .ok_or_else(|| Error::bad_request("password is required"))?;
     let name = body.get("name").and_then(Json::as_str).unwrap_or("");
     Ok((email, password, name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            vars.iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn missing_secret_refuses_to_start() {
+        assert!(session_secret(env(&[])).is_err());
+        assert!(session_secret(env(&[("SUTEGI_ENV", "production")])).is_err());
+    }
+
+    #[test]
+    fn short_secret_refuses_to_start() {
+        assert!(session_secret(env(&[("SESSION_SECRET", "hunter2")])).is_err());
+    }
+
+    #[test]
+    fn configured_or_explicit_dev_secret_starts() {
+        let good = "a".repeat(MIN_SECRET_LEN);
+        assert_eq!(
+            session_secret(env(&[("SESSION_SECRET", &good)])).unwrap(),
+            good
+        );
+        let a = session_secret(env(&[("SUTEGI_ENV", "dev")])).unwrap();
+        let b = session_secret(env(&[("SUTEGI_ENV", "dev")])).unwrap();
+        assert!(a.len() >= MIN_SECRET_LEN);
+        assert_ne!(a, b, "dev secret is random, never a baked-in constant");
+    }
 }
