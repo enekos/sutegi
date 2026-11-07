@@ -684,7 +684,11 @@ fn write_head_and_body<W: Write>(
             if head_only {
                 Ok(())
             } else {
-                producer(w)
+                // Panic isolation, as for the handler: the producer is app
+                // code running on a pool worker. The head is already out, so
+                // the only honest outcome is an error that closes the socket.
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| producer(w)))
+                    .unwrap_or_else(|_| Err(io::Error::other("stream producer panicked")))
             }
         }
         // Upgrades need the raw `TcpStream`, which only the server loop has:
@@ -906,8 +910,12 @@ where
                                   // timeouts belong to the blocking HTTP path.
                     let _ = writer.set_read_timeout(None);
                     let _ = writer.set_write_timeout(None);
-                    takeover(writer, leftover);
-                    return Ok(());
+                    // Panic isolation: the takeover is app code too. A panic
+                    // drops the socket it owned; the worker carries on.
+                    let taken = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        takeover(writer, leftover)
+                    }));
+                    return taken.map_err(|_| io::Error::other("upgrade takeover panicked"));
                 }
                 let persist = keep && !resp.is_stream() && served + 1 < limits.keep_alive_max;
                 // HEAD: emit exactly the headers a GET would (incl. its
@@ -1387,6 +1395,60 @@ mod tests {
         assert!(!s.to_lowercase().contains("content-type"));
         // The pipelined bytes reached the takeover closure intact.
         assert!(s.ends_with("echo:HELLO:done"), "got: {s}");
+
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn panicking_stream_producer_is_an_error_not_a_panic() {
+        let resp = Response::new(200).with_stream(|_| panic!("producer panic (expected)"));
+        let mut buf = Vec::new();
+        assert!(write_response(&mut buf, resp, false).is_err());
+    }
+
+    #[test]
+    fn worker_survives_panicking_stream_and_upgrade() {
+        use std::io::Read;
+        let addr = "127.0.0.1:18466";
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&shutdown);
+        let server = thread::spawn(move || {
+            serve_until(
+                addr,
+                1,
+                Limits::default(),
+                |req| match req.path.as_str() {
+                    "/stream" => Response::new(200).with_stream(|_| panic!("stream (expected)")),
+                    "/upgrade" => Response::upgrade(|_, _| panic!("takeover (expected)")),
+                    _ => Response::new(200).with_body("alive"),
+                },
+                flag,
+            )
+        });
+        let roundtrip = |path: &str| {
+            let mut stream = (0..100)
+                .find_map(|_| {
+                    TcpStream::connect(addr).ok().or_else(|| {
+                        thread::sleep(Duration::from_millis(10));
+                        None
+                    })
+                })
+                .expect("server never listened");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let req = format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+            stream.write_all(req.as_bytes()).unwrap();
+            let mut buf = Vec::new();
+            let _ = stream.read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).into_owned()
+        };
+        roundtrip("/stream");
+        roundtrip("/upgrade");
+        // The single worker must still be alive to answer this.
+        let s = roundtrip("/");
+        assert!(s.ends_with("alive"), "worker died after a panic: {s:?}");
 
         shutdown.store(true, Ordering::Relaxed);
         server.join().unwrap().unwrap();
