@@ -8,11 +8,12 @@
 //! * versioned migrations with a `todo migrate[:status|:rollback]` CLI
 //!
 //! ```text
-//! curl localhost:8080/__introspect
+//! export OPS_TOKEN=dev-token    # unset → /__introspect, /__metrics, /__tools* answer 403
+//! curl -H "Authorization: Bearer $OPS_TOKEN" localhost:8080/__introspect
 //! curl -X POST localhost:8080/api/todos -H 'content-type: application/json' -d '{"title":"ship sutegi"}'
 //! curl localhost:8080/api/todos
 //! curl localhost:8080/api/todos/1
-//! curl -X POST localhost:8080/__tools/create_todo -H 'content-type: application/json' -d '{"title":"via agent"}'
+//! curl -X POST localhost:8080/__tools/create_todo -H "Authorization: Bearer $OPS_TOKEN" -H 'content-type: application/json' -d '{"title":"via agent"}'
 //! ```
 //!
 //! `todo repl` drops into the tinker shell instead of serving — same app,
@@ -54,7 +55,7 @@ fn main() -> std::io::Result<()> {
     migrations().run(&db).expect("migrate");
 
     let ready = db.clone(); // readiness probe holds its own handle
-    let app = App::new("todo")
+    let app = ops_guard_from_env(App::new("todo"), std::env::var("OPS_TOKEN").ok())
         .state(db.clone())
         .readiness(move || ready.query("SELECT 1", &[]).is_ok())
         .get("/", "Health check.", |_| "sutegi up")
@@ -120,8 +121,58 @@ fn main() -> std::io::Result<()> {
     app.serve()
 }
 
+/// Gate the ops/agent surface behind `Authorization: Bearer $OPS_TOKEN`
+/// (compared in constant time by [`bearer`]). Unset or empty leaves no guard,
+/// so the framework keeps the surface closed (403).
+fn ops_guard_from_env(app: App, token: Option<String>) -> App {
+    match token.filter(|t| !t.is_empty()) {
+        Some(token) => app.ops_guard(bearer(&token)),
+        None => app,
+    }
+}
+
 /// Group middleware: log every request to the `/api` group, then continue.
 fn log_request(req: &Request) -> Option<Response> {
     println!("[mw] {} {}", req.method.as_str(), req.path);
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn introspect(app: App, auth: Option<&str>) -> u16 {
+        let svc = app.service();
+        let mut req = Request {
+            method: Method::Get,
+            path: "/__introspect".into(),
+            query: String::new(),
+            version: "HTTP/1.1".into(),
+            headers: vec![],
+            body: vec![],
+            peer: None,
+        };
+        if let Some(auth) = auth {
+            req.headers.push(("authorization".into(), auth.into()));
+        }
+        svc(req).status
+    }
+
+    #[test]
+    fn ops_surface_needs_the_ops_token() {
+        let app = || ops_guard_from_env(App::new("t"), Some("s3cret".into()));
+        assert_eq!(introspect(app(), None), 401);
+        assert_eq!(introspect(app(), Some("Bearer nope")), 401);
+        assert_eq!(introspect(app(), Some("Bearer s3cret")), 200);
+    }
+
+    #[test]
+    fn ops_surface_stays_closed_without_a_token() {
+        assert_eq!(
+            introspect(ops_guard_from_env(App::new("t"), None), None),
+            403
+        );
+        let empty = ops_guard_from_env(App::new("t"), Some(String::new()));
+        assert_eq!(introspect(empty, Some("Bearer ")), 403);
+    }
 }

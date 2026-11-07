@@ -19,6 +19,8 @@ services:
       PORT: "8080"
       WORKERS: "8"
       DATABASE_PATH: ${DATABASE_PATH:-:memory:}
+      # Bearer token for the /__ ops surface; unset keeps it closed (403).
+      OPS_TOKEN: ${OPS_TOKEN:-}
     expose:
       - "8080"
     # Give the SIGTERM drain time to finish in-flight requests.

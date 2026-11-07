@@ -25,6 +25,11 @@
 #   TLS        set to 1 to obtain a Let's Encrypt cert with certbot (needs a real DOMAIN)
 #   SERVICE    systemd unit name (default: sutegi)
 #
+# Ops surface: the first run writes a random OPS_TOKEN into the env file; the
+# todo example requires it as `Authorization: Bearer …` for /__introspect,
+# /__metrics and /__tools*. nginx does not proxy /__ (except /__health and
+# /__ready) at all — reach the ops surface on 127.0.0.1:$PORT from the box.
+#
 # Idempotent: re-running rebuilds the binary and re-renders the unit + nginx
 # site, then restarts. Safe to run repeatedly (e.g. to deploy a new commit).
 
@@ -100,6 +105,8 @@ if [[ ! -f "$ENV_FILE" ]]; then
 HOST=127.0.0.1
 PORT=${PORT}
 WORKERS=${WORKERS}
+# Bearer token for the /__ ops surface (introspect, metrics, tools).
+OPS_TOKEN=$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
 # For the sqlite-backed examples you can point at a persistent file, e.g.:
 # DATABASE_PATH=${DATA_DIR}/app.db
 EOF
@@ -159,6 +166,11 @@ server {
     listen [::]:80;
     server_name ${DOMAIN};
 
+    # Probes are public; the rest of the /__ ops surface is never proxied.
+    location = /__health { proxy_pass http://${SERVICE}_upstream; }
+    location = /__ready  { proxy_pass http://${SERVICE}_upstream; }
+    location ^~ /__ { return 404; }
+
     location / {
         proxy_pass http://${SERVICE}_upstream;
         proxy_set_header Host              \$host;
@@ -166,7 +178,7 @@ server {
         proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
 
-        # Critical for sutegi SSE / streaming (POST /__tools/:name/stream, /stream):
+        # Critical for sutegi SSE / streaming (e.g. /stream):
         # don't buffer so streamed frames reach the client as they're produced.
         proxy_buffering off;
         proxy_cache off;
@@ -213,7 +225,8 @@ for _ in $(seq 1 20); do
     echo "  logs:    journalctl -u ${SERVICE} -f"
     echo "  status:  systemctl status ${SERVICE}"
     echo "  config:  ${ENV_FILE}  (edit + 'systemctl restart ${SERVICE}')"
-    echo "  probes:  /__health  /__ready  /__metrics  /__introspect"
+    echo "  probes:  /__health  /__ready  (public via nginx)"
+    echo "  ops:     curl -H \"Authorization: Bearer \$OPS_TOKEN\" 127.0.0.1:${PORT}/__introspect  (token in ${ENV_FILE})"
     exit 0
   fi
   sleep 0.5

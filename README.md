@@ -19,13 +19,14 @@ Three design goals, held simultaneously:
 ## Quickstart
 
 ```bash
-cargo run -p todo-example -- 127.0.0.1:8080
+OPS_TOKEN=dev-token cargo run -p todo-example -- 127.0.0.1:8080
 ```
 
 ```bash
-curl localhost:8080/__introspect              # full app surface as JSON
-curl localhost:8080/__tools                   # LLM tool-calling manifest
-curl -X POST localhost:8080/__tools/create_todo -H 'content-type: application/json' -d '{"title":"ship sutegi"}'
+AUTH="Authorization: Bearer dev-token"          # the /__ ops surface is closed without it
+curl -H "$AUTH" localhost:8080/__introspect     # full app surface as JSON
+curl -H "$AUTH" localhost:8080/__tools          # LLM tool-calling manifest
+curl -H "$AUTH" -X POST localhost:8080/__tools/create_todo -H 'content-type: application/json' -d '{"title":"ship sutegi"}'
 curl localhost:8080/api/todos
 ```
 
