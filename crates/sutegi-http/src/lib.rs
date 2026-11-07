@@ -362,9 +362,9 @@ enum Line {
 /// before any post-read length check can fire — so the read itself is capped.
 ///
 /// `deadline` bounds the wall-clock time this may spend on a slow drip: the
-/// check runs at the top of each iteration, so a client feeding one byte per
-/// interval is cut off with [`Line::Timeout`] once the deadline passes, rather
-/// than pinning the worker under the (larger) per-recv timeout indefinitely.
+/// check runs after every chunk, so a client feeding one byte (or one whole
+/// line) per interval is cut off with [`Line::Timeout`] once the deadline
+/// passes, rather than pinning the worker under the per-recv timeout forever.
 fn read_line_capped<R: BufRead>(
     reader: &mut R,
     buf: &mut Vec<u8>,
@@ -390,16 +390,15 @@ fn read_line_capped<R: BufRead>(
         }
         buf.extend_from_slice(&chunk[..take]);
         reader.consume(take);
-        if done {
-            break;
-        }
-        // The line isn't complete yet, so we're about to loop and block on the
-        // next recv — the only moment a slow drip can burn wall-clock. Check
-        // the deadline here (mirroring the body-read loop below), not on entry:
-        // a line already served whole from the buffer never reads the clock,
-        // keeping the parse hot path syscall-free.
+        // Checked once per chunk, *including* the one that completes the line:
+        // a client dripping one whole `a:b\r\n` per recv never leaves a line
+        // incomplete, so a check skipped on completion never fires and the
+        // worker is pinned forever. One clock read per line is cheap.
         if Instant::now() > deadline {
             return Ok(Line::Timeout);
+        }
+        if done {
+            break;
         }
     }
     if buf.is_empty() {
@@ -457,10 +456,8 @@ pub fn parse_request_deadline<R: BufRead>(
 
 /// Shared parse body. Callers that derive `deadline` from `now` immediately
 /// beforehand (`parse_request`, `handle_connection`) reach it directly, skipping
-/// the redundant up-front deadline check — the per-line and per-body loops read
-/// the clock only when they must actually wait for more input, so the hot path
-/// (a request already buffered) is syscall-free apart from the one `now` used to
-/// derive the deadline.
+/// the redundant up-front deadline check. The clock is read once per request /
+/// header line (see [`read_line_capped`]) and once per partial body read.
 fn parse_request_impl<R: BufRead>(
     reader: &mut R,
     limits: &Limits,
@@ -1484,6 +1481,49 @@ mod tests {
         match parse_request_deadline(&mut reader, &Limits::default(), past).unwrap() {
             Some(Incoming::Reject { status }) => assert_eq!(status, 408),
             _ => panic!("a past deadline must yield a 408 reject"),
+        }
+    }
+
+    /// A reader that hands out one whole line per `read`, sleeping first — the
+    /// slowloris shape that never stalls mid-line.
+    struct LineDrip {
+        lines: Vec<&'static [u8]>,
+        next: usize,
+        delay: Duration,
+    }
+
+    impl io::Read for LineDrip {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            let Some(line) = self.lines.get(self.next) else {
+                return Ok(0);
+            };
+            thread::sleep(self.delay);
+            self.next += 1;
+            out[..line.len()].copy_from_slice(line);
+            Ok(line.len())
+        }
+    }
+
+    #[test]
+    fn whole_line_drip_hits_deadline_408() {
+        // Each recv delivers a complete header line, so a deadline checked only
+        // while a line is incomplete never fires. 10 lines x 200ms = 2s against
+        // a 1s deadline must be cut off with 408, not parsed as a request.
+        let mut lines: Vec<&'static [u8]> = vec![b"GET / HTTP/1.1\r\n"];
+        lines.extend(std::iter::repeat_n(&b"a: b\r\n"[..], 9));
+        lines.push(b"\r\n");
+        let mut reader = BufReader::new(LineDrip {
+            lines,
+            next: 0,
+            delay: Duration::from_millis(200),
+        });
+        let limits = Limits {
+            header_timeout: Duration::from_secs(1),
+            ..Limits::default()
+        };
+        match parse_request(&mut reader, &limits).unwrap() {
+            Some(Incoming::Reject { status }) => assert_eq!(status, 408),
+            _ => panic!("a whole-line drip past the deadline must yield 408"),
         }
     }
 
