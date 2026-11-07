@@ -60,7 +60,8 @@ pub struct Config {
     pub user: String,
     pub password: Option<String>,
     pub dbname: String,
-    /// Applied as the socket connect/read/write timeout when set.
+    /// Applied as the socket connect/read/write timeout when set, and as the
+    /// longest a [`Pool`] checkout waits for a free connection.
     pub timeout: Option<Duration>,
     /// Reuse server-side prepared statements per connection (the default).
     /// Set `false` to force every query through an unnamed statement.

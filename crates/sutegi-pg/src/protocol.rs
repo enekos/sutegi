@@ -112,18 +112,26 @@ impl Client {
             match tag {
                 b'E' => return Err(parse_error(&body)),
                 b'R' => {
+                    // Every authentication request starts with an i32 code; a
+                    // shorter body would read as code 0 (AuthenticationOk).
+                    if body.len() < 4 {
+                        return Err("truncated authentication request".into());
+                    }
                     let code = be_i32(&body, 0);
+                    let data = body.get(4..).unwrap_or_default();
                     match code {
                         0 => return Ok(()),             // AuthenticationOk
                         3 => self.auth_cleartext(cfg)?, // AuthenticationCleartextPassword
                         5 => {
                             // AuthenticationMD5Password: 4-byte salt follows.
-                            let salt = &body[4..8];
+                            let salt = body
+                                .get(4..8)
+                                .ok_or("truncated MD5 authentication request")?;
                             self.auth_md5(cfg, salt)?;
                         }
                         10 => {
                             // AuthenticationSASL: NUL-separated mechanism list.
-                            let mechs = parse_cstr_list(&body[4..]);
+                            let mechs = parse_cstr_list(data);
                             if !mechs.iter().any(|m| m == "SCRAM-SHA-256") {
                                 return Err(format!(
                                     "server offered no supported SASL mechanism (got {mechs:?})"
@@ -134,8 +142,8 @@ impl Client {
                         11 => {
                             // AuthenticationSASLContinue: server-first message.
                             let s = scram.as_mut().ok_or("SASL continue before SASL start")?;
-                            let server_first = std::str::from_utf8(&body[4..])
-                                .map_err(|_| "non-utf8 SASL data")?;
+                            let server_first =
+                                std::str::from_utf8(data).map_err(|_| "non-utf8 SASL data")?;
                             let client_final = s.handle_server_first(cfg, server_first)?;
                             // SASLResponse: just the message bytes.
                             self.send_msg(b'p', client_final.as_bytes())?;
@@ -143,8 +151,8 @@ impl Client {
                         12 => {
                             // AuthenticationSASLFinal: verify the server signature.
                             let s = scram.as_ref().ok_or("SASL final before SASL start")?;
-                            let server_final = std::str::from_utf8(&body[4..])
-                                .map_err(|_| "non-utf8 SASL data")?;
+                            let server_final =
+                                std::str::from_utf8(data).map_err(|_| "non-utf8 SASL data")?;
                             s.verify_server_final(server_final)?;
                         }
                         other => return Err(format!("unsupported auth request code {other}")),
@@ -929,6 +937,89 @@ mod tests {
         let evil = format!("r={nonce}extra,s=YWJjZA==,i=4000000000");
         let err = scram.handle_server_first(&cfg, &evil).unwrap_err();
         assert!(err.contains("iteration count"), "got: {err}");
+    }
+
+    // -- adversarial: a scripted loopback server -----------------------------
+    //
+    // The handshake reads server bytes before any query runs, so a hostile or
+    // MITM'd server reaches it first. `fake_server` accepts one connection,
+    // swallows the startup packet, writes `script` verbatim, then records
+    // everything the client sends until it hangs up — so a test can assert
+    // both the outcome and what (e.g. a password) went over the wire.
+
+    use std::net::TcpListener;
+    use std::thread::JoinHandle;
+    use std::time::Duration;
+
+    fn fake_server(url_tail: &str, script: Vec<u8>) -> (Config, JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut len = [0u8; 4];
+            sock.read_exact(&mut len).unwrap();
+            let mut startup = vec![0u8; i32::from_be_bytes(len) as usize - 4];
+            sock.read_exact(&mut startup).unwrap();
+            // The client may already have hung up on a rejected handshake.
+            let _ = sock.write_all(&script);
+            let mut sent = Vec::new();
+            let _ = sock.read_to_end(&mut sent);
+            sent
+        });
+        let mut cfg = Config::from_url(&format!(
+            "postgres://u:hunter2@127.0.0.1:{port}/db{url_tail}"
+        ))
+        .unwrap();
+        cfg.timeout = Some(Duration::from_secs(5));
+        (cfg, handle)
+    }
+
+    /// A raw backend message: tag + self-inclusive i32 length + body.
+    fn msg(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        out.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn auth(code: i32, rest: &[u8]) -> Vec<u8> {
+        let mut body = code.to_be_bytes().to_vec();
+        body.extend_from_slice(rest);
+        msg(b'R', &body)
+    }
+
+    fn connect_err(cfg: &Config) -> String {
+        match Client::connect(cfg) {
+            Ok(_) => panic!("handshake must be refused"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn md5_request_without_a_salt_is_an_error_not_a_panic() {
+        // `R`, length 8, code 5 — and no 4-byte salt after it.
+        let (cfg, server) = fake_server("", auth(5, &[]));
+        let err = connect_err(&cfg);
+        assert!(err.contains("MD5"), "got: {err}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn auth_request_shorter_than_its_code_is_not_authentication_ok() {
+        // An empty `R` body used to decode as code 0 (AuthenticationOk).
+        let (cfg, server) = fake_server("", msg(b'R', &[]));
+        let err = connect_err(&cfg);
+        assert!(err.contains("truncated"), "got: {err}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn sasl_request_without_a_mechanism_list_is_an_error() {
+        let (cfg, server) = fake_server("", msg(b'R', &10i32.to_be_bytes()));
+        let err = connect_err(&cfg);
+        assert!(err.contains("SASL"), "got: {err}");
+        server.join().unwrap();
     }
 
     #[test]
