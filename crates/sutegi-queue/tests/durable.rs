@@ -13,7 +13,8 @@ use std::time::Duration;
 use sutegi_json::Json;
 use sutegi_orm::pg::Pg;
 use sutegi_orm::Backend;
-use sutegi_queue::Queue;
+use sutegi_orm::Value;
+use sutegi_queue::{now_ms, Queue};
 
 // Both tests share one `sutegi_jobs` table, so they must not run concurrently
 // (one's DROP would nuke the other's rows). Serialize them.
@@ -146,6 +147,40 @@ fn terminal_failure_becomes_dead_letter() {
     );
 
     workers.stop();
+    pg.execute("DROP TABLE sutegi_jobs", &[]).unwrap();
+}
+
+#[test]
+fn a_poison_job_whose_worker_died_is_dead_lettered_by_the_claim() {
+    let _guard = DB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(pg) = store() else {
+        eprintln!("skipping: SUTEGI_PG_TEST_URL not set");
+        return;
+    };
+    pg.execute("DROP TABLE IF EXISTS sutegi_jobs", &[]).unwrap();
+
+    let mut queue = Queue::new(pg.clone()).visibility_timeout(Duration::from_millis(50));
+    queue.register("poison", |_job| panic!("a spent job must not run again"));
+    queue.migrate().unwrap();
+    let id = queue
+        .dispatch_with("poison", Json::Null, 2, Duration::ZERO)
+        .unwrap();
+    // Last attempt claimed, worker killed outright: never settled.
+    pg.execute(
+        "UPDATE sutegi_jobs SET locked_at = ?, attempts = 2 WHERE id = ?",
+        &[Value::Int(now_ms()), Value::Int(id)],
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(70));
+
+    assert!(queue.run_once().unwrap());
+    let failed = queue.failed(10).unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(
+        failed[0].get("last_error").and_then(Json::as_str),
+        Some("exceeded max_attempts (worker died)")
+    );
+    assert!(!queue.run_once().unwrap());
     pg.execute("DROP TABLE sutegi_jobs", &[]).unwrap();
 }
 

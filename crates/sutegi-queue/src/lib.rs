@@ -11,6 +11,12 @@
 //! timeout — **at-least-once** delivery. Retries, delays and priorities are
 //! columns, not in-memory timers, so a restart forgets nothing.
 //!
+//! A worker death spends an attempt like any failure: when the lease of a job
+//! whose budget is already used up expires, the next claim dead-letters it
+//! (`last_error = "exceeded max_attempts (worker died)"`) instead of running a
+//! poison job forever. Give jobs that must survive a crash `max_attempts > 1`.
+
+//!
 //! How the claim stays exclusive differs by backend, and that is the *only*
 //! dialect-aware line in this crate:
 //!
@@ -400,8 +406,9 @@ impl Queue {
     // --- running ----------------------------------------------------------
 
     /// Claim and run at most one ready job from the default queue. Returns
-    /// `true` if a job ran (so a caller can keep draining), `false` if the
-    /// queue was idle.
+    /// `true` if a job was taken off the queue — run, or dead-lettered because
+    /// its budget was already spent — so a caller can keep draining, `false`
+    /// if the queue was idle.
     pub fn run_once(&self) -> Result<bool, String> {
         self.run_once_on(DEFAULT_QUEUE, &AtomicBool::new(false))
     }
@@ -409,8 +416,20 @@ impl Queue {
     /// [`run_once`](Queue::run_once) against a named queue. `stop` is what the
     /// handler sees through [`JobCtx::should_stop`].
     pub fn run_once_on(&self, queue: &str, stop: &AtomicBool) -> Result<bool, String> {
-        let Some(job) = self.claim(queue)? else {
-            return Ok(false);
+        let job = match self.claim(queue)? {
+            Claim::Idle => return Ok(false),
+            Claim::DeadLettered { id, name, attempts } => {
+                sutegi_log::error!(
+                    "queue",
+                    "job dead-lettered: its worker died on the last attempt",
+                    queue = queue,
+                    job = name,
+                    job_id = id,
+                    attempts = attempts
+                );
+                return Ok(true);
+            }
+            Claim::Run(job) => job,
         };
         let payload = Json::parse(&job.payload).unwrap_or(Json::Null);
         let inherited = trace_fields(job.trace.as_deref());
@@ -471,9 +490,15 @@ impl Queue {
         Ok(true)
     }
 
-    /// Claim the next ready job in `queue`, or `None` when there is nothing to
-    /// do. One statement, so the claim is atomic on both backends.
-    fn claim(&self, queue: &str) -> Result<Option<Claimed>, String> {
+    /// Claim the next ready job in `queue`. One statement, so the claim is
+    /// atomic on both backends.
+    ///
+    /// A row whose lease expired with its attempt budget already spent belongs
+    /// to a worker that died mid-job (abort, OOM kill, segfault) on its last
+    /// try — no handler ever reached `settle`. Running it again would loop a
+    /// poison job forever, so the same `UPDATE` dead-letters it instead. Every
+    /// `CASE` reads the row as it was before the update, on both dialects.
+    fn claim(&self, queue: &str) -> Result<Claim, String> {
         let now = now_ms();
         let cutoff = now - self.visibility_timeout.as_millis() as i64;
         // Postgres needs SKIP LOCKED so concurrent workers step over rows
@@ -485,24 +510,34 @@ impl Queue {
             ""
         };
         let sql = format!(
-            "UPDATE sutegi_jobs SET locked_at = ?, attempts = attempts + 1 \
+            "UPDATE sutegi_jobs SET \
+               locked_at = CASE WHEN attempts >= max_attempts THEN NULL \
+                                ELSE CAST(? AS BIGINT) END, \
+               failed_at = CASE WHEN attempts >= max_attempts THEN CAST(? AS BIGINT) \
+                                ELSE NULL END, \
+               last_error = CASE WHEN attempts >= max_attempts THEN CAST(? AS TEXT) \
+                                 ELSE last_error END, \
+               attempts = CASE WHEN attempts >= max_attempts THEN attempts \
+                               ELSE attempts + 1 END \
              WHERE id = (SELECT id FROM sutegi_jobs \
                          WHERE failed_at IS NULL AND queue = ? AND run_at <= ? \
                            AND (locked_at IS NULL OR locked_at < ?) \
                          ORDER BY priority DESC, run_at, id LIMIT 1{skip}) \
-             RETURNING id, name, payload, attempts, max_attempts, trace"
+             RETURNING id, name, payload, attempts, max_attempts, trace, failed_at"
         );
         let rows = self.store.query(
             &sql,
             &[
                 Value::Int(now),
+                Value::Int(now),
+                Value::Text(WORKER_DIED.to_string()),
                 Value::Text(queue.to_string()),
                 Value::Int(now),
                 Value::Int(cutoff),
             ],
         )?;
         let Some(row) = rows.into_iter().next() else {
-            return Ok(None);
+            return Ok(Claim::Idle);
         };
         let text = |k: &str| {
             row.get(k)
@@ -511,7 +546,14 @@ impl Queue {
                 .to_string()
         };
         let int = |k: &str, d: i64| row.get(k).and_then(Json::as_i64).unwrap_or(d);
-        Ok(Some(Claimed {
+        if row.get("failed_at").and_then(Json::as_i64).is_some() {
+            return Ok(Claim::DeadLettered {
+                id: int("id", 0),
+                name: text("name"),
+                attempts: int("attempts", 0),
+            });
+        }
+        Ok(Claim::Run(Claimed {
             id: int("id", 0),
             name: text("name"),
             payload: text("payload"),
@@ -737,6 +779,24 @@ impl Dispatch<'_> {
     pub fn dispatch(self) -> Result<i64, String> {
         self.queue.enqueue(&self)
     }
+}
+
+/// The `last_error` of a job dead-lettered by [`Queue::claim`] rather than by
+/// a handler's own failure.
+const WORKER_DIED: &str = "exceeded max_attempts (worker died)";
+
+/// What one claim attempt found.
+enum Claim {
+    /// Nothing ready.
+    Idle,
+    /// A job to run.
+    Run(Claimed),
+    /// An expired lease on a spent budget, moved to the dead letter instead.
+    DeadLettered {
+        id: i64,
+        name: String,
+        attempts: i64,
+    },
 }
 
 /// A row this worker has claimed.
