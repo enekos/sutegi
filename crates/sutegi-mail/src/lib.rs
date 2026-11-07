@@ -79,6 +79,8 @@ impl Mailer {
     /// - `MAIL_DRIVER`: `log` (default) | `smtp` | `sendmail`.
     /// - `MAIL_LOG_PATH`: file for the `log` driver (stderr if unset).
     /// - `MAIL_SMTP_ADDR` (`host:port`), `MAIL_SMTP_USER`, `MAIL_SMTP_PASS`.
+    /// - `MAIL_SMTP_ALLOW_PLAINTEXT_AUTH` (`1`/`true`): send credentials to a
+    ///   non-loopback relay in cleartext. Off by default — see [`Smtp`].
     pub fn from_env() -> Result<Mailer, String> {
         let var = |k: &str| std::env::var(k).ok();
         let from = var("MAIL_FROM").ok_or("MAIL_FROM is not set")?;
@@ -94,6 +96,9 @@ impl Mailer {
                 if let (Some(u), Some(p)) = (var("MAIL_SMTP_USER"), var("MAIL_SMTP_PASS")) {
                     smtp = smtp.credentials(&u, &p);
                 }
+                let opt_in = var("MAIL_SMTP_ALLOW_PLAINTEXT_AUTH")
+                    .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"));
+                smtp = smtp.allow_plaintext_auth(opt_in);
                 Mailer::new(smtp, &from)
             }
             "sendmail" => Mailer::new(transports::Sendmail::new(), &from),
