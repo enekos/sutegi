@@ -1,17 +1,21 @@
 //! **Login throttling** — Laravel's `ThrottlesLogins`, DB-backed so every pod
-//! counts the same attempts. Fixed window: `max` hits per `per` seconds per
-//! key, where the key is whatever you rate — the convention for login is
-//! `login:<email>|<ip>`.
+//! counts the same attempts. Fixed window: `max` attempts per `per` seconds
+//! per key, where the key is whatever you rate.
+//!
+//! Gate with [`attempt`](Throttle::attempt), which counts the attempt and
+//! decides in **one atomic statement** — a separate `too_many` check followed
+//! by a later `hit` lets N concurrent requests all pass the check before any
+//! of them counts. The convention for login is `login:<email>|<ip>`.
 //!
 //! ```ignore
 //! let throttle = Throttle::new(db.clone()); // 5 attempts / 60 s
 //! let key = format!("login:{email}|{ip}");
-//! if let Some(retry) = throttle.too_many(&key)? {
+//! if let Some(retry) = throttle.attempt(&key)? {
 //!     return Err(Error::too_many_requests(format!("retry in {retry}s")));
 //! }
 //! match auth.users.authenticate(&email, &pw)? {
 //!     Some(user) => { throttle.clear(&key)?; /* login */ }
-//!     None => { throttle.hit(&key)?; /* 401 */ }
+//!     None => { /* 401 — the attempt is already counted */ }
 //! }
 //! ```
 
@@ -66,9 +70,27 @@ impl<B: Backend> Throttle<B> {
             .map(|_| ())
     }
 
+    /// Count one attempt against `key` and decide, atomically: `Ok(None)`
+    /// admits it, `Ok(Some(secs))` rejects it (more than `max` attempts in
+    /// the window; `secs` until it reopens). Increment and check are one
+    /// `INSERT … ON CONFLICT DO UPDATE … RETURNING` statement, so concurrent
+    /// attempts — across threads or pods — can never all slip under the
+    /// limit. Every attempt counts, successful or not, until
+    /// [`clear`](Throttle::clear) — call that on success.
+    pub fn attempt(&self, key: &str) -> Result<Option<i64>, String> {
+        let now = now_secs();
+        let (attempts, window_start) = self.count(key, now)?;
+        if attempts > self.max {
+            Ok(Some((window_start + self.per - now).max(1)))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Whether `key` is locked out right now; `Some(secs)` says how long
-    /// until the window reopens. Read-only — pair with [`hit`](Throttle::hit)
-    /// on failures and [`clear`](Throttle::clear) on success.
+    /// until the window reopens. Read-only and **not** a gate on its own:
+    /// checking here and counting later races under concurrency — gate with
+    /// [`attempt`](Throttle::attempt) instead.
     pub fn too_many(&self, key: &str) -> Result<Option<i64>, String> {
         let Some((attempts, window_start)) = self.row(key)? else {
             return Ok(None);
@@ -81,42 +103,11 @@ impl<B: Backend> Throttle<B> {
         }
     }
 
-    /// Record a failed attempt; returns the attempt count in the current
-    /// window. The increment is a single atomic `UPDATE`, so concurrent
-    /// failures across pods all count.
+    /// Record an attempt; returns the attempt count in the current window.
+    /// Atomic (the same single statement as [`attempt`](Throttle::attempt)),
+    /// so concurrent hits across pods all count.
     pub fn hit(&self, key: &str) -> Result<i64, String> {
-        let now = now_secs();
-        match self.row(key)? {
-            None => {
-                // The unique index backstops the insert race: a concurrent
-                // first-hit surfaces as a constraint error → count via UPDATE.
-                if self
-                    .backend
-                    .insert(
-                        "auth_throttle",
-                        &[
-                            ("key", Value::Text(key.to_string())),
-                            ("attempts", Value::Int(1)),
-                            ("window_start", Value::Int(now)),
-                        ],
-                        "id",
-                    )
-                    .is_ok()
-                {
-                    return Ok(1);
-                }
-                self.bump(key)
-            }
-            Some((_, window_start)) if now >= window_start + self.per => {
-                // Window elapsed: restart it.
-                self.backend.execute(
-                    "UPDATE auth_throttle SET attempts = 1, window_start = ? WHERE key = ?",
-                    &[Value::Int(now), Value::Text(key.to_string())],
-                )?;
-                Ok(1)
-            }
-            Some(_) => self.bump(key),
-        }
+        self.count(key, now_secs()).map(|(attempts, _)| attempts)
     }
 
     /// Forget `key` (successful login).
@@ -129,12 +120,34 @@ impl<B: Backend> Throttle<B> {
             .map(|_| ())
     }
 
-    fn bump(&self, key: &str) -> Result<i64, String> {
-        self.backend.execute(
-            "UPDATE auth_throttle SET attempts = attempts + 1 WHERE key = ?",
-            &[Value::Text(key.to_string())],
+    /// Increment `key`'s counter — restarting it if the window elapsed —
+    /// and return `(attempts, window_start)` after the increment, in one
+    /// statement. `SET` expressions all read the pre-update row.
+    fn count(&self, key: &str, now: i64) -> Result<(i64, i64), String> {
+        let row = self.backend.query_one(
+            "INSERT INTO auth_throttle (key, attempts, window_start) VALUES (?, 1, ?) \
+             ON CONFLICT (key) DO UPDATE SET \
+             attempts = CASE WHEN auth_throttle.window_start + ? <= ? \
+                        THEN 1 ELSE auth_throttle.attempts + 1 END, \
+             window_start = CASE WHEN auth_throttle.window_start + ? <= ? \
+                            THEN ? ELSE auth_throttle.window_start END \
+             RETURNING attempts, window_start",
+            &[
+                Value::Text(key.to_string()),
+                Value::Int(now),
+                Value::Int(self.per),
+                Value::Int(now),
+                Value::Int(self.per),
+                Value::Int(now),
+                Value::Int(now),
+            ],
         )?;
-        Ok(self.row(key)?.map(|(a, _)| a).unwrap_or(1))
+        row.as_ref()
+            .and_then(|r| {
+                let int_of = |k: &str| r.get(k).and_then(Json::as_f64).map(|f| f as i64);
+                Some((int_of("attempts")?, int_of("window_start")?))
+            })
+            .ok_or_else(|| "auth_throttle upsert returned no row".to_string())
     }
 
     fn row(&self, key: &str) -> Result<Option<(i64, i64)>, String> {
@@ -174,6 +187,55 @@ mod tests {
         assert!(retry > 0 && retry <= 60, "retry_after = {retry}");
         // Other keys are unaffected.
         assert_eq!(t.too_many("other").unwrap(), None);
+    }
+
+    #[test]
+    fn attempt_admits_exactly_max_then_locks() {
+        let t = store(5, 60);
+        let admitted = (0..20)
+            .filter(|_| t.attempt("k").unwrap().is_none())
+            .count();
+        assert_eq!(admitted, 5);
+        let retry = t.attempt("k").unwrap().unwrap();
+        assert!(retry > 0 && retry <= 60, "retry_after = {retry}");
+        t.clear("k").unwrap();
+        assert_eq!(t.attempt("k").unwrap(), None);
+    }
+
+    #[test]
+    fn concurrent_attempts_admit_only_max() {
+        let dir = std::env::temp_dir().join(format!(
+            "sutegi-throttle-{}-{}",
+            std::process::id(),
+            sutegi_crypto::now_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let t = Throttle::new(Db::open(path.to_str().unwrap()).unwrap()).max(5);
+        t.migrate().unwrap();
+        let admitted = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..20 {
+                s.spawn(|| {
+                    if t.attempt("login:a@b.co").unwrap().is_none() {
+                        admitted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(admitted.into_inner(), 5);
+    }
+
+    #[test]
+    fn attempt_window_restarts() {
+        let t = store(1, 60);
+        assert_eq!(t.attempt("k").unwrap(), None);
+        assert!(t.attempt("k").unwrap().is_some());
+        t.backend
+            .execute("UPDATE auth_throttle SET window_start = 1", &[])
+            .unwrap();
+        assert_eq!(t.attempt("k").unwrap(), None);
     }
 
     #[test]

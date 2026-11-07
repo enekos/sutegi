@@ -16,8 +16,8 @@
 //! ```
 //!
 //! The **first registered user becomes `admin`** (bootstrap convention);
-//! everyone after is a plain `user`. Six failed logins in a minute lock the
-//! email+IP pair out (429 with a retry hint).
+//! everyone after is a plain `user`. More than five login attempts a minute
+//! lock the email+IP pair out (429 with a retry hint).
 
 use std::sync::Arc;
 use sutegi::prelude::*;
@@ -108,8 +108,9 @@ fn main() -> std::io::Result<()> {
                     .map(|p| p.rsplit_once(':').map(|(host, _)| host).unwrap_or(p))
                     .unwrap_or_default()
                     .to_string();
+                // Count-then-decide in one atomic step (no check-then-hit race).
                 let key = format!("login:{email}|{ip}");
-                if let Some(retry) = throttle.too_many(&key)? {
+                if let Some(retry) = throttle.attempt(&key)? {
                     return Ok(json(
                         429,
                         &Json::obj(vec![
@@ -129,10 +130,8 @@ fn main() -> std::io::Result<()> {
                             a_login.login(c.req, &user, resp)
                         })
                     }
-                    None => {
-                        throttle.hit(&key)?;
-                        Err(Error::unauthorized("bad credentials"))
-                    }
+                    // The failed attempt is already counted by `attempt`.
+                    None => Err(Error::unauthorized("bad credentials")),
                 }
             },
         )
