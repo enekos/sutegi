@@ -105,6 +105,9 @@ fn main() -> std::io::Result<()> {
     let hub = channels.build();
 
     App::new("chat")
+        // Local demo: serve the /__channels manifest unguarded. Use `ops_guard`
+        // in production.
+        .ops_public()
         .get("/", "The chat page.", |_c| html(200, PAGE))
         .get("/channels.js", "The bundled channels client.", |_c| {
             Response::new(200)

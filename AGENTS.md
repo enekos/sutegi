@@ -4,6 +4,14 @@ Every sutegi app is self-describing over plain JSON/HTTP. You do not need source
 access, an SDK, or any integration code. The loop is: **discover → manifest →
 invoke**.
 
+## 0. Access
+
+The ops/agent surface (everything under `/__` except `/__health` and `/__ready`)
+is **closed by default**: an app with no `ops_guard` answers `403`. Send
+whatever credential the app's guard expects — usually
+`Authorization: Bearer <token>`. A `401`/`403` on `/__introspect` means you lack
+it, not that the app is not sutegi.
+
 ## 1. Discover the surface
 
 ```
@@ -58,6 +66,8 @@ Content-Type: application/json
   The `errors` map is keyed by dotted field path — fix those fields and retry.
 - `404 { "error": "unknown tool '<name>'" }` → no such tool.
 - `400 { "error": "..." }` → the body was not valid JSON.
+- `415 { "error": "..." }` → a non-empty body without `Content-Type:
+  application/json` (or `+json`).
 
 ## 4. Streaming tools (SSE)
 

@@ -8,12 +8,13 @@
 //!
 //! ```text
 //! export REDACTOR_TOKEN=dev-token          # or read the one printed at startup
-//! curl localhost:8080/__introspect         # the agent contract, self-described
-//! curl localhost:8080/__tools              # tool manifest
-//! # agent tools (open, framework-mounted):
-//! curl -X POST localhost:8080/__tools/redact -d '{"text":"mail a@b.com from 10.0.0.1"}'
-//! curl -X POST localhost:8080/__tools/detect -d '{"text":"call 555-123-4567"}'
-//! curl -N  -X POST localhost:8080/__tools/redact_stream/stream -d '{"text":"line a@b.com\nline 2"}'
+//! AUTH="Authorization: Bearer dev-token"
+//! curl -H "$AUTH" localhost:8080/__introspect   # the agent contract, self-described
+//! curl -H "$AUTH" localhost:8080/__tools        # tool manifest
+//! # agent tools (framework-mounted, behind the same token via ops_guard):
+//! curl -H "$AUTH" -X POST localhost:8080/__tools/redact -d '{"text":"mail a@b.com from 10.0.0.1"}'
+//! curl -H "$AUTH" -X POST localhost:8080/__tools/detect -d '{"text":"call 555-123-4567"}'
+//! curl -H "$AUTH" -N -X POST localhost:8080/__tools/redact_stream/stream -d '{"text":"line a@b.com\nline 2"}'
 //! # token-gated HTTP API + audit log:
 //! curl -H "Authorization: Bearer dev-token" -X POST localhost:8080/api/redact -d '{"text":"a@b.com"}'
 //! curl -H "Authorization: Bearer dev-token" localhost:8080/api/log
@@ -239,6 +240,8 @@ fn main() -> std::io::Result<()> {
 
     let ready = db.clone();
     App::new("redactor")
+        // The whole `/__` ops surface (introspect, metrics, tools) needs the token.
+        .ops_guard(bearer(&token))
         .state(db)
         .readiness(move || ready.query("SELECT 1", &[]).is_ok())
         .get("/", "Health check.", |_| "redactor up")

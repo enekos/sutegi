@@ -147,7 +147,7 @@ keep anything stronger in a table.
   Cross-connection ordering within a topic follows broker order: in-process
   is synchronous; PG delivers `NOTIFY` in commit order.
 - The `/__channels` endpoint, like the whole `/__` surface, is gated by
-  `App::ops_guard`. A cookie-authenticated socket endpoint MUST set
+  `App::ops_guard` (`403` when unset, unless `App::ops_public()`). A cookie-authenticated socket endpoint MUST set
   `check_origin` (CSWSH) — same rule as `App::ws`.
 
 ## Try it

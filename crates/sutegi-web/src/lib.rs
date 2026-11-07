@@ -374,6 +374,9 @@ pub struct App {
     routes: Vec<Route>,
     middleware: Vec<Middleware>,
     ops_guard: Option<Middleware>,
+    /// Explicit opt-in to serving the ops surface with no guard. Off by
+    /// default: no guard and no opt-in means the surface is closed (403).
+    ops_public: bool,
     models: Vec<Json>,
     capabilities: Option<Json>,
     search: Vec<Json>,
@@ -448,6 +451,7 @@ impl App {
             routes: Vec::new(),
             middleware: Vec::new(),
             ops_guard: None,
+            ops_public: false,
             models: Vec::new(),
             capabilities: None,
             search: Vec::new(),
@@ -761,23 +765,37 @@ impl App {
     /// `/__`-mounted route such as `/__migrations`. Returning `Some(resp)`
     /// denies the request with that response; `None` lets it through.
     ///
-    /// Introspection and tool invocation are **open by default** (that's the
-    /// agent-native contract). In any deployment where the agent surface must
-    /// not be public, set a guard here — e.g. require a shared token or an
-    /// internal network. This runs ahead of the global [`middleware`](Self::middleware)
-    /// chain, and unlike the probes and pre-`0.5.2` behaviour, it *can* gate
-    /// `/__introspect` and `/__metrics`.
+    /// The surface is **closed by default**: with neither a guard nor
+    /// [`ops_public`](Self::ops_public), every guarded `/__` request answers
+    /// `403 Forbidden` — tool invocation runs arbitrary app code against shared
+    /// state and introspection discloses the whole route/model map, so they
+    /// must never be reachable by accident. Set a guard here — e.g. require a
+    /// shared token or an internal network. This runs ahead of the global
+    /// [`middleware`](Self::middleware) chain, and unlike the probes and
+    /// pre-`0.5.2` behaviour, it *can* gate `/__introspect` and `/__metrics`.
     /// ```ignore
-    /// app.ops_guard(|req| match req.header("authorization") {
-    ///     Some(tok) if tok == expected => None,             // allow
+    /// let expected = format!("Bearer {token}");
+    /// app.ops_guard(move |req| match req.header("authorization") {
+    ///     Some(h) if sutegi_crypto::constant_time_eq(h.as_bytes(), expected.as_bytes()) => None,
     ///     _ => Some(Response::new(401).with_body(&b"unauthorized"[..])),
     /// })
     /// ```
+    /// [`bearer`] builds exactly this guard: `app.ops_guard(bearer(&token))`.
     pub fn ops_guard(
         mut self,
         guard: impl Fn(&Request) -> Option<Response> + Send + Sync + 'static,
     ) -> App {
         self.ops_guard = Some(Box::new(guard));
+        self
+    }
+
+    /// Serve the ops/agent surface (`/__introspect`, `/__metrics`, `/__tools*`
+    /// and every other `/__`-mounted route) **without any guard**. Only for
+    /// local development or a listener that is unreachable from outside; a
+    /// set [`ops_guard`](Self::ops_guard) still takes precedence. [`App::serve`]
+    /// prints a warning when this is on.
+    pub fn ops_public(mut self) -> App {
+        self.ops_public = true;
         self
     }
 
@@ -891,6 +909,7 @@ impl App {
         let after = Arc::new(self.after);
         let access_log = Arc::new(self.access_log);
         let logs_exposed = self.ops_guard.is_some();
+        let ops_public = self.ops_public;
         let ops_guard = Arc::new(self.ops_guard);
         let readiness = Arc::new(self.readiness);
         let state = Arc::new(self.state);
@@ -937,11 +956,21 @@ impl App {
                 // Runs before the global middleware chain AND before routing, so
                 // it protects the internal surface (tool routes live in the
                 // route table; introspect/metrics are matched below). Unset =
-                // open, the historical default.
+                // closed (403) unless the app opted in with `ops_public()`.
                 if ops_surface {
-                    if let Some(guard) = &*ops_guard {
-                        if let Some(resp) = guard(&req) {
-                            return resp;
+                    match &*ops_guard {
+                        Some(guard) => {
+                            if let Some(resp) = guard(&req) {
+                                return resp;
+                            }
+                        }
+                        None if ops_public => {}
+                        None => {
+                            return Error::forbidden(
+                                "ops surface is closed: configure App::ops_guard \
+                                 (or App::ops_public for local development)",
+                            )
+                            .into_response();
                         }
                     }
                 }
@@ -1072,6 +1101,15 @@ impl App {
         });
         println!("sutegi · {} on http://{addr}", self.name);
         println!("  ops: /__health /__ready /__metrics /__introspect");
+        if self.ops_guard.is_none() {
+            if self.ops_public {
+                println!(
+                    "  WARNING: ops surface (/__introspect /__metrics /__tools*) is PUBLIC — ops_public() with no ops_guard"
+                );
+            } else {
+                println!("  ops surface closed (403) — no ops_guard set; only /__health /__ready are served");
+            }
+        }
         if !self.listeners.is_empty() {
             let names: Vec<&str> = self.listeners.iter().map(|l| l.name.as_str()).collect();
             println!("  listeners: {}", names.join(" "));
@@ -2197,7 +2235,8 @@ mod tests {
 
     #[test]
     fn recent_logs_are_served_only_behind_an_ops_guard() {
-        let open = App::new("t").service();
+        // Even an explicitly public ops surface does not expose the log tail.
+        let open = App::new("t").ops_public().service();
         let get = |svc: &dyn Fn(Request) -> Response, path: &str, query: &str| {
             svc(Request {
                 path: path.into(),
@@ -2298,16 +2337,51 @@ mod tests {
     }
 
     #[test]
-    fn introspect_is_open_without_an_ops_guard() {
-        // Unchanged default: no guard => the agent surface is served.
+    fn ops_surface_is_closed_without_a_guard() {
+        // Fail closed: no guard and no opt-in => every guarded `/__` route is
+        // 403, including tool invocation, while probes and app routes work.
         let svc = App::new("t")
             .get("/", "home", |_c| text(200, "ok"))
+            .get("/__events", "app-mounted ops route", |_c| text(200, "x"))
+            .tool("t", "a tool", schema::object(vec![], &[]), |_c, _a| {
+                Ok(Json::Null)
+            })
             .service();
-        let resp = svc(Request {
-            path: "/__introspect".into(),
-            ..req(Method::Get, b"")
-        });
-        assert_eq!(resp.status, 200);
+        let call = |path: &str, method: Method| {
+            svc(Request {
+                path: path.into(),
+                ..req(method, b"")
+            })
+            .status
+        };
+        assert_eq!(call("/__introspect", Method::Get), 403);
+        assert_eq!(call("/__metrics", Method::Get), 403);
+        assert_eq!(call("/__tools", Method::Get), 403);
+        assert_eq!(call("/__tools/t", Method::Post), 403);
+        assert_eq!(call("//__tools/t/", Method::Post), 403);
+        assert_eq!(call("/__tools/t/stream", Method::Post), 403);
+        assert_eq!(call("/__events", Method::Get), 403);
+        assert_eq!(call("/__health", Method::Get), 200);
+        assert_eq!(call("/__ready", Method::Get), 200);
+        assert_eq!(call("/", Method::Get), 200);
+    }
+
+    #[test]
+    fn ops_public_opts_in_and_a_guard_still_wins() {
+        let open = App::new("t").ops_public().service();
+        let intro = |svc: &dyn Fn(Request) -> Response| {
+            svc(Request {
+                path: "/__introspect".into(),
+                ..req(Method::Get, b"")
+            })
+            .status
+        };
+        assert_eq!(intro(&open), 200);
+        let guarded = App::new("t")
+            .ops_public()
+            .ops_guard(|_req| Some(text(401, "nope")))
+            .service();
+        assert_eq!(intro(&guarded), 401);
     }
 
     #[test]
@@ -2333,6 +2407,7 @@ mod tests {
             .listener("noop", "Would panic if spawned.", |_ctx| {
                 panic!("spawned by service()")
             })
+            .ops_public()
             .service();
         let resp = svc(Request {
             path: "/__introspect".into(),

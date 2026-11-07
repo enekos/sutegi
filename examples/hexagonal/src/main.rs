@@ -51,6 +51,8 @@ fn main() -> std::io::Result<()> {
 
     // 3. Mount the inbound adapters — HTTP and AI both over the same use cases.
     let app = App::new("hexagonal-todo")
+        // Local demo: serve /__tools unguarded. Use `ops_guard` in production.
+        .ops_public()
         .readiness(|| true)
         .get("/", "Health check.", |_| "sutegi up");
     let app = inbound_http::register(app, Arc::clone(&create), list, complete);

@@ -72,6 +72,8 @@ fn main() -> std::io::Result<()> {
     let _workers = Arc::new(projections).start(); // held: dropping it stops the workers
 
     App::new("ledger-demo")
+        // Local demo: serve /__events unguarded. Use `ops_guard` in production.
+        .ops_public()
         .state(store)
         .post("/accounts/:id/deposit", "Deposit into an account.", |c| {
             let amount = amount_from(c)?;

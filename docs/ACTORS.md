@@ -111,7 +111,8 @@ App::new("myapp")
 ]
 ```
 
-`/__actors` is gated by `App::ops_guard` like the rest of the `/__` surface.
+`/__actors` is gated by `App::ops_guard` like the rest of the `/__` surface
+(`403` when no guard is set, unless `App::ops_public()`).
 Unsupervised actors opt in with `spawn_opts(actor, ActorOpts::new().name(..).registry(&reg))`.
 
 ## Honest limits

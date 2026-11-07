@@ -1,6 +1,7 @@
 //! The smallest useful sutegi app: routing + the built-in operational endpoints
-//! (`/__health`, `/__ready`, `/__metrics`, `/__introspect`), with graceful
-//! shutdown. No ORM, AI, queue, or derive compiled in.
+//! (`/__health`, `/__ready`; `/__metrics` and `/__introspect` answer 403 until an
+//! `ops_guard` is set), with graceful shutdown. No ORM, AI, queue, or derive
+//! compiled in.
 //!
 //! Handlers take a single [`Ctx`] and return anything that is `IntoResponse`
 //! (here, a plain `String`). `serve()` reads `HOST`/`PORT`/`WORKERS` from the

@@ -175,7 +175,10 @@ fn boot(addr: &'static str, build: impl FnOnce() -> App + Send + 'static) {
 
 fn chat_app() -> App {
     let hub = Channels::new().channel(room_channel()).build();
-    App::new("channels-e2e").channels("/channels", "The chat socket.", hub)
+    App::new("channels-e2e")
+        // The `/__channels` manifest is ops surface: closed without this.
+        .ops_public()
+        .channels("/channels", "The chat socket.", hub)
 }
 
 // --- tests -------------------------------------------------------------------
