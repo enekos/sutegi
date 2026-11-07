@@ -12,11 +12,11 @@
 //! curl -H "$AUTH" localhost:8080/__introspect   # the agent contract, self-described
 //! curl -H "$AUTH" localhost:8080/__tools        # tool manifest
 //! # agent tools (framework-mounted, behind the same token via ops_guard):
-//! curl -H "$AUTH" -X POST localhost:8080/__tools/redact -d '{"text":"mail a@b.com from 10.0.0.1"}'
-//! curl -H "$AUTH" -X POST localhost:8080/__tools/detect -d '{"text":"call 555-123-4567"}'
-//! curl -H "$AUTH" -N -X POST localhost:8080/__tools/redact_stream/stream -d '{"text":"line a@b.com\nline 2"}'
+//! curl -H "$AUTH" -X POST localhost:8080/__tools/redact -H 'content-type: application/json' -d '{"text":"mail a@b.com from 10.0.0.1"}'
+//! curl -H "$AUTH" -X POST localhost:8080/__tools/detect -H 'content-type: application/json' -d '{"text":"call 555-123-4567"}'
+//! curl -H "$AUTH" -N -X POST localhost:8080/__tools/redact_stream/stream -H 'content-type: application/json' -d '{"text":"line a@b.com\nline 2"}'
 //! # token-gated HTTP API + audit log:
-//! curl -H "Authorization: Bearer dev-token" -X POST localhost:8080/api/redact -d '{"text":"a@b.com"}'
+//! curl -H "Authorization: Bearer dev-token" -X POST localhost:8080/api/redact -H 'content-type: application/json' -d '{"text":"a@b.com"}'
 //! curl -H "Authorization: Bearer dev-token" localhost:8080/api/log
 //! ```
 

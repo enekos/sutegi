@@ -9,10 +9,10 @@
 //!
 //! ```text
 //! curl localhost:8080/__introspect
-//! curl -X POST localhost:8080/api/todos -d '{"title":"ship sutegi"}'
+//! curl -X POST localhost:8080/api/todos -H 'content-type: application/json' -d '{"title":"ship sutegi"}'
 //! curl localhost:8080/api/todos
 //! curl localhost:8080/api/todos/1
-//! curl -X POST localhost:8080/__tools/create_todo -d '{"title":"via agent"}'
+//! curl -X POST localhost:8080/__tools/create_todo -H 'content-type: application/json' -d '{"title":"via agent"}'
 //! ```
 //!
 //! `todo repl` drops into the tinker shell instead of serving — same app,

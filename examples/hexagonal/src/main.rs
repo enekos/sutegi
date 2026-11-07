@@ -7,9 +7,9 @@
 //! REPO=memory cargo run -p hexagonal-example     # in-memory adapter
 //!
 //! curl localhost:8080/api/todos
-//! curl -X POST localhost:8080/api/todos -d '{"title":"ship sutegi"}'
+//! curl -X POST localhost:8080/api/todos -H 'content-type: application/json' -d '{"title":"ship sutegi"}'
 //! curl -X POST localhost:8080/api/todos/1/complete
-//! curl -X POST localhost:8080/__tools/create_todo -d '{"title":"via agent"}'
+//! curl -X POST localhost:8080/__tools/create_todo -H 'content-type: application/json' -d '{"title":"via agent"}'
 //! ```
 
 mod adapters;

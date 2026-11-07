@@ -93,9 +93,13 @@ impl Ctx<'_> {
     }
 
     /// The request body parsed as JSON (empty body → empty object; malformed
-    /// body → a `400` [`Error`]).
+    /// body → a `400` [`Error`]; a body that is not declared JSON → `415`, see
+    /// [`json_body`]).
     pub fn json(&self) -> Result<Json, Error> {
-        json_body(self.req).map_err(Error::bad_request)
+        if !is_json_request(self.req) {
+            return Err(Error::new(415, UNSUPPORTED_JSON_TYPE));
+        }
+        parse_json(self.req).map_err(Error::bad_request)
     }
 
     /// Shared state of type `T`, registered via [`App::state`].
@@ -1709,8 +1713,38 @@ pub fn sse(
 
 // ---- extractors -----------------------------------------------------------
 
-/// Parse the request body as JSON.
+const UNSUPPORTED_JSON_TYPE: &str = "expected content-type: application/json";
+
+/// Is this request's body declared as JSON? `application/json` or any
+/// `application/*+json`, parameters ignored. A request with *no* body and no
+/// content type also passes (an argument-less call). Anything else — notably
+/// the `text/plain`, form and multipart types a cross-site HTML form can send
+/// without a CORS preflight — does not, which is what makes JSON endpoints
+/// (and `/__tools`) immune to form-based CSRF.
+fn is_json_request(req: &Request) -> bool {
+    let Some(ct) = req.header("content-type") else {
+        return req.body.is_empty();
+    };
+    let essence = ct
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    essence == "application/json"
+        || (essence.starts_with("application/") && essence.ends_with("+json"))
+}
+
+/// Parse the request body as JSON. Errors (without parsing) when the body is
+/// not declared JSON — see [`Ctx::json`], which maps that case to `415`.
 pub fn json_body(req: &Request) -> Result<Json, String> {
+    if !is_json_request(req) {
+        return Err(UNSUPPORTED_JSON_TYPE.to_string());
+    }
+    parse_json(req)
+}
+
+fn parse_json(req: &Request) -> Result<Json, String> {
     let s = std::str::from_utf8(&req.body).map_err(|_| "body is not valid UTF-8".to_string())?;
     if s.trim().is_empty() {
         return Ok(Json::Obj(BTreeMap::new()));
@@ -1970,7 +2004,9 @@ mod tests {
 
     #[test]
     fn json_body_parses_and_defaults_empty() {
-        let r = req(Method::Post, br#"{"a":1}"#);
+        let mut r = req(Method::Post, br#"{"a":1}"#);
+        r.headers
+            .push(("content-type".into(), "application/json".into()));
         assert_eq!(
             json_body(&r).unwrap().get("a").and_then(Json::as_i64),
             Some(1)
@@ -1982,6 +2018,55 @@ mod tests {
         );
         // Malformed JSON is an error.
         assert!(json_body(&req(Method::Post, b"{not json")).is_err());
+    }
+
+    #[test]
+    fn json_requires_a_json_content_type() {
+        let svc = App::new("t")
+            .ops_public()
+            .post("/echo", "echo", |c| Ok::<_, Error>(json(200, &c.json()?)))
+            .tool("t", "a tool", schema::object(vec![], &[]), |_c, _a| {
+                Ok(Json::Null)
+            })
+            .service();
+        let call = |path: &str, ct: Option<&str>, body: &[u8]| {
+            let mut r = Request {
+                path: path.into(),
+                ..req(Method::Post, body)
+            };
+            if let Some(ct) = ct {
+                r.headers.push(("Content-Type".into(), ct.into()));
+            }
+            svc(r).status
+        };
+        let body = br#"{"a":1}"#;
+        // The cross-site-form content types (no CORS preflight) are refused.
+        assert_eq!(call("/echo", Some("text/plain"), body), 415);
+        assert_eq!(
+            call("/echo", Some("application/x-www-form-urlencoded"), body),
+            415
+        );
+        assert_eq!(
+            call("/echo", Some("multipart/form-data; boundary=x"), body),
+            415
+        );
+        assert_eq!(call("/__tools/t", Some("text/plain"), body), 415);
+        // A body with no declared type is refused too.
+        assert_eq!(call("/echo", None, body), 415);
+        // JSON, with parameters and `+json` suffixes, case-insensitive.
+        assert_eq!(call("/echo", Some("application/json"), body), 200);
+        assert_eq!(
+            call("/echo", Some("Application/JSON; charset=utf-8"), body),
+            200
+        );
+        assert_eq!(
+            call("/echo", Some("application/merge-patch+json"), body),
+            200
+        );
+        assert_eq!(call("/__tools/t", Some("application/json"), body), 200);
+        // An argument-less call (no body, no type) still works.
+        assert_eq!(call("/__tools/t", None, b""), 200);
+        assert_eq!(call("/echo", Some("text/plain"), b""), 415);
     }
 
     #[test]

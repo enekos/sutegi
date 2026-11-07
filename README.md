@@ -25,7 +25,7 @@ cargo run -p todo-example -- 127.0.0.1:8080
 ```bash
 curl localhost:8080/__introspect              # full app surface as JSON
 curl localhost:8080/__tools                   # LLM tool-calling manifest
-curl -X POST localhost:8080/__tools/create_todo -d '{"title":"ship sutegi"}'
+curl -X POST localhost:8080/__tools/create_todo -H 'content-type: application/json' -d '{"title":"ship sutegi"}'
 curl localhost:8080/api/todos
 ```
 
