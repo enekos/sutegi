@@ -404,7 +404,7 @@ fn user_of(row: &Json) -> Result<User, String> {
 
 /// Trim, lowercase, and shape-check an email. Deliberately minimal — one `@`
 /// with something on both sides; real validation is delivery.
-fn normalize_email(email: &str) -> Result<String, String> {
+pub(crate) fn normalize_email(email: &str) -> Result<String, String> {
     let email = email.trim().to_lowercase();
     let ok = email.len() <= 254
         && email

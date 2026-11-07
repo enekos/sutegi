@@ -16,10 +16,12 @@
 //! ```
 //!
 //! The **first registered user becomes `admin`** (bootstrap convention);
-//! everyone after is a plain `user`. More than five login attempts a minute
-//! lock the email+IP pair out (429 with a retry hint).
+//! everyone after is a plain `user`. Login attempts are throttled per
+//! email+IP pair (5 a minute) and per account across all IPs (20 a minute);
+//! past either limit the answer is 429 with a retry hint.
 
 use std::sync::Arc;
+use sutegi::auth::login_key;
 use sutegi::prelude::*;
 
 fn main() -> std::io::Result<()> {
@@ -37,6 +39,9 @@ fn main() -> std::io::Result<()> {
     remember.migrate().expect("migrate remember tokens");
     let throttle = Arc::new(Throttle::new(db.clone())); // 5 attempts / 60 s
     throttle.migrate().expect("migrate throttle");
+    // Per-account limit, IP-independent: looser so one attacker can't
+    // trivially lock a real user out, but rotating IPs buys no extra guesses.
+    let account_throttle = Arc::new(Throttle::new(db.clone()).max(20));
 
     let secret = std::env::var("SESSION_SECRET")
         .unwrap_or_else(|_| "dev-only-secret-set-SESSION_SECRET".to_string());
@@ -108,9 +113,16 @@ fn main() -> std::io::Result<()> {
                     .map(|p| p.rsplit_once(':').map(|(host, _)| host).unwrap_or(p))
                     .unwrap_or_default()
                     .to_string();
-                // Count-then-decide in one atomic step (no check-then-hit race).
-                let key = format!("login:{email}|{ip}");
-                if let Some(retry) = throttle.attempt(&key)? {
+                // Count-then-decide in one atomic step per key (no check-
+                // then-hit race), keyed on the normalized email so case or
+                // whitespace variants share the counter.
+                let (client_key, account_key) =
+                    (login_key(email, Some(&ip)), login_key(email, None));
+                let limited = match throttle.attempt(&client_key)? {
+                    Some(retry) => Some(retry),
+                    None => account_throttle.attempt(&account_key)?,
+                };
+                if let Some(retry) = limited {
                     return Ok(json(
                         429,
                         &Json::obj(vec![
@@ -121,7 +133,8 @@ fn main() -> std::io::Result<()> {
                 }
                 match a_login.users.authenticate(email, password)? {
                     Some(user) => {
-                        throttle.clear(&key)?;
+                        throttle.clear(&client_key)?;
+                        account_throttle.clear(&account_key)?;
                         let resp = json(200, &user.to_json());
                         let remember = body.get("remember").and_then(Json::as_bool) == Some(true);
                         Ok::<_, Error>(if remember {

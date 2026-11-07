@@ -5,21 +5,26 @@
 //! Gate with [`attempt`](Throttle::attempt), which counts the attempt and
 //! decides in **one atomic statement** — a separate `too_many` check followed
 //! by a later `hit` lets N concurrent requests all pass the check before any
-//! of them counts. The convention for login is `login:<email>|<ip>`.
+//! of them counts. Rate two keys for login: the email+IP pair, and the email
+//! alone (so rotating IPs cannot buy more guesses against one account). Build
+//! the email part with [`login_key`] so `A@x.co ` and `a@x.co` share a
+//! counter.
 //!
 //! ```ignore
 //! let throttle = Throttle::new(db.clone()); // 5 attempts / 60 s
-//! let key = format!("login:{email}|{ip}");
-//! if let Some(retry) = throttle.attempt(&key)? {
-//!     return Err(Error::too_many_requests(format!("retry in {retry}s")));
+//! let keys = [login_key(&email, Some(&ip)), login_key(&email, None)];
+//! for key in &keys {
+//!     if let Some(retry) = throttle.attempt(key)? {
+//!         return Err(Error::too_many_requests(format!("retry in {retry}s")));
+//!     }
 //! }
 //! match auth.users.authenticate(&email, &pw)? {
-//!     Some(user) => { throttle.clear(&key)?; /* login */ }
+//!     Some(user) => { for k in &keys { throttle.clear(k)?; } /* login */ }
 //!     None => { /* 401 — the attempt is already counted */ }
 //! }
 //! ```
 
-use crate::users::now_secs;
+use crate::users::{normalize_email, now_secs};
 use sutegi_json::Json;
 use sutegi_orm::{Backend, ColType, Column, TableSchema, Value};
 
@@ -164,6 +169,21 @@ impl<B: Backend> Throttle<B> {
     }
 }
 
+/// The throttle key for a login attempt on `email`: normalized exactly as
+/// [`Users`](crate::Users) stores it (trimmed, lowercased), so case or
+/// whitespace variants of one address share a counter. `ip: Some(..)` gives
+/// the per-client `login:<email>|<ip>` key; `None` the per-account
+/// `login:<email>` key, which rotating IPs cannot dodge.
+pub fn login_key(email: &str, ip: Option<&str>) -> String {
+    // A malformed address can't log in anyway; trim+lowercase it the same
+    // way so its variants still collapse onto one key.
+    let email = normalize_email(email).unwrap_or_else(|_| email.trim().to_lowercase());
+    match ip {
+        Some(ip) => format!("login:{email}|{ip}"),
+        None => format!("login:{email}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +256,18 @@ mod tests {
             .execute("UPDATE auth_throttle SET window_start = 1", &[])
             .unwrap();
         assert_eq!(t.attempt("k").unwrap(), None);
+    }
+
+    #[test]
+    fn login_key_normalizes_email() {
+        assert_eq!(
+            login_key("  Eneko@Example.COM ", Some("1.2.3.4")),
+            login_key("eneko@example.com", Some("1.2.3.4"))
+        );
+        assert_eq!(login_key("A@B.co", None), "login:a@b.co");
+        assert_ne!(login_key("a@b.co", None), login_key("a@b.co", Some("ip")));
+        // Malformed input still collapses case/whitespace variants.
+        assert_eq!(login_key(" NOPE ", None), login_key("nope", None));
     }
 
     #[test]

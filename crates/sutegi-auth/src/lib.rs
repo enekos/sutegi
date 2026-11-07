@@ -58,7 +58,7 @@ pub use flows::AuthMail;
 pub use links::Links;
 pub use password::{hash_password, needs_rehash, verify_password, DEFAULT_ITERATIONS};
 pub use remember::{Remember, REMEMBER_COOKIE, REMEMBER_TTL};
-pub use throttle::Throttle;
+pub use throttle::{login_key, Throttle};
 pub use tokens::{ApiToken, Tokens, TOKEN_PREFIX};
 pub use users::{User, Users, MAX_PASSWORD_LEN, MIN_PASSWORD_LEN};
 
