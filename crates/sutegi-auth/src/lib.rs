@@ -111,13 +111,14 @@ impl<B: Backend> Auth<B> {
         self
     }
 
-    /// Stamp `user` into the (signed) session and attach it to `resp`.
-    /// Existing session data is preserved. The session carries a fingerprint
-    /// of the current password hash, so a password change invalidates every
+    /// Stamp `user` into a **fresh** (signed) session and attach it to
+    /// `resp`. Any pre-login session data — including its CSRF token — is
+    /// discarded, so nothing an attacker planted or learned before login
+    /// carries over (session fixation). The session carries a fingerprint of
+    /// the current password hash, so a password change invalidates every
     /// other session on the next store-checking lookup.
     pub fn login(&self, req: &Request, user: &User, resp: Response) -> Response {
-        let mut s = self.sessions.load(req);
-        self.stamp(&mut s, user.id);
+        let s = self.fresh_session(req, user.id);
         self.sessions.save(&s, resp)
     }
 
@@ -244,8 +245,7 @@ impl<B: Backend> Auth<B> {
         let Some(user) = self.users.find(uid)? else {
             return Ok(None);
         };
-        let mut s = self.sessions.load(req);
-        self.stamp(&mut s, user.id);
+        let s = self.fresh_session(req, user.id);
         Ok(Some(Identified {
             user,
             via_remember: true,
@@ -260,6 +260,15 @@ impl<B: Backend> Auth<B> {
         let mut s = self.sessions.load(req);
         let token = self.sessions.csrf(&mut s)?;
         Ok((token, self.sessions.save(&s, resp)))
+    }
+
+    /// A session holding only `uid`'s login stamp: whatever the request's
+    /// session carried before authentication is dropped.
+    fn fresh_session(&self, req: &Request, uid: i64) -> sutegi_session::Session {
+        let mut s = self.sessions.load(req);
+        s.clear();
+        self.stamp(&mut s, uid);
+        s
     }
 
     fn stamp(&self, s: &mut sutegi_session::Session, uid: i64) {
@@ -779,6 +788,31 @@ mod tests {
         let mut other = request(vec![("Authorization".into(), "Bearer abc".into())]);
         other.method = Method::Post;
         assert_eq!(guard(&other).unwrap().status, 419);
+    }
+
+    #[test]
+    fn login_starts_a_fresh_session() {
+        let auth = rig();
+        let user = auth.users.register("fix@a.co", "password1").unwrap();
+        // Pre-login session: a CSRF token (known to whoever planted it) and
+        // arbitrary attacker-chosen state.
+        let (old_csrf, resp) = auth.csrf(&request(vec![]), Response::new(200)).unwrap();
+        let mut planted = auth
+            .sessions
+            .load(&request(vec![("Cookie".into(), cookie_of(&resp))]));
+        planted.set("role_hint", Json::str("admin"));
+        let pre = cookie_of(&auth.sessions.save(&planted, Response::new(200)));
+
+        let post = cookie_of(&auth.login(
+            &request(vec![("Cookie".into(), pre)]),
+            &user,
+            Response::new(200),
+        ));
+        let req = request(vec![("Cookie".into(), post)]);
+        let s = auth.sessions.load(&req);
+        assert!(s.get("role_hint").is_none());
+        assert!(!auth.sessions.verify_csrf(&s, &old_csrf));
+        assert_eq!(auth.current(&req).unwrap().unwrap().id, user.id);
     }
 
     #[test]
