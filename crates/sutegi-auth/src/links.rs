@@ -15,7 +15,18 @@ pub struct Links {
 impl Links {
     /// Use a long, random, configured secret (it can be the session secret,
     /// but a dedicated one is cleaner to rotate).
+    ///
+    /// # Panics
+    ///
+    /// If `secret` is shorter than [`sutegi_session::MIN_SECRET_LEN`] bytes.
     pub fn new(secret: &[u8]) -> Links {
+        assert!(
+            secret.len() >= sutegi_session::MIN_SECRET_LEN,
+            "Links::new: secret is {} bytes, need at least {} \
+             (generate one with `openssl rand -hex 32`)",
+            secret.len(),
+            sutegi_session::MIN_SECRET_LEN
+        );
         Links {
             secret: secret.to_vec(),
         }
@@ -58,19 +69,30 @@ impl Links {
 mod tests {
     use super::*;
 
+    const KEY: &[u8] = b"links-test-secret-0123456789abcdef";
+
+    #[test]
+    #[should_panic(expected = "need at least 32")]
+    fn short_secret_is_rejected() {
+        let _ = Links::new(b"secret");
+    }
+
     #[test]
     fn roundtrip_and_scoping() {
-        let links = Links::new(b"secret");
+        let links = Links::new(KEY);
         let t = links.mint("verify", 42, 1_000, "");
         assert_eq!(links.verify("verify", &t, 999), Some((42, String::new())));
         assert_eq!(links.verify("reset", &t, 999), None); // wrong purpose
         assert_eq!(links.verify("verify", &t, 1_001), None); // expired
-        assert_eq!(Links::new(b"other").verify("verify", &t, 0), None); // wrong key
+        assert_eq!(
+            Links::new(b"other-secret-0123456789abcdef01234").verify("verify", &t, 0),
+            None
+        ); // wrong key
     }
 
     #[test]
     fn bind_travels_and_tampering_fails() {
-        let links = Links::new(b"secret");
+        let links = Links::new(KEY);
         let t = links.mint("reset", 7, i64::MAX, "abc123");
         assert_eq!(links.verify("reset", &t, 0), Some((7, "abc123".into())));
 

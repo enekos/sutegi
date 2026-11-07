@@ -452,7 +452,10 @@ mod tests {
         let db = Db::memory().unwrap();
         let users = Users::new(db).iterations(1_000);
         users.migrate().unwrap();
-        Arc::new(Auth::new(users, Sessions::new(b"test-secret").insecure()))
+        Arc::new(Auth::new(
+            users,
+            Sessions::new(b"test-secret-0123456789abcdef012345").insecure(),
+        ))
     }
 
     fn request(headers: Vec<(String, String)>) -> Request {
@@ -498,7 +501,7 @@ mod tests {
         let auth_rig = rig();
         let auth = Auth {
             users: Users::new(auth_rig.users.backend().clone()).iterations(1_000),
-            sessions: Sessions::new(b"test-secret").insecure(),
+            sessions: Sessions::new(b"test-secret-0123456789abcdef012345").insecure(),
             remember: None,
             ttl: 0, // expires immediately (ttl(0) would clamp to 1)
         };
@@ -567,7 +570,13 @@ mod tests {
         users.migrate().unwrap();
         let remember = Remember::new(db).insecure();
         remember.migrate().unwrap();
-        Arc::new(Auth::new(users, Sessions::new(b"test-secret").insecure()).remember(remember))
+        Arc::new(
+            Auth::new(
+                users,
+                Sessions::new(b"test-secret-0123456789abcdef012345").insecure(),
+            )
+            .remember(remember),
+        )
     }
 
     fn cookies_of(resp: &Response) -> Vec<(String, String)> {

@@ -19,7 +19,7 @@ fn splitmix(state: &mut u64) -> u64 {
 
 #[test]
 fn token_round_trips_and_verify_never_panics() {
-    let s = Sessions::new(b"super-secret-key");
+    let s = Sessions::new(b"super-secret-key-0123456789abcdef");
     let mut seed = 0x0000_0053_4553_0000u64; // "SES"
     for _ in 0..10_000 {
         // Round-trip: a freshly-signed token verifies back to its value.
@@ -48,7 +48,7 @@ fn token_round_trips_and_verify_never_panics() {
 
 #[test]
 fn tampering_is_rejected() {
-    let s = Sessions::new(b"key");
+    let s = Sessions::new(b"key-0123456789abcdef0123456789abcd");
     let tok = s.token("user=42;role=admin");
 
     // Flip a character in the payload half → must fail.
@@ -64,6 +64,6 @@ fn tampering_is_rejected() {
     assert_eq!(s.verify_token(&format!("{hex}.deadbeef")), None);
 
     // A token minted with a different key must not verify here.
-    let other = Sessions::new(b"different-key");
+    let other = Sessions::new(b"different-key-0123456789abcdef0123");
     assert_eq!(s.verify_token(&other.token("x")), None);
 }
