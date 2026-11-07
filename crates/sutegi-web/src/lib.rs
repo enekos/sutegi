@@ -1610,10 +1610,11 @@ pub fn cors_credentialed(
 }
 
 /// A pre-middleware requiring `Authorization: Bearer <token>`; else `401`.
+/// The header is compared in constant time (no early exit on a mismatch).
 pub fn bearer(token: &str) -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static {
     let expected = format!("Bearer {}", token);
     move |req: &Request| match req.header("authorization") {
-        Some(h) if h == expected => None,
+        Some(h) if sutegi_crypto::constant_time_eq(h.as_bytes(), expected.as_bytes()) => None,
         _ => Some(text(401, "401 Unauthorized").with_header("www-authenticate", "Bearer")),
     }
 }
@@ -1628,7 +1629,7 @@ pub fn basic(
         sutegi_crypto::base64_encode(format!("{}:{}", user, pass).as_bytes())
     );
     move |req: &Request| match req.header("authorization") {
-        Some(h) if h == expected => None,
+        Some(h) if sutegi_crypto::constant_time_eq(h.as_bytes(), expected.as_bytes()) => None,
         _ => Some(
             text(401, "401 Unauthorized").with_header("www-authenticate", "Basic realm=\"sutegi\""),
         ),
@@ -2018,6 +2019,26 @@ mod tests {
         );
         // Malformed JSON is an error.
         assert!(json_body(&req(Method::Post, b"{not json")).is_err());
+    }
+
+    #[test]
+    fn bearer_and_basic_accept_only_the_exact_credential() {
+        let with = |v: &str| {
+            let mut r = req(Method::Get, b"");
+            r.headers.push(("authorization".into(), v.into()));
+            r
+        };
+        let b = bearer("s3cret");
+        assert!(b(&with("Bearer s3cret")).is_none());
+        for bad in ["Bearer s3cre", "Bearer s3cretX", "Bearer S3cret", ""] {
+            assert_eq!(b(&with(bad)).map(|r| r.status), Some(401));
+        }
+        assert_eq!(b(&req(Method::Get, b"")).map(|r| r.status), Some(401));
+        let auth = basic("u", "p");
+        let good = format!("Basic {}", sutegi_crypto::base64_encode(b"u:p"));
+        assert!(auth(&with(&good)).is_none());
+        let bad = format!("Basic {}", sutegi_crypto::base64_encode(b"u:q"));
+        assert_eq!(auth(&with(&bad)).map(|r| r.status), Some(401));
     }
 
     #[test]
