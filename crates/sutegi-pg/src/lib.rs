@@ -4,7 +4,8 @@
 //! socket; share work across threads with a [`Pool`].
 //!
 //! What it supports:
-//! - Auth: **SCRAM-SHA-256** (the modern default), **MD5**, and cleartext.
+//! - Auth: **SCRAM-SHA-256** (the modern default), **MD5**, and cleartext —
+//!   the last refused unless opted into via [`Config::require_auth`].
 //! - The **extended query protocol** with bound parameters (text format),
 //!   so every query is parameterized and injection-safe.
 //! - Rows decoded straight into [`sutegi_json::Json`], typed by column OID —
@@ -66,6 +67,82 @@ pub struct Config {
     /// Reuse server-side prepared statements per connection (the default).
     /// Set `false` to force every query through an unnamed statement.
     pub statement_cache: bool,
+    /// Which authentication methods the server may ask for. Defaults to
+    /// [`AuthMethods::default`]: SCRAM-SHA-256, MD5 and trust, but never a
+    /// cleartext password. Set from a URL with libpq's `require_auth` param.
+    pub require_auth: AuthMethods,
+}
+
+/// The authentication exchanges a client will take part in — libpq's
+/// `require_auth`. With no TLS on the wire the *server* (or a MITM) picks the
+/// method, so whatever is allowed here is what an attacker can steer to.
+///
+/// The default refuses a cleartext password (it would hand the password to
+/// whoever answers) and keeps MD5 for legacy servers; MD5 leaks only a
+/// salted hash, but it is a replayable credential — drop it with
+/// `require_auth=scram-sha-256` once every server speaks SCRAM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthMethods {
+    /// No challenge at all (`trust`): the server answers `AuthenticationOk`
+    /// straight away. libpq name: `none`.
+    pub none: bool,
+    /// Cleartext password. libpq name: `password`.
+    pub password: bool,
+    /// MD5-hashed password. libpq name: `md5`.
+    pub md5: bool,
+    /// SCRAM-SHA-256, which also authenticates the server. libpq name:
+    /// `scram-sha-256`.
+    pub scram_sha_256: bool,
+}
+
+impl Default for AuthMethods {
+    fn default() -> Self {
+        AuthMethods {
+            none: true,
+            password: false,
+            md5: true,
+            scram_sha_256: true,
+        }
+    }
+}
+
+impl std::str::FromStr for AuthMethods {
+    type Err = String;
+
+    /// libpq syntax: a comma-separated list of the methods allowed
+    /// (`scram-sha-256,md5`), or of methods forbidden, each prefixed `!`
+    /// (`!password,!md5`); the two forms cannot be mixed. A negated list
+    /// starts from *everything* allowed, as libpq does — including cleartext.
+    fn from_str(s: &str) -> Result<Self, String> {
+        let entries: Vec<&str> = s.split(',').map(str::trim).collect();
+        let negated = entries.first().is_some_and(|e| e.starts_with('!'));
+        let mut methods = AuthMethods {
+            none: negated,
+            password: negated,
+            md5: negated,
+            scram_sha_256: negated,
+        };
+        for entry in entries {
+            let name = match (negated, entry.strip_prefix('!')) {
+                (true, Some(name)) => name,
+                (false, None) => entry,
+                _ => {
+                    return Err(format!(
+                        "require_auth cannot mix negated and plain methods: {s}"
+                    ))
+                }
+            };
+            let slot = match name {
+                "none" => &mut methods.none,
+                "password" => &mut methods.password,
+                "md5" => &mut methods.md5,
+                "scram-sha-256" => &mut methods.scram_sha_256,
+                other => return Err(format!("unsupported require_auth method: {other:?}")),
+            };
+            *slot = !negated;
+        }
+        Ok(methods)
+    }
 }
 
 impl fmt::Debug for Config {
@@ -78,6 +155,7 @@ impl fmt::Debug for Config {
             .field("dbname", &self.dbname)
             .field("timeout", &self.timeout)
             .field("statement_cache", &self.statement_cache)
+            .field("require_auth", &self.require_auth)
             .finish()
     }
 }
@@ -92,21 +170,25 @@ impl Default for Config {
             dbname: "postgres".into(),
             timeout: Some(Duration::from_secs(30)),
             statement_cache: true,
+            require_auth: AuthMethods::default(),
         }
     }
 }
 
 impl Config {
-    /// Parse a `postgres://user:password@host:port/dbname` URL. `postgresql://`
-    /// is accepted too; password and port are optional.
+    /// Parse a `postgres://user:password@host:port/dbname?params` URL.
+    /// `postgresql://` is accepted too; password, port and params are
+    /// optional. Understood params: `require_auth` (see [`AuthMethods`]).
     pub fn from_url(url: &str) -> Result<Config, String> {
         let rest = url
             .strip_prefix("postgres://")
             .or_else(|| url.strip_prefix("postgresql://"))
             .ok_or_else(|| "url must start with postgres:// or postgresql://".to_string())?;
 
-        // Strip any query string (`?sslmode=…`); we don't act on params yet.
-        let rest = rest.split('?').next().unwrap_or(rest);
+        let (rest, query) = match rest.split_once('?') {
+            Some((r, q)) => (r, Some(q)),
+            None => (rest, None),
+        };
 
         let (authority, dbname) = match rest.split_once('/') {
             Some((a, db)) => (a, db.to_string()),
@@ -134,7 +216,7 @@ impl Config {
             None => (hostport.to_string(), 5432),
         };
 
-        Ok(Config {
+        let mut cfg = Config {
             host: if host.is_empty() {
                 "localhost".into()
             } else {
@@ -150,17 +232,38 @@ impl Config {
             },
             timeout: Some(Duration::from_secs(30)),
             statement_cache: true,
-        })
+            require_auth: AuthMethods::default(),
+        };
+        if let Some(query) = query {
+            cfg.apply_params(query)?;
+        }
+        Ok(cfg)
+    }
+
+    /// Act on the connection parameters this client understands; others
+    /// (`application_name`, `connect_timeout`, …) are accepted and ignored.
+    fn apply_params(&mut self, query: &str) -> Result<(), String> {
+        for pair in query.split('&').filter(|p| !p.is_empty()) {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            if key == "require_auth" {
+                self.require_auth = percent_decode(value).parse()?;
+            }
+        }
+        Ok(())
     }
 
     /// Build from the environment: `DATABASE_URL` if present, otherwise the
     /// standard `PGHOST`/`PGPORT`/`PGUSER`/`PGPASSWORD`/`PGDATABASE` vars
-    /// (each with a sensible default).
+    /// (each with a sensible default), plus `PGREQUIREAUTH`.
     pub fn from_env() -> Result<Config, String> {
         if let Ok(url) = std::env::var("DATABASE_URL") {
             return Config::from_url(&url);
         }
         let var = |k: &str| std::env::var(k).ok();
+        let require_auth = match var("PGREQUIREAUTH") {
+            Some(v) => v.parse()?,
+            None => AuthMethods::default(),
+        };
         Ok(Config {
             host: var("PGHOST").unwrap_or_else(|| "localhost".into()),
             port: var("PGPORT").and_then(|p| p.parse().ok()).unwrap_or(5432),
@@ -169,6 +272,7 @@ impl Config {
             dbname: var("PGDATABASE").unwrap_or_else(|| "postgres".into()),
             timeout: Some(Duration::from_secs(30)),
             statement_cache: true,
+            require_auth,
         })
     }
 }
@@ -207,5 +311,47 @@ mod config_tests {
         assert!(!printed.contains("top-secret"), "{printed}");
         assert!(printed.contains("<redacted>"), "{printed}");
         assert!(printed.contains("\"app\""), "{printed}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleartext_is_refused_by_default_and_md5_kept() {
+        let cfg = Config::from_url("postgres://u:p@h/db").unwrap();
+        assert!(!cfg.require_auth.password);
+        assert!(cfg.require_auth.md5 && cfg.require_auth.scram_sha_256);
+        assert_eq!(Config::default().require_auth, cfg.require_auth);
+    }
+
+    #[test]
+    fn require_auth_url_param_follows_libpq() {
+        let only_scram = Config::from_url("postgres://u:p@h/db?require_auth=scram-sha-256")
+            .unwrap()
+            .require_auth;
+        assert_eq!(
+            only_scram,
+            AuthMethods {
+                none: false,
+                password: false,
+                md5: false,
+                scram_sha_256: true,
+            }
+        );
+        let opt_in = Config::from_url(
+            "postgres://u:p@h/db?application_name=x&require_auth=password%2Cscram-sha-256",
+        )
+        .unwrap()
+        .require_auth;
+        assert!(opt_in.password && opt_in.scram_sha_256 && !opt_in.md5 && !opt_in.none);
+
+        let negated: AuthMethods = "!md5,!none".parse().unwrap();
+        assert!(negated.password && negated.scram_sha_256 && !negated.md5 && !negated.none);
+
+        assert!("md5,!password".parse::<AuthMethods>().is_err());
+        assert!("gss".parse::<AuthMethods>().is_err());
+        assert!(Config::from_url("postgres://u:p@h/db?require_auth=").is_err());
     }
 }

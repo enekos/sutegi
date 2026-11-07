@@ -114,8 +114,16 @@ impl Client {
         }
     }
 
+    /// Drive the authentication exchange to `AuthenticationOk`.
+    ///
+    /// The server picks the method, so with no TLS a MITM picks it too. Two
+    /// rules keep that from becoming a downgrade: a method outside
+    /// [`Config::require_auth`] is refused before any secret is sent (cleartext
+    /// is off by default), and once SCRAM has started, `AuthenticationOk` is
+    /// accepted only after the server's final signature verified.
     fn authenticate(&mut self, cfg: &Config) -> Result<(), String> {
-        let mut scram: Option<Scram> = None;
+        let allowed = cfg.require_auth;
+        let mut state = AuthState::Start;
         loop {
             let (tag, body) = self.recv()?;
             match tag {
@@ -129,40 +137,83 @@ impl Client {
                     let code = be_i32(&body, 0);
                     let data = body.get(4..).unwrap_or_default();
                     match code {
-                        0 => return Ok(()),             // AuthenticationOk
-                        3 => self.auth_cleartext(cfg)?, // AuthenticationCleartextPassword
+                        // AuthenticationOk
+                        0 => {
+                            return match state {
+                                AuthState::Start if allowed.none => Ok(()),
+                                AuthState::Start => Err("server skipped authentication, \
+                                     which require_auth does not allow"
+                                    .into()),
+                                AuthState::PasswordSent | AuthState::ScramVerified => Ok(()),
+                                AuthState::Scram(_) => Err("server sent AuthenticationOk \
+                                     before proving its SCRAM signature; refusing"
+                                    .into()),
+                            };
+                        }
+                        // AuthenticationCleartextPassword
+                        3 => {
+                            state.expect_start("cleartext password")?;
+                            if !allowed.password {
+                                return Err("server requested a cleartext password; refused \
+                                     (opt in with require_auth=password)"
+                                    .into());
+                            }
+                            self.auth_cleartext(cfg)?;
+                            state = AuthState::PasswordSent;
+                        }
+                        // AuthenticationMD5Password: 4-byte salt follows.
                         5 => {
-                            // AuthenticationMD5Password: 4-byte salt follows.
+                            state.expect_start("MD5 password")?;
+                            if !allowed.md5 {
+                                return Err("server requested MD5 password auth, \
+                                     which require_auth does not allow"
+                                    .into());
+                            }
                             let salt = body
                                 .get(4..8)
                                 .ok_or("truncated MD5 authentication request")?;
                             self.auth_md5(cfg, salt)?;
+                            state = AuthState::PasswordSent;
                         }
+                        // AuthenticationSASL: NUL-separated mechanism list.
                         10 => {
-                            // AuthenticationSASL: NUL-separated mechanism list.
+                            state.expect_start("SASL")?;
+                            if !allowed.scram_sha_256 {
+                                return Err("server requested SCRAM-SHA-256, \
+                                     which require_auth does not allow"
+                                    .into());
+                            }
                             let mechs = parse_cstr_list(data);
                             if !mechs.iter().any(|m| m == "SCRAM-SHA-256") {
                                 return Err(format!(
                                     "server offered no supported SASL mechanism (got {mechs:?})"
                                 ));
                             }
-                            scram = Some(self.scram_first(cfg)?);
+                            state = AuthState::Scram(self.scram_first(cfg)?);
                         }
+                        // AuthenticationSASLContinue: server-first message.
                         11 => {
-                            // AuthenticationSASLContinue: server-first message.
-                            let s = scram.as_mut().ok_or("SASL continue before SASL start")?;
+                            let AuthState::Scram(s) = &mut state else {
+                                return Err("SASL continue outside a SASL exchange".into());
+                            };
+                            if s.server_signature.is_some() {
+                                return Err("duplicate SASL continue".into());
+                            }
                             let server_first =
                                 std::str::from_utf8(data).map_err(|_| "non-utf8 SASL data")?;
                             let client_final = s.handle_server_first(cfg, server_first)?;
                             // SASLResponse: just the message bytes.
                             self.send_msg(b'p', client_final.as_bytes())?;
                         }
+                        // AuthenticationSASLFinal: verify the server signature.
                         12 => {
-                            // AuthenticationSASLFinal: verify the server signature.
-                            let s = scram.as_ref().ok_or("SASL final before SASL start")?;
+                            let AuthState::Scram(s) = &state else {
+                                return Err("SASL final outside a SASL exchange".into());
+                            };
                             let server_final =
                                 std::str::from_utf8(data).map_err(|_| "non-utf8 SASL data")?;
                             s.verify_server_final(server_final)?;
+                            state = AuthState::ScramVerified;
                         }
                         other => return Err(format!("unsupported auth request code {other}")),
                     }
@@ -688,6 +739,27 @@ pub(crate) fn parse_error(body: &[u8]) -> String {
 // SCRAM-SHA-256 client state (RFC 5802 / RFC 7677).
 // ---------------------------------------------------------------------------
 
+/// Where the authentication exchange is. A challenge is only legal from
+/// `Start`, and `AuthenticationOk` only from a state that proved something.
+enum AuthState {
+    Start,
+    /// A cleartext or MD5 response went out; the server judges it.
+    PasswordSent,
+    /// SCRAM started; the server has not yet proven its signature.
+    Scram(Scram),
+    /// The server's SCRAM signature checked out.
+    ScramVerified,
+}
+
+impl AuthState {
+    fn expect_start(&self, what: &str) -> Result<(), String> {
+        match self {
+            AuthState::Start => Ok(()),
+            _ => Err(format!("server requested {what} auth mid-exchange")),
+        }
+    }
+}
+
 struct Scram {
     client_nonce: String,
     client_first_bare: String,
@@ -1077,6 +1149,95 @@ mod tests {
         let err = connect_err(&cfg);
         assert!(err.contains("read body"), "got: {err}");
         server.join().unwrap();
+    }
+
+    fn ready() -> Vec<u8> {
+        msg(b'Z', b"I")
+    }
+
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn a_cleartext_request_is_refused_and_the_password_never_sent() {
+        let (cfg, server) = fake_server("", auth(3, &[]));
+        let err = connect_err(&cfg);
+        assert!(err.contains("cleartext"), "got: {err}");
+        let sent = server.join().unwrap();
+        assert!(
+            !contains(&sent, b"hunter2"),
+            "password leaked to the server"
+        );
+    }
+
+    #[test]
+    fn cleartext_is_sent_only_after_an_explicit_opt_in() {
+        let script = [auth(3, &[]), auth(0, &[]), ready()].concat();
+        let (cfg, server) = fake_server("?require_auth=password", script);
+        drop(Client::connect(&cfg).expect("opted into cleartext"));
+        assert!(contains(&server.join().unwrap(), b"hunter2\0"));
+    }
+
+    #[test]
+    fn authentication_ok_mid_scram_is_a_downgrade_and_refused() {
+        // Server starts SCRAM, then skips SASLContinue/SASLFinal and claims
+        // success without ever proving it knows the password.
+        let script = [auth(10, b"SCRAM-SHA-256\0\0"), auth(0, &[]), ready()].concat();
+        let (cfg, server) = fake_server("", script);
+        let err = connect_err(&cfg);
+        assert!(err.contains("SCRAM signature"), "got: {err}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn sasl_final_without_continue_is_refused() {
+        let script = [
+            auth(10, b"SCRAM-SHA-256\0\0"),
+            auth(12, b"v=AAAA"),
+            auth(0, &[]),
+            ready(),
+        ]
+        .concat();
+        let (cfg, server) = fake_server("", script);
+        let err = connect_err(&cfg);
+        assert!(err.contains("SCRAM"), "got: {err}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn require_auth_scram_refuses_md5_and_trust() {
+        let (cfg, server) = fake_server("?require_auth=scram-sha-256", auth(5, b"salt"));
+        let err = connect_err(&cfg);
+        assert!(err.contains("MD5"), "got: {err}");
+        assert!(!contains(&server.join().unwrap(), b"md5"));
+
+        let (cfg, server) = fake_server("?require_auth=scram-sha-256", auth(0, &[]));
+        let err = connect_err(&cfg);
+        assert!(err.contains("skipped authentication"), "got: {err}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn default_policy_still_accepts_trust_and_md5() {
+        let (cfg, server) = fake_server("", [auth(0, &[]), ready()].concat());
+        drop(Client::connect(&cfg).expect("trust"));
+        server.join().unwrap();
+
+        let script = [auth(5, b"salt"), auth(0, &[]), ready()].concat();
+        let (cfg, server) = fake_server("", script);
+        drop(Client::connect(&cfg).expect("md5"));
+        assert!(contains(&server.join().unwrap(), b"md5"));
+    }
+
+    #[test]
+    fn a_second_challenge_after_answering_one_is_refused() {
+        // Answer MD5, then get asked for cleartext: a classic downgrade dance.
+        let script = [auth(5, b"salt"), auth(3, &[])].concat();
+        let (cfg, server) = fake_server("?require_auth=md5,password", script);
+        let err = connect_err(&cfg);
+        assert!(err.contains("mid-exchange"), "got: {err}");
+        assert!(!contains(&server.join().unwrap(), b"hunter2\0"));
     }
 
     #[test]
