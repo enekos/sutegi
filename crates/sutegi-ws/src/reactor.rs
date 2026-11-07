@@ -183,18 +183,18 @@ enum Cmd {
     Adopt(Box<AdoptData>),
     Send {
         token: u32,
-        gen: u32,
+        id: u64,
         buf: Arc<Vec<u8>>,
     },
     /// One frame to many connections on the same shard — a broadcast that
     /// takes the shard lock once instead of once per target.
     SendMany {
-        targets: Vec<(u32, u32)>,
+        targets: Vec<(u32, u64)>,
         buf: Arc<Vec<u8>>,
     },
     Close {
         token: u32,
-        gen: u32,
+        id: u64,
         code: u16,
         reason: String,
     },
@@ -222,13 +222,13 @@ impl ShardShared {
 ///
 /// Sends are fire-and-forget: if the connection has closed (or closes before
 /// the reactor drains the queue), the frame is dropped silently — exactly
-/// the semantics a broadcast loop wants. Generation counters make a stale
-/// handle harmless even after its slab slot is reused.
+/// the semantics a broadcast loop wants. Every command carries the
+/// process-unique connection id, which is never reused, so a stale handle is
+/// harmless even after its slab slot is reused by another connection.
 #[derive(Clone)]
 pub struct Conn {
     id: u64,
     token: u32,
-    gen: u32,
     shard: Arc<ShardShared>,
 }
 
@@ -253,7 +253,7 @@ impl Conn {
     pub fn send_shared(&self, frame: &Arc<Vec<u8>>) {
         self.shard.inject(Cmd::Send {
             token: self.token,
-            gen: self.gen,
+            id: self.id,
             buf: Arc::clone(frame),
         });
     }
@@ -263,7 +263,7 @@ impl Conn {
     pub fn close(&self, code: u16, reason: &str) {
         self.shard.inject(Cmd::Close {
             token: self.token,
-            gen: self.gen,
+            id: self.id,
             code,
             reason: reason.to_string(),
         });
@@ -291,7 +291,7 @@ where
 {
     // Group by shard identity (the Arc's pointer), carrying one Arc clone of
     // the shard per group so we can inject after the grouping pass.
-    type ShardGroup = (Arc<ShardShared>, Vec<(u32, u32)>);
+    type ShardGroup = (Arc<ShardShared>, Vec<(u32, u64)>);
     let mut by_shard: HashMap<usize, ShardGroup> = HashMap::new();
     for conn in conns {
         let key = Arc::as_ptr(&conn.shard) as usize;
@@ -299,7 +299,7 @@ where
             .entry(key)
             .or_insert_with(|| (Arc::clone(&conn.shard), Vec::new()))
             .1
-            .push((conn.token, conn.gen));
+            .push((conn.token, conn.id));
     }
     for (_, (shard, targets)) in by_shard {
         shard.inject(Cmd::SendMany {
@@ -418,7 +418,6 @@ impl WsRuntime {
                 shared: Arc::clone(&shared),
                 poller,
                 slab: Vec::new(),
-                gens: Vec::new(),
                 free: Vec::new(),
                 pending_parse: Vec::new(),
                 cfg: cfg.clone(),
@@ -520,10 +519,10 @@ struct ConnState {
 struct Shard {
     shared: Arc<ShardShared>,
     poller: Poller,
+    /// Slot per token. A command names its target by `(token, id)`: the id
+    /// is process-unique and never reused, so a stale `Conn` (or a queued
+    /// command) for a slot since reused by another connection is dropped.
     slab: Vec<Option<ConnState>>,
-    /// Generation per slot, bumped on removal: stale `Conn` handles (and
-    /// queued commands) for a reused slot are recognized and dropped.
-    gens: Vec<u32>,
     free: Vec<u32>,
     /// Connections that hit the per-wakeup frame cap with bytes still
     /// buffered — resumed round-robin next iteration so no single peer can
@@ -593,25 +592,25 @@ impl Shard {
         for cmd in cmds {
             match cmd {
                 Cmd::Adopt(data) => self.adopt(*data),
-                Cmd::Send { token, gen, buf } => {
-                    if self.live(token, gen) {
+                Cmd::Send { token, id, buf } => {
+                    if self.live(token, id) {
                         self.enqueue(token, buf);
                     }
                 }
                 Cmd::SendMany { targets, buf } => {
-                    for (token, gen) in targets {
-                        if self.live(token, gen) {
+                    for (token, id) in targets {
+                        if self.live(token, id) {
                             self.enqueue(token, Arc::clone(&buf));
                         }
                     }
                 }
                 Cmd::Close {
                     token,
-                    gen,
+                    id,
                     code,
                     reason,
                 } => {
-                    if self.live(token, gen) {
+                    if self.live(token, id) {
                         self.begin_close(token, code, &reason);
                     }
                 }
@@ -619,9 +618,11 @@ impl Shard {
         }
     }
 
-    fn live(&self, token: u32, gen: u32) -> bool {
-        let t = token as usize;
-        t < self.slab.len() && self.gens[t] == gen && self.slab[t].is_some()
+    fn live(&self, token: u32, id: u64) -> bool {
+        self.slab
+            .get(token as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|s| s.id == id)
     }
 
     fn conn_handle(&self, token: u32) -> Conn {
@@ -629,7 +630,6 @@ impl Shard {
         Conn {
             id: state.id,
             token,
-            gen: self.gens[token as usize],
             shard: Arc::clone(&self.shared),
         }
     }
@@ -654,7 +654,6 @@ impl Shard {
             Some(t) => t,
             None => {
                 self.slab.push(None);
-                self.gens.push(0);
                 (self.slab.len() - 1) as u32
             }
         };
@@ -974,22 +973,19 @@ impl Shard {
     }
 
     /// Tear down a connection: close the fd (which deregisters it), free the
-    /// slot, bump the generation, and notify `on_close`.
+    /// slot, and notify `on_close`.
     fn remove(&mut self, token: u32, code: u16) {
         let t = token as usize;
         let Some(state) = self.slab[t].take() else {
             return;
         };
-        // Construct the handle before bumping the generation so `on_close`
-        // sees the right id — its sends are dropped either way, because the
-        // slot is already vacated.
+        // `on_close` sees the right id; its sends are dropped because the
+        // slot is already vacated (and any later occupant has another id).
         let conn = Conn {
             id: state.id,
             token,
-            gen: self.gens[t],
             shard: Arc::clone(&self.shared),
         };
-        self.gens[t] = self.gens[t].wrapping_add(1);
         self.free.push(token);
         let _ = self.poller.del(state.stream.as_fd());
         drop(state.stream); // close(2): kqueue/epoll deregister with the fd
@@ -1046,10 +1042,9 @@ impl Shard {
     /// Give back the trailing free slots so a shard that spiked to a million
     /// connections and drained doesn't keep hundreds of MB of empty slab (and
     /// a million-entry sweep) forever. Only touches the free tail — live slots
-    /// keep their tokens, so in-flight `Conn` handles stay valid. A truncated
-    /// slot that later regrows restarts at generation 0, which can only be
-    /// aliased by a stale handle whose gen is also 0 — impossible, since any
-    /// freed slot was removed at least once and so has gen ≥ 1.
+    /// keep their tokens, so in-flight `Conn` handles stay valid. A token that
+    /// is truncated and later regrown is safe to hand out again: liveness is
+    /// checked against the never-reused connection id, not the token.
     fn reclaim_slab(&mut self) {
         let mut new_len = self.slab.len();
         while new_len > 0 && self.slab[new_len - 1].is_none() {
@@ -1059,12 +1054,10 @@ impl Shard {
             return;
         }
         self.slab.truncate(new_len);
-        self.gens.truncate(new_len);
         self.free.retain(|&t| (t as usize) < new_len);
         // Only pay the reallocation when the win is large.
         if self.slab.capacity() > 4 * new_len.max(1) {
             self.slab.shrink_to_fit();
-            self.gens.shrink_to_fit();
         }
     }
 }

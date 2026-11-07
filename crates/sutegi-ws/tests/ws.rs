@@ -523,3 +523,64 @@ fn frame_cap_does_not_drop_frames() {
     client.write_all(&burst).unwrap();
     wait_for("all frames processed", || count.load(Ordering::SeqCst) == n);
 }
+
+#[test]
+fn stale_handle_never_reaches_the_next_occupant_of_its_slot() {
+    // A connects (token 0); the app keeps its Conn. A leaves, the shard's
+    // sweep reclaims the free slab tail, B connects and lands on token 0
+    // again. A send through A's stale handle must not reach B.
+    let opened: Arc<Mutex<Vec<Conn>>> = Arc::new(Mutex::new(Vec::new()));
+    let closed = Arc::new(AtomicUsize::new(0));
+    let handlers = Arc::new(Handlers {
+        on_open: Some(Arc::new({
+            let opened = Arc::clone(&opened);
+            move |conn: &Conn, _req: &Request| opened.lock().unwrap().push(conn.clone())
+        })),
+        on_close: Some(Arc::new({
+            let closed = Arc::clone(&closed);
+            move |_conn: &Conn, _code: u16| {
+                closed.fetch_add(1, Ordering::SeqCst);
+            }
+        })),
+        ..Handlers::default()
+    });
+    let rt = WsRuntime::start(test_config()).expect("runtime");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = || {
+        let client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let (server, _) = listener.accept().unwrap();
+        rt.adopt(server, Vec::new(), Arc::clone(&handlers), upgrade_request())
+            .expect("adopt");
+        client
+    };
+
+    let client_a = connect();
+    wait_for("A open", || opened.lock().unwrap().len() == 1);
+    let stale = opened.lock().unwrap()[0].clone();
+    drop(client_a);
+    wait_for("A close", || closed.load(Ordering::SeqCst) == 1);
+    // The sweep (which reclaims the slab tail) runs once a second.
+    std::thread::sleep(Duration::from_millis(2200));
+
+    let mut client_b = connect();
+    wait_for("B open", || opened.lock().unwrap().len() == 2);
+    let fresh = opened.lock().unwrap()[1].clone();
+    assert_ne!(stale.id(), fresh.id());
+
+    // Both commands go through the same shard inbox, in order: if the stale
+    // send leaked, B would read it first.
+    stale.send_text("leaked");
+    stale.close(1000, "");
+    fresh.send_text("mine");
+    let (op, payload) = read_frame(&mut client_b);
+    assert_eq!(op, 0x1);
+    assert_eq!(payload, b"mine");
+    broadcast([&stale], &text_frame("leaked"));
+    fresh.send_text("still-mine");
+    let (_, payload) = read_frame(&mut client_b);
+    assert_eq!(payload, b"still-mine");
+}
