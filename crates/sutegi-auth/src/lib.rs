@@ -174,32 +174,47 @@ impl<B: Backend> Auth<B> {
     }
 
     /// The logged-in user id, if the request carries a valid, unexpired
-    /// session. Pure cookie-HMAC work — no database access (so no password
-    /// binding check; [`current`](Auth::current) and [`identify`](Auth::identify)
-    /// enforce it).
+    /// session with a password binding. Pure cookie-HMAC work — no database
+    /// access, so the binding is only required to be *present*, not checked
+    /// against the store; [`current`](Auth::current), [`identify`](Auth::identify)
+    /// and [`require_auth`] enforce it.
     pub fn user_id(&self, req: &Request) -> Option<i64> {
+        self.session_of(req).map(|(uid, _)| uid)
+    }
+
+    /// The logged-in [`User`], loaded from the store. A session whose
+    /// password binding is missing or no longer matches the stored hash —
+    /// the password changed since login — is treated as anonymous.
+    pub fn current(&self, req: &Request) -> Result<Option<User>, String> {
+        match self.bound_user_id(req)? {
+            Some(id) => self.users.find(id),
+            None => Ok(None),
+        }
+    }
+
+    /// `(uid, pwb)` from a valid, unexpired session. Fails closed: a session
+    /// without a password binding is anonymous.
+    fn session_of(&self, req: &Request) -> Option<(i64, String)> {
         let s = self.sessions.load(req);
         let exp = s.get(EXP_KEY).and_then(Json::as_i64)?;
         if exp < users::now_secs() {
             return None;
         }
-        s.get(UID_KEY).and_then(Json::as_i64)
+        let uid = s.get(UID_KEY).and_then(Json::as_i64)?;
+        let pwb = s.get_str(PWB_KEY)?;
+        Some((uid, pwb.to_string()))
     }
 
-    /// The logged-in [`User`], loaded from the store (one lookup). A session
-    /// whose password binding no longer matches the stored hash — the
-    /// password changed since login — is treated as anonymous.
-    pub fn current(&self, req: &Request) -> Result<Option<User>, String> {
-        let Some(id) = self.user_id(req) else {
+    /// The session's uid, only if its password binding matches the store
+    /// (one lookup).
+    fn bound_user_id(&self, req: &Request) -> Result<Option<i64>, String> {
+        let Some((id, pwb)) = self.session_of(req) else {
             return Ok(None);
         };
-        let s = self.sessions.load(req);
-        if let Some(pwb) = s.get_str(PWB_KEY) {
-            if self.bind_of(id)?.as_deref() != Some(pwb) {
-                return Ok(None);
-            }
+        if self.bind_of(id)?.as_deref() != Some(pwb.as_str()) {
+            return Ok(None);
         }
-        self.users.find(id)
+        Ok(Some(id))
     }
 
     /// The request's user via session **or** remember-me revival: when the
@@ -284,18 +299,20 @@ impl Identified {
     }
 }
 
-/// Guard: reject with `401` JSON unless the request carries a valid session.
-/// Cookie-signature work only — handlers needing the full user call
-/// [`Auth::current`].
+/// Guard: reject with `401` JSON unless the request carries a valid session
+/// whose password binding still matches the store (one lookup per request,
+/// like [`require_role`]) — so a password change logs other devices out of
+/// guarded routes too. Handlers needing the full user call [`Auth::current`].
 pub fn require_auth<B>(
     auth: Arc<Auth<B>>,
 ) -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static
 where
     B: Backend + Send + Sync + 'static,
 {
-    move |req| match auth.user_id(req) {
-        Some(_) => None,
-        None => Some(unauthenticated()),
+    move |req| match auth.bound_user_id(req) {
+        Ok(Some(_)) => None,
+        Ok(None) => Some(unauthenticated()),
+        Err(e) => Some(json(500, &Json::obj(vec![("error", Json::str(e))]))),
     }
 }
 
@@ -561,11 +578,44 @@ mod tests {
         let req = request(vec![("Cookie".into(), cookie)]);
         assert!(auth.current(&req).unwrap().is_some());
 
+        assert!(require_auth(auth.clone())(&req).is_none());
+
         auth.users.set_password(user.id, "newpassword").unwrap();
-        // Cookie-only check still passes (documented); the store check dies.
+        // Cookie-only check still passes (documented); the store checks die.
         assert_eq!(auth.user_id(&req), Some(user.id));
         assert!(auth.current(&req).unwrap().is_none());
         assert!(auth.identify(&req).unwrap().is_none());
+        assert_eq!(require_auth(auth.clone())(&req).unwrap().status, 401);
+    }
+
+    #[test]
+    fn signed_token_is_not_a_session_cookie() {
+        let auth = rig();
+        let user = auth.users.register("victim@a.co", "password1").unwrap();
+        // `Sessions::token` over attacker-chosen JSON, replayed as the cookie.
+        let forged = auth
+            .sessions
+            .token(&format!(r#"{{"uid":{},"exp":99999999999}}"#, user.id));
+        let req = request(vec![("Cookie".into(), format!("sutegi_session={forged}"))]);
+        assert_eq!(auth.user_id(&req), None);
+        assert!(auth.current(&req).unwrap().is_none());
+        assert_eq!(require_auth(auth.clone())(&req).unwrap().status, 401);
+    }
+
+    #[test]
+    fn session_without_password_binding_fails_closed() {
+        let auth = rig();
+        let user = auth.users.register("nopwb@a.co", "password1").unwrap();
+        // A validly signed session that lacks `pwb` (e.g. minted by older
+        // code, or by app code writing `uid` itself).
+        let mut s = auth.sessions.load(&request(vec![]));
+        s.set(UID_KEY, Json::int(user.id));
+        s.set(EXP_KEY, Json::int(users::now_secs() + 3600));
+        let cookie = cookie_of(&auth.sessions.save(&s, Response::new(200)));
+        let req = request(vec![("Cookie".into(), cookie)]);
+        assert_eq!(auth.user_id(&req), None);
+        assert!(auth.current(&req).unwrap().is_none());
+        assert_eq!(require_auth(auth.clone())(&req).unwrap().status, 401);
     }
 
     #[test]

@@ -24,6 +24,12 @@ use sutegi_web::{Request, Response};
 /// The session key the CSRF token lives under.
 const CSRF_KEY: &str = "_csrf";
 
+/// MAC domain tags. Session cookies and [`Sessions::token`] share one secret
+/// and one `hex.sig` shape, so each MAC is bound to its purpose — otherwise a
+/// token minted over attacker-chosen JSON would verify as a session cookie.
+const SESSION_DOMAIN: &[u8] = b"sutegi.session\0";
+const TOKEN_DOMAIN: &[u8] = b"sutegi.token\0";
+
 /// Session manager: holds the signing secret and cookie policy.
 pub struct Sessions {
     secret: Vec<u8>,
@@ -59,22 +65,28 @@ impl Sessions {
         self
     }
 
-    fn sign(&self, msg: &[u8]) -> String {
-        to_hex(&hmac_sha256(&self.secret, msg))
+    /// HMAC over `domain ‖ msg`; `domain` is one of the `*_DOMAIN` tags.
+    fn sign(&self, domain: &[u8], msg: &[u8]) -> String {
+        let mut tagged = Vec::with_capacity(domain.len() + msg.len());
+        tagged.extend_from_slice(domain);
+        tagged.extend_from_slice(msg);
+        to_hex(&hmac_sha256(&self.secret, &tagged))
     }
 
     /// Sign an arbitrary value into a `<value-hex>.<sig>` token (CSRF tokens,
     /// password-reset links, …). Verify with [`verify_token`](Sessions::verify_token).
+    /// Tokens are MAC'd under a different domain than session cookies, so
+    /// neither verifies as the other.
     pub fn token(&self, value: &str) -> String {
         let hex = to_hex(value.as_bytes());
-        format!("{}.{}", hex, self.sign(value.as_bytes()))
+        format!("{}.{}", hex, self.sign(TOKEN_DOMAIN, value.as_bytes()))
     }
 
     /// Verify a token from [`token`](Sessions::token); returns the original value.
     pub fn verify_token(&self, token: &str) -> Option<String> {
         let (hex, sig) = token.split_once('.')?;
         let bytes = from_hex(hex)?;
-        if constant_time_eq(self.sign(&bytes).as_bytes(), sig.as_bytes()) {
+        if constant_time_eq(self.sign(TOKEN_DOMAIN, &bytes).as_bytes(), sig.as_bytes()) {
             String::from_utf8(bytes).ok()
         } else {
             None
@@ -87,7 +99,8 @@ impl Sessions {
         if let Some(raw) = req.cookie(&self.cookie) {
             if let Some((payload_hex, sig)) = raw.split_once('.') {
                 if let Some(bytes) = from_hex(payload_hex) {
-                    if constant_time_eq(self.sign(&bytes).as_bytes(), sig.as_bytes()) {
+                    let expected = self.sign(SESSION_DOMAIN, &bytes);
+                    if constant_time_eq(expected.as_bytes(), sig.as_bytes()) {
                         if let Ok(s) = std::str::from_utf8(&bytes) {
                             if let Ok(Json::Obj(map)) = Json::parse(s) {
                                 return Session {
@@ -116,7 +129,7 @@ impl Sessions {
     pub fn cookie_for(&self, session: &Session) -> String {
         let payload = Json::Obj(session.data.clone()).to_string();
         let payload_hex = to_hex(payload.as_bytes());
-        let sig = self.sign(payload.as_bytes());
+        let sig = self.sign(SESSION_DOMAIN, payload.as_bytes());
         let mut cookie = format!(
             "{}={}.{}; Path=/; HttpOnly; SameSite=Lax",
             self.cookie, payload_hex, sig
@@ -252,6 +265,21 @@ mod tests {
         let t = s.token("user:42");
         assert_eq!(s.verify_token(&t).as_deref(), Some("user:42"));
         assert!(s.verify_token("deadbeef.badsig").is_none());
+    }
+
+    #[test]
+    fn tokens_and_session_cookies_do_not_cross_verify() {
+        let s = Sessions::new(b"k").insecure();
+        // A token over attacker-chosen JSON must not load as a session.
+        let forged = s.token(r#"{"uid":1,"exp":99999999999}"#);
+        assert!(s
+            .load(&req_with_cookie("sutegi_session", &forged))
+            .is_empty());
+        // And a real session cookie must not verify as a token.
+        let mut sess = s.load(&req_with_cookie("x", ""));
+        sess.set("uid", Json::int(1));
+        let cookie = cookie_value(&s.save(&sess, Response::new(200)), "sutegi_session");
+        assert!(s.verify_token(&cookie).is_none());
     }
 
     #[test]
