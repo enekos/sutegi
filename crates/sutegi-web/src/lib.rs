@@ -904,6 +904,13 @@ impl App {
         let limits = self.limits;
         let introspect = self.introspection();
         let listeners = std::mem::take(&mut self.listeners);
+        // Framework `/__` routes (tools, channels, actors, …) match ahead of the
+        // app's own: they are mounted last, so a catch-all like
+        // `static_dir("/")` registered earlier would otherwise shadow
+        // `GET /__tools`. Stable, so relative order within each half holds.
+        // Sorted after `introspection()` so the advertised order is unchanged.
+        self.routes
+            .sort_by_key(|r| !matches!(r.segs.first(), Some(Seg::Lit(s)) if s.starts_with("__")));
         let routes = Arc::new(self.routes);
         let middleware = Arc::new(self.middleware);
         let after = Arc::new(self.after);
@@ -2364,6 +2371,26 @@ mod tests {
         assert_eq!(call("/__health", Method::Get), 200);
         assert_eq!(call("/__ready", Method::Get), 200);
         assert_eq!(call("/", Method::Get), 200);
+    }
+
+    #[test]
+    fn ops_routes_are_not_shadowed_by_a_root_static_dir() {
+        let dir = std::env::temp_dir().join(format!("sutegi-shadow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let svc = App::new("t")
+            .ops_public()
+            .static_dir("/", &dir)
+            .tool("t", "a tool", schema::object(vec![], &[]), |_c, _a| {
+                Ok(Json::Null)
+            })
+            .service();
+        let resp = svc(Request {
+            path: "/__tools".into(),
+            ..req(Method::Get, b"")
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(resp.status, 200);
+        assert!(full_body(resp).contains("\"t\""));
     }
 
     #[test]
