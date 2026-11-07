@@ -208,7 +208,8 @@ fn remote_repl_drives_a_live_server() {
     let addr = "127.0.0.1:39217";
     let db = fixture_db();
     thread::spawn(move || {
-        let _ = build(db).run(addr);
+        // A live socket: the ops surface is closed unless the app opts in.
+        let _ = build(db).ops_public().run(addr);
     });
     for _ in 0..300 {
         if TcpStream::connect(addr).is_ok() {

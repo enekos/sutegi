@@ -62,10 +62,12 @@ pub struct Repl {
 impl Repl {
     /// Wrap a built [`App`] for in-process tinkering. Consumes the app (the
     /// same closure `serve()` would run — routing, middleware, tools, ops
-    /// endpoints — minus the socket).
+    /// endpoints — minus the socket). No socket means no remote caller, so
+    /// the ops surface is opened ([`App::ops_public`]) for this closure only;
+    /// a set `ops_guard` still applies.
     pub fn new(app: App) -> Repl {
         Repl {
-            surface: Surface::InProcess(Box::new(app.service())),
+            surface: Surface::InProcess(Box::new(app.ops_public().service())),
             #[cfg(feature = "orm")]
             db: None,
         }
