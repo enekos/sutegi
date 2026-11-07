@@ -505,38 +505,49 @@ fn parse_request_impl<R: BufRead>(
             Line::Read(n) => n,
         };
         header_bytes += n;
-        let line = decode_line(&buf)?;
-        let l = line.trim_end_matches(['\r', '\n']);
-        if l.is_empty() {
+        // Field lines are strict: CRLF-terminated, `token ":" OWS value OWS`,
+        // no obs-fold, no bare CR/LF or NUL. Every leniency here is a parse
+        // that some proxy in front of us disagrees with — a smuggling
+        // differential (CWE-444) — so anything else is refused with 400.
+        let Some(raw) = buf.strip_suffix(b"\r\n") else {
+            return Ok(Some(Incoming::Reject { status: 400 }));
+        };
+        if raw.is_empty() {
             break;
         }
-        if let Some((k, v)) = l.split_once(':') {
-            let k = k.trim().to_string();
-            let v = v.trim().to_string();
-            // Transfer-Encoding framing (chunked, …) is not implemented. We
-            // must NOT fall through to Content-Length framing: that treats a
-            // chunked body as a 0-length body and leaves the chunk data in the
-            // buffer to be re-parsed as the next request (CWE-444). Refuse it.
-            if k.eq_ignore_ascii_case("transfer-encoding") {
-                return Ok(Some(Incoming::Reject { status: 501 }));
-            }
-            // Content-Length must be exactly 1*DIGIT that fits in usize, and
-            // consistent if repeated. A malformed or conflicting value used to
-            // coerce to 0, desynchronizing body framing (CWE-444) — reject it.
-            if k.eq_ignore_ascii_case("content-length") {
-                let parsed = match parse_content_length(&v) {
-                    Some(n) => n,
-                    None => return Ok(Some(Incoming::Reject { status: 400 })),
-                };
-                match content_length {
-                    Some(prev) if prev != parsed => {
-                        return Ok(Some(Incoming::Reject { status: 400 }));
-                    }
-                    _ => content_length = Some(parsed),
-                }
-            }
-            headers.push((k, v));
+        let line = decode_line(raw)?;
+        let Some((k, v)) = line.split_once(':') else {
+            return Ok(Some(Incoming::Reject { status: 400 }));
+        };
+        // A leading SP/HTAB (obs-fold) or whitespace before the colon fails
+        // the token check, as does an empty name.
+        if k.is_empty() || !k.bytes().all(is_tchar) || v.bytes().any(|b| b == b'\r' || b == 0) {
+            return Ok(Some(Incoming::Reject { status: 400 }));
         }
+        let v = v.trim_matches([' ', '\t']);
+        // Transfer-Encoding framing (chunked, …) is not implemented. We
+        // must NOT fall through to Content-Length framing: that treats a
+        // chunked body as a 0-length body and leaves the chunk data in the
+        // buffer to be re-parsed as the next request (CWE-444). Refuse it.
+        if k.eq_ignore_ascii_case("transfer-encoding") {
+            return Ok(Some(Incoming::Reject { status: 501 }));
+        }
+        // Content-Length must be exactly 1*DIGIT that fits in usize, and
+        // consistent if repeated. A malformed or conflicting value used to
+        // coerce to 0, desynchronizing body framing (CWE-444) — reject it.
+        if k.eq_ignore_ascii_case("content-length") {
+            let parsed = match parse_content_length(v) {
+                Some(n) => n,
+                None => return Ok(Some(Incoming::Reject { status: 400 })),
+            };
+            match content_length {
+                Some(prev) if prev != parsed => {
+                    return Ok(Some(Incoming::Reject { status: 400 }));
+                }
+                _ => content_length = Some(parsed),
+            }
+        }
+        headers.push((k.to_string(), v.to_string()));
     }
 
     // Refuse oversized bodies before allocating an attacker-controlled buffer.
@@ -575,6 +586,11 @@ fn parse_request_impl<R: BufRead>(
         body,
         peer: None,
     })))
+}
+
+/// RFC 9110 `tchar`: the bytes allowed in a header field name (`token`).
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
 }
 
 /// Parse a `Content-Length` field value: exactly `1*DIGIT` that fits in
@@ -1542,6 +1558,44 @@ mod tests {
         match parse_request(&mut reader, &limits).unwrap() {
             Some(Incoming::Reject { status }) => assert_eq!(status, 408),
             _ => panic!("a whole-line drip past the deadline must yield 408"),
+        }
+    }
+
+    #[test]
+    fn malformed_header_lines_are_rejected_400() {
+        // Each of these is parsed differently by some proxy in front of us;
+        // accepting any of them leniently is a request-smuggling differential
+        // (CWE-444), so all must be refused with 400.
+        let cases: &[(&str, &[u8])] = &[
+            ("obs-fold", b"GET / HTTP/1.1\r\nX-A: 1\r\n folded\r\n\r\n"),
+            (
+                "obs-fold tab",
+                b"GET / HTTP/1.1\r\nX-A: 1\r\n\tfolded\r\n\r\n",
+            ),
+            (
+                "space before colon",
+                b"GET / HTTP/1.1\r\nContent-Length : 5\r\n\r\nhello",
+            ),
+            ("no colon", b"GET / HTTP/1.1\r\nnot a header\r\n\r\n"),
+            ("empty name", b"GET / HTTP/1.1\r\n: v\r\n\r\n"),
+            ("non-token name", b"GET / HTTP/1.1\r\nX(A): v\r\n\r\n"),
+            ("bare CR", b"GET / HTTP/1.1\r\nX-A: 1\rX-B: 2\r\n\r\n"),
+            ("NUL in value", b"GET / HTTP/1.1\r\nX-A: 1\x002\r\n\r\n"),
+            ("bare LF line", b"GET / HTTP/1.1\r\nX-A: 1\nX-B: 2\r\n\r\n"),
+            ("bare LF end", b"GET / HTTP/1.1\r\nX-A: 1\r\n\n"),
+        ];
+        for (name, raw) in cases {
+            let mut reader = BufReader::new(*raw);
+            match parse_request(&mut reader, &Limits::default()).unwrap() {
+                Some(Incoming::Reject { status }) => assert_eq!(status, 400, "{name}"),
+                _ => panic!("{name}: malformed header line must be rejected 400"),
+            }
+        }
+        // Tab OWS around a well-formed value is still accepted and trimmed.
+        let raw = b"GET / HTTP/1.1\r\nX-A:\t v \t\r\n\r\n";
+        match parse_request(&mut BufReader::new(&raw[..]), &Limits::default()).unwrap() {
+            Some(Incoming::Request(r)) => assert_eq!(r.header("x-a"), Some("v")),
+            _ => panic!("a well-formed header with tab OWS must parse"),
         }
     }
 
