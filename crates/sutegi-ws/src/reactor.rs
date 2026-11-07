@@ -148,8 +148,13 @@ pub struct Handlers {
     /// If set, the `Origin` header must be present and exactly match one of
     /// these — the built-in defense against Cross-Site WebSocket Hijacking
     /// (a cookie-authenticated socket opened by an attacker's page). Checked
-    /// before `authorize`.
+    /// before `authorize`. When unset the handshake layer applies a
+    /// same-origin default (see `allow_any_origin`).
     pub allowed_origins: Option<Vec<String>>,
+    /// Opt out of the same-origin default: with no `allowed_origins`, accept
+    /// an upgrade from any `Origin`. Only for public, cookieless endpoints.
+    /// Ignored when `allowed_origins` is set.
+    pub allow_any_origin: bool,
 }
 
 /// Pre-encode a text frame for fan-out: `Conn::send_shared` clones only the

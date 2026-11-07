@@ -596,8 +596,9 @@ impl App {
     /// `/__` surface).
     ///
     /// The hub's [`check_origin`](sutegi_channels::Channels::check_origin) /
+    /// [`allow_any_origin`](sutegi_channels::Channels::allow_any_origin) /
     /// [`authorize`](sutegi_channels::Channels::authorize) gates are applied
-    /// to the handshake. Keep a `hub.clone()` to broadcast from HTTP
+    /// to the handshake (same-origin by default). Keep a `hub.clone()` to broadcast from HTTP
     /// handlers or background threads.
     #[cfg(feature = "channels")]
     pub fn channels(mut self, pattern: &str, doc: &str, hub: sutegi_channels::ChannelHub) -> App {
@@ -611,6 +612,9 @@ impl App {
         let mut ws = Ws::new();
         if let Some(origins) = origins {
             ws = ws.check_origin(origins);
+        }
+        if hub.allows_any_origin() {
+            ws = ws.allow_any_origin();
         }
         if let Some(gate) = authorize {
             ws = ws.authorize(move |req: &Request| gate(req));

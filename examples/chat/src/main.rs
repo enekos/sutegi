@@ -102,6 +102,8 @@ fn main() -> std::io::Result<()> {
         }
         Err(_) => println!("chat: single pod (set DATABASE_URL for cross-pod fan-out)"),
     }
+    // The page is served from this app, so the hub's same-origin default is
+    // the CSWSH guard; a page on another host needs `.check_origin([...])`.
     let hub = channels.build();
 
     App::new("chat")

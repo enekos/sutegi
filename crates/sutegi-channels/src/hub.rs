@@ -44,6 +44,7 @@ pub struct Channels {
     channels: Vec<Channel>,
     broker: Option<Arc<dyn Broker>>,
     allowed_origins: Option<Vec<String>>,
+    allow_any_origin: bool,
     authorize: Option<AuthorizeFn>,
     #[cfg(feature = "presence")]
     presence_interval: Option<std::time::Duration>,
@@ -67,14 +68,23 @@ impl Channels {
         self
     }
 
-    /// Origin allowlist for the WebSocket handshake — the CSWSH guard. Any
-    /// endpoint that authenticates by cookie MUST set this (see `Ws::check_origin`).
+    /// Origin allowlist for the WebSocket handshake — the CSWSH guard. Without
+    /// one the endpoint is same-origin by default (`Origin` host must equal
+    /// `Host`; see `Ws::check_origin`). Set it when the page lives elsewhere.
     pub fn check_origin<I, S>(mut self, origins: I) -> Channels
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
         self.allowed_origins = Some(origins.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Accept upgrades from any `Origin`, disabling the same-origin default
+    /// (see `Ws::allow_any_origin`). Only for public, cookieless hubs — with
+    /// it, any site can open the socket with the visitor's cookies.
+    pub fn allow_any_origin(mut self) -> Channels {
+        self.allow_any_origin = true;
         self
     }
 
@@ -102,6 +112,7 @@ impl Channels {
             topics: Mutex::new(HashMap::new()),
             weak: weak.clone(),
             allowed_origins: self.allowed_origins,
+            allow_any_origin: self.allow_any_origin,
             authorize: self.authorize,
             #[cfg(feature = "presence")]
             presence: {
@@ -134,6 +145,7 @@ pub(crate) struct HubInner {
     topics: Mutex<HashMap<String, TopicEntry>>,
     weak: Weak<HubInner>,
     allowed_origins: Option<Vec<String>>,
+    allow_any_origin: bool,
     authorize: Option<AuthorizeFn>,
     #[cfg(feature = "presence")]
     pub(crate) presence: crate::presence::PresenceState,
@@ -207,7 +219,10 @@ impl Socket {
     }
 
     /// The HTTP upgrade request that opened this connection — headers,
-    /// cookies, path, query — for identity decisions in `on_join`.
+    /// cookies, path, query — for identity decisions in `on_join`. Cookies
+    /// are only trustworthy because the handshake refused cross-origin pages
+    /// (same-origin default or `check_origin`); a hub built with
+    /// `allow_any_origin` must not authenticate by cookie.
     pub fn request(&self) -> &Request {
         &self.req
     }
@@ -399,6 +414,12 @@ impl ChannelHub {
             self.inner.allowed_origins.clone(),
             self.inner.authorize.clone(),
         )
+    }
+
+    /// Whether the builder opted out of the same-origin default
+    /// ([`Channels::allow_any_origin`]), applied by `App::channels`.
+    pub fn allows_any_origin(&self) -> bool {
+        self.inner.allow_any_origin
     }
 }
 
