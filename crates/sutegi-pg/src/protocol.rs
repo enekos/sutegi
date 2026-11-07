@@ -17,6 +17,15 @@ const PROTOCOL_VERSION: i32 = 196608;
 /// bound (the server keeps every named statement alive for the session).
 const STMT_CACHE_MAX: usize = 256;
 
+/// Largest backend message accepted, length prefix included. PostgreSQL caps a
+/// single field at 1 GiB, so a bigger frame is corrupt or hostile — and the
+/// length is a signed i32 off the wire, so it is range-checked, never cast.
+const MAX_MSG_LEN: usize = 1 << 30;
+
+/// Up-front buffer reservation for one message body; anything larger grows as
+/// the bytes arrive.
+const RECV_PREALLOC_MAX: usize = 64 * 1024;
+
 /// One live connection to a backend.
 pub struct Client {
     write: TcpStream,
@@ -458,16 +467,32 @@ impl Client {
             self.broken = true;
             format!("read header: {e}")
         })?;
-        let len = be_i32(&header[1..], 0) as usize;
-        if len < 4 {
+        let raw = be_i32(&header, 1);
+        let Some(body_len) = usize::try_from(raw)
+            .ok()
+            .filter(|len| (4..=MAX_MSG_LEN).contains(len))
+            .map(|len| len - 4)
+        else {
             self.broken = true;
-            return Err(format!("invalid message length {len}"));
+            return Err(format!("invalid message length {raw}"));
+        };
+        // Grow with the bytes that actually arrive rather than trusting the
+        // header up front: a frame that claims a gigabyte and then stalls must
+        // not cost a gigabyte.
+        let mut body = Vec::with_capacity(body_len.min(RECV_PREALLOC_MAX));
+        let got = (&mut self.read)
+            .take(body_len as u64)
+            .read_to_end(&mut body)
+            .map_err(|e| {
+                self.broken = true;
+                format!("read body: {e}")
+            })?;
+        if got != body_len {
+            self.broken = true;
+            return Err(format!(
+                "read body: connection closed after {got} of {body_len} bytes"
+            ));
         }
-        let mut body = vec![0u8; len - 4];
-        self.read.read_exact(&mut body).map_err(|e| {
-            self.broken = true;
-            format!("read body: {e}")
-        })?;
         Ok((header[0], body))
     }
 }
@@ -943,7 +968,7 @@ mod tests {
     //
     // The handshake reads server bytes before any query runs, so a hostile or
     // MITM'd server reaches it first. `fake_server` accepts one connection,
-    // swallows the startup packet, writes `script` verbatim, then records
+    // swallows the startup packet, writes `script` verbatim and half-closes, then records
     // everything the client sends until it hangs up — so a test can assert
     // both the outcome and what (e.g. a password) went over the wire.
 
@@ -963,6 +988,8 @@ mod tests {
             sock.read_exact(&mut startup).unwrap();
             // The client may already have hung up on a rejected handshake.
             let _ = sock.write_all(&script);
+            // End of script: the client sees EOF instead of waiting for more.
+            let _ = sock.shutdown(std::net::Shutdown::Write);
             let mut sent = Vec::new();
             let _ = sock.read_to_end(&mut sent);
             sent
@@ -1019,6 +1046,36 @@ mod tests {
         let (cfg, server) = fake_server("", msg(b'R', &10i32.to_be_bytes()));
         let err = connect_err(&cfg);
         assert!(err.contains("SASL"), "got: {err}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn negative_message_length_is_rejected_not_sign_extended() {
+        // 0x80000000 used to become a huge usize and abort on allocation.
+        let (cfg, server) = fake_server("", vec![b'R', 0x80, 0, 0, 0]);
+        let err = connect_err(&cfg);
+        assert!(err.contains("invalid message length"), "got: {err}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn oversized_message_length_is_rejected_before_allocating() {
+        // 0x7FFFFFFF used to allocate 2 GiB before reading a single byte.
+        let (cfg, server) = fake_server("", vec![b'R', 0x7F, 0xFF, 0xFF, 0xFF]);
+        let err = connect_err(&cfg);
+        assert!(err.contains("invalid message length"), "got: {err}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_frame_that_promises_more_than_it_sends_is_an_error() {
+        // In range, but the server hangs up long before 1 GiB arrives.
+        let mut script = vec![b'R'];
+        script.extend_from_slice(&(MAX_MSG_LEN as i32).to_be_bytes());
+        script.extend_from_slice(b"short");
+        let (cfg, server) = fake_server("", script);
+        let err = connect_err(&cfg);
+        assert!(err.contains("read body"), "got: {err}");
         server.join().unwrap();
     }
 
