@@ -225,7 +225,7 @@ impl HttpTransport for PlainHttp {
 
         let head_only = req.method.eq_ignore_ascii_case("HEAD");
         let mut reader = BufReader::new(stream);
-        read_response(&mut reader, self.max_body, head_only)
+        read_response(&mut reader, self.max_body, head_only, Framing::Wire)
     }
 }
 
@@ -243,7 +243,10 @@ impl HttpTransport for PlainHttp {
 /// - TLS 1.2 floor; certificate and hostname verification left **on** (there
 ///   is deliberately no knob here that turns it off).
 /// - `--max-filesize` makes `curl` itself refuse an oversized body.
-/// - Interim `1xx` header blocks (`Expect: 100-continue`) are skipped.
+/// - Interim `1xx` header blocks (`Expect: 100-continue`) are skipped, and a
+///   proxy's `CONNECT` reply is suppressed, so the status read is the
+///   origin's — not an `https_proxy`'s `200 Connection established`.
+/// - `-q` comes first in `argv`, so a `~/.curlrc` cannot undo any of this.
 ///
 /// The one thing that does hit disk: a `PUT` body is handed over as a
 /// `0600`, `O_EXCL`-created temp file (`curl` reads its upload from a file, and
@@ -329,6 +332,7 @@ impl SystemCurl {
         ));
         c.push_str("tlsv1.2\n");
         c.push_str("silent\nshow-error\ninclude\nno-location\nhttp1.1\n");
+        c.push_str("suppress-connect-headers\n");
         c.push_str(&format!("connect-timeout = \"{}\"\n", self.connect_timeout));
         c.push_str(&format!("max-time = \"{}\"\n", self.max_time));
         c.push_str(&format!("max-filesize = \"{}\"\n", self.max_body));
@@ -430,7 +434,9 @@ impl HttpTransport for SystemCurl {
         };
         let config = self.config(req, staged.as_ref().map(|t| t.0.as_path()));
 
+        // `-q` must be the very first argument or curl reads ~/.curlrc anyway.
         let mut child = Command::new(&self.program)
+            .arg("-q")
             .arg("--config")
             .arg("-")
             .stdin(Stdio::piped())
@@ -458,11 +464,23 @@ impl HttpTransport for SystemCurl {
         }
         let head_only = req.method.eq_ignore_ascii_case("HEAD");
         let mut reader = BufReader::new(&out.stdout[..]);
-        read_response(&mut reader, self.max_body, head_only)
+        // curl has already de-chunked the body but echoes the original
+        // `Transfer-Encoding`; its stdout ends where the body does.
+        read_response(&mut reader, self.max_body, head_only, Framing::ToEof)
     }
 }
 
 // ---------------------------------------------------- HTTP/1.1 response read
+
+/// How the body is delimited in the stream being read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Framing {
+    /// Raw socket bytes: honour `Transfer-Encoding` / `Content-Length`.
+    Wire,
+    /// Already-decoded output (`curl -i`): the body runs to EOF, and the
+    /// framing headers describe bytes that are no longer there.
+    ToEof,
+}
 
 /// Read one response: status line, headers, body. Interim `1xx` blocks are
 /// consumed and skipped; `chunked` bodies are de-chunked; everything is
@@ -471,6 +489,7 @@ fn read_response<R: BufRead>(
     r: &mut R,
     max_body: usize,
     head_only: bool,
+    framing: Framing,
 ) -> Result<HttpResponse, String> {
     let mut interim = 0;
     let (status, headers) = loop {
@@ -486,11 +505,15 @@ fn read_response<R: BufRead>(
     };
 
     let mut body = Vec::new();
-    let chunked = headers
-        .iter()
-        .any(|(k, v)| k == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked"));
+    let chunked = framing == Framing::Wire
+        && headers
+            .iter()
+            .any(|(k, v)| k == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked"));
     let mut length: Option<u64> = None;
-    for (_, v) in headers.iter().filter(|(k, _)| k == "content-length") {
+    let framed = headers
+        .iter()
+        .filter(|(k, _)| framing == Framing::Wire && k == "content-length");
+    for (_, v) in framed {
         let n = parse_decimal(v.trim()).ok_or_else(|| format!("bad content-length: {v:?}"))?;
         // Conflicting lengths mean the framing cannot be trusted.
         if length.is_some_and(|prev| prev != n) {
@@ -634,7 +657,12 @@ mod tests {
     use super::*;
 
     fn parse(raw: &str, head_only: bool) -> Result<HttpResponse, String> {
-        read_response(&mut BufReader::new(raw.as_bytes()), 1024, head_only)
+        read_response(
+            &mut BufReader::new(raw.as_bytes()),
+            1024,
+            head_only,
+            Framing::Wire,
+        )
     }
 
     #[test]
@@ -701,7 +729,7 @@ mod tests {
         assert!(parse(raw, false).unwrap_err().contains("exceeds cap"));
         // Same with an unbounded cap: nothing to compare against but overflow.
         let mut r = BufReader::new(raw.as_bytes());
-        assert!(read_response(&mut r, usize::MAX, false).is_err());
+        assert!(read_response(&mut r, usize::MAX, false, Framing::Wire).is_err());
         for bad in ["1ffffffffffffffff", "+5", "-1", "", "0x5"] {
             let raw = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{bad}\r\n");
             assert!(
@@ -715,7 +743,9 @@ mod tests {
     fn hostile_framing_is_rejected() {
         let mut r = BufReader::new(&b"HTTP/1.1 200 OK\r\n\r\nabc"[..]);
         assert_eq!(
-            read_response(&mut r, usize::MAX, false).unwrap().body,
+            read_response(&mut r, usize::MAX, false, Framing::Wire)
+                .unwrap()
+                .body,
             b"abc"
         );
         assert!(parse("HTTP/1.1 200 OK\r\nContent-Length: +2\r\n\r\nok", false).is_err());
@@ -795,6 +825,9 @@ mod tests {
         assert!(cfg.contains("url = \"https://acct.r2.cloudflarestorage.com/bkt/a%20b.txt\"\n"));
         assert!(cfg.contains("proto = \"=https\"\n"));
         assert!(cfg.contains("no-location\n") && cfg.contains("tlsv1.2\n"));
+        // Behind https_proxy, curl -i would otherwise print the proxy's
+        // "200 Connection established" first and a 403 would read as 200.
+        assert!(cfg.contains("suppress-connect-headers\n"));
         assert!(cfg.contains("request = \"PUT\"\n"));
         assert!(cfg.contains("header = \"authorization: AWS4-HMAC-SHA256 Credential=AK/x\"\n"));
         assert!(cfg.contains("upload-file = \"/tmp/x.tmp\"\n"));
@@ -827,6 +860,34 @@ mod tests {
             .allow_http()
             .config(&req, None)
             .contains("insecure"));
+    }
+
+    /// A stand-in `curl` that checks `-q` is first and prints what real curl
+    /// prints for a chunked response: the header kept, the body decoded.
+    #[cfg(unix)]
+    #[test]
+    fn curl_output_is_read_to_eof_and_curlrc_ignored() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("sutegi-fake-curl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("curl");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\n[ \"$1\" = \"-q\" ] || { echo 'first arg not -q' >&2; exit 9; }\n\
+             cat >/dev/null\n\
+             printf 'HTTP/1.1 200 OK\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\nhello'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let res = SystemCurl::at(bin.to_str().unwrap()).send(&HttpRequest {
+            method: "GET",
+            url: "https://bucket.example.com/k".to_string(),
+            headers: vec![],
+            body: b"",
+        });
+        let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+        let res = res.unwrap();
+        assert_eq!((res.status, res.body.as_slice()), (200, &b"hello"[..]));
     }
 
     #[test]
