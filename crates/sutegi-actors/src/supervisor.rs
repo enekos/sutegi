@@ -621,6 +621,43 @@ mod tests {
     }
 
     #[test]
+    fn multibyte_panic_message_at_the_cut_still_restarts() {
+        // 239 ASCII bytes then a 2-byte char straddling the 240-byte cut.
+        struct Accented {
+            bombs: Arc<AtomicUsize>,
+        }
+        impl Actor for Accented {
+            type Msg = ();
+            fn handle(&mut self, _msg: ()) {
+                if self.bombs.swap(0, Ordering::SeqCst) > 0 {
+                    panic!("{}ñ and more", "x".repeat(239));
+                }
+            }
+        }
+        let bombs = Arc::new(AtomicUsize::new(1));
+        let starts = Arc::new(AtomicUsize::new(0));
+        let (b2, s2) = (Arc::clone(&bombs), Arc::clone(&starts));
+        let sup = Supervisor::new("utf8")
+            .child(ChildSpec::new("accented", move || {
+                s2.fetch_add(1, Ordering::SeqCst);
+                Accented {
+                    bombs: Arc::clone(&b2),
+                }
+            }))
+            .start();
+        wait_for(|| starts.load(Ordering::SeqCst) == 1);
+        let child: ActorRef<()> = sup.child_ref("accented").unwrap();
+        child.tell(()).unwrap();
+
+        wait_for(|| starts.load(Ordering::SeqCst) == 2);
+        let status = sup.status();
+        assert_eq!(status.children[0].restarts, 1);
+        let err = status.children[0].last_error.clone().unwrap();
+        assert_eq!(err, format!("{}…", "x".repeat(239)));
+        sup.stop();
+    }
+
+    #[test]
     fn intensity_exceeded_fails_supervisor_and_stops_children() {
         struct AlwaysBombs;
         impl Actor for AlwaysBombs {
