@@ -19,7 +19,8 @@
 //!   primitive behind sutegi's cross-pod pubsub.
 //!
 //! What it does not (yet): TLS (terminate at the LB / mesh, or run inside the
-//! cluster network), binary result format, and `COPY`.
+//! cluster network — `sslmode=require` and stricter are refused rather than
+//! silently ignored), binary result format, and `COPY`.
 
 /// The shared hand-rolled, known-answer-tested primitives (SHA-256, HMAC,
 /// PBKDF2, MD5, hex, Base64) — extracted to `sutegi-crypto` once storage,
@@ -178,7 +179,9 @@ impl Default for Config {
 impl Config {
     /// Parse a `postgres://user:password@host:port/dbname?params` URL.
     /// `postgresql://` is accepted too; password, port and params are
-    /// optional. Understood params: `require_auth` (see [`AuthMethods`]).
+    /// optional. Understood params: `require_auth` (see [`AuthMethods`]) and
+    /// `sslmode` (`disable`/`allow`/`prefer` connect in plaintext;
+    /// `require`/`verify-ca`/`verify-full` are an error, since there is no TLS).
     pub fn from_url(url: &str) -> Result<Config, String> {
         let rest = url
             .strip_prefix("postgres://")
@@ -245,8 +248,10 @@ impl Config {
     fn apply_params(&mut self, query: &str) -> Result<(), String> {
         for pair in query.split('&').filter(|p| !p.is_empty()) {
             let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-            if key == "require_auth" {
-                self.require_auth = percent_decode(value).parse()?;
+            match key {
+                "require_auth" => self.require_auth = percent_decode(value).parse()?,
+                "sslmode" => check_sslmode(&percent_decode(value))?,
+                _ => {}
             }
         }
         Ok(())
@@ -254,12 +259,15 @@ impl Config {
 
     /// Build from the environment: `DATABASE_URL` if present, otherwise the
     /// standard `PGHOST`/`PGPORT`/`PGUSER`/`PGPASSWORD`/`PGDATABASE` vars
-    /// (each with a sensible default), plus `PGREQUIREAUTH`.
+    /// (each with a sensible default), plus `PGREQUIREAUTH` and `PGSSLMODE`.
     pub fn from_env() -> Result<Config, String> {
         if let Ok(url) = std::env::var("DATABASE_URL") {
             return Config::from_url(&url);
         }
         let var = |k: &str| std::env::var(k).ok();
+        if let Some(mode) = var("PGSSLMODE") {
+            check_sslmode(&mode)?;
+        }
         let require_auth = match var("PGREQUIREAUTH") {
             Some(v) => v.parse()?,
             None => AuthMethods::default(),
@@ -274,6 +282,23 @@ impl Config {
             statement_cache: true,
             require_auth,
         })
+    }
+}
+
+/// Validate a libpq `sslmode` against what this client can do: speak
+/// plaintext. `disable`, `allow` and `prefer` all mean plaintext here (the
+/// latter two permit it in libpq too). `require`, `verify-ca` and
+/// `verify-full` are an error rather than a silent downgrade — a caller that
+/// asked for TLS must not get a cleartext connection it believes is
+/// encrypted. Terminate TLS at a sidecar/mesh and connect to that instead.
+fn check_sslmode(mode: &str) -> Result<(), String> {
+    match mode {
+        "disable" | "allow" | "prefer" => Ok(()),
+        "require" | "verify-ca" | "verify-full" => Err(format!(
+            "sslmode={mode} needs TLS, which sutegi-pg does not support yet; \
+             use sslmode=disable behind a TLS-terminating proxy"
+        )),
+        other => Err(format!("unknown sslmode: {other:?}")),
     }
 }
 
@@ -353,5 +378,18 @@ mod tests {
         assert!("md5,!password".parse::<AuthMethods>().is_err());
         assert!("gss".parse::<AuthMethods>().is_err());
         assert!(Config::from_url("postgres://u:p@h/db?require_auth=").is_err());
+    }
+
+    #[test]
+    fn sslmode_demanding_tls_is_an_error_not_a_silent_downgrade() {
+        for mode in ["require", "verify-ca", "verify-full"] {
+            let err = Config::from_url(&format!("postgres://u:p@h/db?sslmode={mode}"))
+                .expect_err("TLS was asked for and cannot be given");
+            assert!(err.contains("TLS"), "{mode}: {err}");
+        }
+        for mode in ["disable", "allow", "prefer"] {
+            assert!(Config::from_url(&format!("postgres://u:p@h/db?sslmode={mode}")).is_ok());
+        }
+        assert!(Config::from_url("postgres://u:p@h/db?sslmode=bogus").is_err());
     }
 }
