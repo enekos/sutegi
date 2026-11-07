@@ -13,8 +13,62 @@ pub struct Address {
     pub name: String,
 }
 
+/// Longest forward-path RFC 5321 §4.5.3.1.3 allows, minus the angle brackets.
+const MAX_MAILBOX: usize = 254;
+/// RFC 5321 §4.5.3.1.1.
+const MAX_LOCAL_PART: usize = 64;
+
+/// Check a bare `local@domain` mailbox against a strict, injection-proof
+/// subset of RFC 5321: dot-atom local part, hostname domain. Everything that
+/// could split one address into two (`,` `;` whitespace), close the SMTP path
+/// (`<` `>`), open a quoted string or comment (`"` `(` `)` `\`), or read as a
+/// command-line option (a leading `-`) is refused. Quoted local parts and
+/// address literals are not supported. Non-ASCII letters and digits are
+/// allowed (SMTPUTF8 / IDN).
+///
+/// # Errors
+/// A description of why `addr` is not an acceptable mailbox.
+pub fn check_mailbox(addr: &str) -> Result<(), String> {
+    let invalid = || format!("invalid email address: {addr:?}");
+    if addr.is_empty() || addr.len() > MAX_MAILBOX || addr.starts_with('-') {
+        return Err(invalid());
+    }
+    let (local, domain) = addr.split_once('@').ok_or_else(invalid)?;
+    // RFC 5322 atext, plus '.' between atoms.
+    let local_ok = !local.is_empty()
+        && local.len() <= MAX_LOCAL_PART
+        && !local.starts_with('.')
+        && !local.ends_with('.')
+        && !local.contains("..")
+        && local.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || "!#$%&'*+-/=?^_`{|}~.".contains(c)
+                || (!c.is_ascii() && c.is_alphanumeric())
+        });
+    let domain_ok = !domain.is_empty()
+        && !domain.starts_with(['.', '-'])
+        && !domain.ends_with('.')
+        && !domain.contains("..")
+        && domain.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || c == '-'
+                || c == '.'
+                || (!c.is_ascii() && c.is_alphanumeric())
+        });
+    if local_ok && domain_ok {
+        Ok(())
+    } else {
+        Err(invalid())
+    }
+}
+
 impl Address {
-    /// `a@b.co` or `Name <a@b.co>` (parsed loosely).
+    /// `a@b.co` or `Name <a@b.co>`. The mailbox itself must pass
+    /// [`check_mailbox`]; the display name may be anything without control
+    /// characters (it is quoted or RFC 2047-encoded on render).
+    ///
+    /// # Errors
+    /// The input is not one of those two shapes, or the mailbox is invalid.
     pub fn parse(s: &str) -> Result<Address, String> {
         // Reject control characters that would let an address smuggle a header
         // or SMTP command (CRLF injection). Guarding the raw input keeps both
@@ -30,13 +84,27 @@ impl Address {
             ),
             _ => (String::new(), s.to_string()),
         };
-        let shaped = email
-            .split_once('@')
-            .is_some_and(|(l, d)| !l.is_empty() && !d.is_empty());
-        if !shaped {
-            return Err(format!("invalid email address: {s}"));
+        check_mailbox(&email)?;
+        if name.chars().any(char::is_control) {
+            return Err("invalid email address: control character".to_string());
         }
         Ok(Address { email, name })
+    }
+
+    /// Re-check an `Address` that may not have come from [`Address::parse`]
+    /// (the fields are public).
+    ///
+    /// # Errors
+    /// The mailbox is invalid or the name holds control characters.
+    pub fn check(&self) -> Result<(), String> {
+        check_mailbox(&self.email)?;
+        if self.name.chars().any(char::is_control) {
+            return Err(format!(
+                "invalid display name for {}: control character",
+                self.email
+            ));
+        }
+        Ok(())
     }
 
     fn render(&self) -> String {
@@ -146,6 +214,15 @@ impl Email {
         }
         if self.text.is_none() && self.html.is_none() {
             return Err("email has no body".to_string());
+        }
+        // Fields are public: an Address built by hand never went through parse.
+        let every = self
+            .from
+            .iter()
+            .chain(&self.reply_to)
+            .chain(self.recipients());
+        for addr in every {
+            addr.check()?;
         }
         Ok(())
     }
@@ -323,6 +400,70 @@ mod tests {
         // Valid forms still parse.
         assert!(Address::parse("a@b.co").is_ok());
         assert!(Address::parse("Name <a@b.co>").is_ok());
+    }
+
+    #[test]
+    fn address_parse_rejects_recipient_injection() {
+        for bad in [
+            // Two recipients in one To: sendmail -t would deliver to both.
+            "me@evil.com, v1@x.com",
+            "me@evil.com;v1@x.com",
+            // ESMTP parameter smuggled into RCPT TO:<...>.
+            "x <a@b.co> NOTIFY=SUCCESS ORCPT=rfc822;spy@evil.com",
+            "a@b.co> NOTIFY=SUCCESS",
+            "Name <a@b.co, c@d.co>",
+            "\"a b\"@x.co",
+            "a(comment)@x.co",
+            "a\\b@x.co",
+            "a b@x.co",
+            "a\tb@x.co",
+            // Read as a sendmail option.
+            "-X/var/www/x.log@a",
+            "-oQ/tmp@x",
+            "a@@b.co",
+            "a@b@c.co",
+            ".a@b.co",
+            "a..b@c.co",
+            "a@-b.co",
+            "a@b..co",
+        ] {
+            assert!(Address::parse(bad).is_err(), "{bad:?} must be rejected");
+        }
+        assert!(Address::parse(&format!("{}@b.co", "a".repeat(65))).is_err());
+        // The accepted forms are unchanged.
+        for good in [
+            "a@b.co",
+            "first.last+tag@sub.example.co.uk",
+            "o'brien@x.ie",
+            "Name <a@b.co>",
+            "\"Last, First\" <a@b.co>",
+            "  Name   <  a@b.co  >  ",
+            "Kaixo Ñ <app@example.com>",
+            "ñandú@ejemplo.es",
+        ] {
+            assert!(Address::parse(good).is_ok(), "{good:?} must parse");
+        }
+        let a = Address::parse("\"Last, First\" <a@b.co>").unwrap();
+        assert_eq!(
+            (a.name.as_str(), a.email.as_str()),
+            ("Last, First", "a@b.co")
+        );
+    }
+
+    #[test]
+    fn hand_built_addresses_are_validated() {
+        let mut email = Email::new().from("a@b.co").to("t@b.co").text("x");
+        email.to.push(Address {
+            email: "me@evil.com, v1@x.com".to_string(),
+            name: String::new(),
+        });
+        assert!(email.validate().is_err());
+        let mut email = Email::new().from("a@b.co").to("t@b.co").text("x");
+        email.from = Some(Address {
+            email: "a@b.co".to_string(),
+            name: "N\0".to_string(),
+        });
+        assert!(email.validate().is_err());
     }
 
     #[test]

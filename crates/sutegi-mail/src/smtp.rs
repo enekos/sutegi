@@ -5,7 +5,7 @@
 //! MailHog. For TLS-only providers, terminate at a local relay or implement
 //! [`crate::Transport`] over your own HTTP client.
 
-use crate::message::Email;
+use crate::message::{check_mailbox, Email};
 use crate::Transport;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
@@ -55,8 +55,38 @@ impl Smtp {
     }
 }
 
+/// `EHLO` argument: a hostname or an address literal (`[192.0.2.1]`,
+/// `[IPv6:…]`) — never whitespace, CR/LF or anything that extends the command.
+fn check_helo(helo: &str) -> Result<(), String> {
+    let ok = !helo.is_empty()
+        && helo.len() <= 255
+        && helo
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-.[]:".contains(&b));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("smtp: invalid EHLO hostname {helo:?}"))
+    }
+}
+
 impl Transport for Smtp {
     fn send(&self, email: &Email, rendered: &str, message_id: &str) -> Result<String, String> {
+        // `Email`/`Address` fields are public, so a caller can bypass
+        // `Address::parse`. Every value that lands on a command line is
+        // re-checked here, before anything touches the network.
+        check_helo(&self.helo)?;
+        let from = email
+            .from
+            .as_ref()
+            .ok_or("email has no From address")?
+            .email
+            .clone();
+        check_mailbox(&from)?;
+        for rcpt in email.recipients() {
+            check_mailbox(&rcpt.email)?;
+        }
+
         let stream = TcpStream::connect(&self.addr)
             .map_err(|e| format!("smtp connect {}: {e}", self.addr))?;
         stream.set_read_timeout(Some(self.timeout)).ok();
@@ -80,12 +110,6 @@ impl Transport for Smtp {
             }
         }
 
-        let from = email
-            .from
-            .as_ref()
-            .ok_or("email has no From address")?
-            .email
-            .clone();
         conn.command(&format!("MAIL FROM:<{from}>"), 250)?;
         for rcpt in email.recipients() {
             conn.command(&format!("RCPT TO:<{}>", rcpt.email), 250)?;
@@ -261,6 +285,39 @@ mod tests {
         assert!(joined.contains("RCPT TO:<bcc@example.com>")); // envelope only
         assert!(joined.contains("Subject: Test"));
         assert!(log.contains(&".".to_string())); // terminator
+    }
+
+    #[test]
+    fn command_injection_is_refused_before_connecting() {
+        use crate::message::Address;
+        // Port 1 is never listened on: reaching connect would fail with a
+        // different error, so "invalid" proves the check came first.
+        let smtp = Smtp::new("127.0.0.1:1");
+        let base = Email::new().from("a@b.co").subject("s").text("x");
+        for bad in [
+            "a@b.co> NOTIFY=SUCCESS ORCPT=rfc822;spy@evil.com",
+            "a@b.co>\r\nRCPT TO:<spy@evil.com",
+            "a@b.co\0",
+        ] {
+            let mut email = base.clone();
+            email.to.push(Address {
+                email: bad.to_string(),
+                name: String::new(),
+            });
+            let err = smtp.send(&email, "", "m").unwrap_err();
+            assert!(err.contains("invalid"), "{bad:?}: {err}");
+        }
+        let mut email = base.clone().to("t@b.co");
+        email.from.as_mut().unwrap().email = "a@b.co> SIZE=1".to_string();
+        assert!(smtp.send(&email, "", "m").unwrap_err().contains("invalid"));
+        let email = base.to("t@b.co");
+        for helo in ["evil\r\nRSET", "a b", ""] {
+            let err = Smtp::new("127.0.0.1:1")
+                .hello_as(helo)
+                .send(&email, "", "m")
+                .unwrap_err();
+            assert!(err.contains("EHLO"), "{helo:?}: {err}");
+        }
     }
 
     #[test]
