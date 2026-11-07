@@ -85,6 +85,7 @@ fn sha256_compress(h: &mut [u32; 8], block: &[u8; 64]) {
 /// the input, unlike the one-shot [`sha256`] (which wraps this and buffers
 /// nothing extra either, but takes the whole input as one slice). Use it to
 /// hash streams: S3 upload bodies, file reads, wire frames.
+#[derive(Clone)]
 pub struct Sha256 {
     h: [u32; 8],
     buf: [u8; 64],
@@ -164,40 +165,63 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 
 /// HMAC-SHA-256(key, msg) → 32 bytes (RFC 2104).
 pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
-    const BLOCK: usize = 64;
-    let mut k = [0u8; BLOCK];
-    if key.len() > BLOCK {
-        k[..32].copy_from_slice(&sha256(key));
-    } else {
-        k[..key.len()].copy_from_slice(key);
-    }
-    let mut ipad = [0x36u8; BLOCK];
-    let mut opad = [0x5cu8; BLOCK];
-    for i in 0..BLOCK {
-        ipad[i] ^= k[i];
-        opad[i] ^= k[i];
-    }
-    let mut inner = Sha256::new();
-    inner.update(&ipad);
-    inner.update(msg);
-    let inner_hash = inner.finalize();
+    HmacSha256::new(key).mac(msg)
+}
 
-    let mut outer = Sha256::new();
-    outer.update(&opad);
-    outer.update(&inner_hash);
-    outer.finalize()
+/// A keyed HMAC-SHA-256: the key is hashed (if over-long) and absorbed into
+/// the inner/outer pad states **once**, so each [`mac`](HmacSha256::mac)
+/// costs a constant number of compressions regardless of key length.
+/// PBKDF2 leans on this — re-deriving the pads per iteration made its cost
+/// grow with `iterations × password length`, a CPU DoS on login endpoints.
+struct HmacSha256 {
+    inner: Sha256,
+    outer: Sha256,
+}
+
+impl HmacSha256 {
+    fn new(key: &[u8]) -> Self {
+        const BLOCK: usize = 64;
+        let mut k = [0u8; BLOCK];
+        if key.len() > BLOCK {
+            k[..32].copy_from_slice(&sha256(key));
+        } else {
+            k[..key.len()].copy_from_slice(key);
+        }
+        let mut ipad = [0x36u8; BLOCK];
+        let mut opad = [0x5cu8; BLOCK];
+        for i in 0..BLOCK {
+            ipad[i] ^= k[i];
+            opad[i] ^= k[i];
+        }
+        let mut inner = Sha256::new();
+        inner.update(&ipad);
+        let mut outer = Sha256::new();
+        outer.update(&opad);
+        HmacSha256 { inner, outer }
+    }
+
+    fn mac(&self, msg: &[u8]) -> [u8; 32] {
+        let mut inner = self.inner.clone();
+        inner.update(msg);
+        let inner_hash = inner.finalize();
+        let mut outer = self.outer.clone();
+        outer.update(&inner_hash);
+        outer.finalize()
+    }
 }
 
 /// PBKDF2-HMAC-SHA-256 with a 32-byte derived key — the `Hi()` function from
-/// the SCRAM spec (RFC 5802 §2.2).
+/// the SCRAM spec (RFC 5802 §2.2). The password is keyed into HMAC once, so
+/// the cost is `O(len + iterations)`, not `O(len × iterations)`.
 pub fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
+    let prf = HmacSha256::new(password);
     // dkLen == hLen == 32, so there is exactly one block (INT(1) = 0x00000001).
     let mut block = salt.to_vec();
     block.extend_from_slice(&1u32.to_be_bytes());
-    let mut u = hmac_sha256(password, &block);
+    let mut u = prf.mac(&block);
     let mut result = u;
     for _ in 1..iterations {
-        u = hmac_sha256(password, &u);
+        u = prf.mac(&u);
         for (r, x) in result.iter_mut().zip(u.iter()) {
             *r ^= *x;
         }
@@ -843,6 +867,41 @@ mod tests {
         assert_eq!(
             hex(&dk),
             "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc"
+        );
+    }
+
+    #[test]
+    fn pbkdf2_sha256_multi_iteration_and_long_password() {
+        // RFC 7914-style vector at c = 4096 (cross-checked with Python's
+        // hashlib.pbkdf2_hmac), and a > 64-byte password, which HMAC hashes
+        // down to a 32-byte key first.
+        let dk = pbkdf2_hmac_sha256(
+            b"passwordPASSWORDpassword",
+            b"saltSALTsaltSALTsaltSALTsaltSALTsalt",
+            4096,
+        );
+        assert_eq!(
+            hex(&dk),
+            "348c89dbcbd32b2f32d814b8116e84cf2b17347ebc1800181c4e2a1fb8dd53e1"
+        );
+        let dk = pbkdf2_hmac_sha256(&[b'p'; 100], b"salt", 3);
+        assert_eq!(
+            hex(&dk),
+            "f598272d35e2ca276ac07694cf01636c4d643ad3075956477cfdd83eda46d9f6"
+        );
+    }
+
+    #[test]
+    fn pbkdf2_cost_does_not_scale_with_password_length() {
+        // A 1 MiB password at 2 000 iterations: keyed once this is ~1 MiB of
+        // hashing; re-keyed per iteration it was ~2 GiB (minutes in debug).
+        let password = vec![b'x'; 1 << 20];
+        let start = std::time::Instant::now();
+        let _ = pbkdf2_hmac_sha256(&password, b"salt", 2_000);
+        let took = start.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(5),
+            "pbkdf2 took {took:?} — password re-hashed per iteration?"
         );
     }
 
