@@ -393,7 +393,10 @@ fn bench_request(method: Method, path: &str) -> Request {
 /// Start a sutegi server on ADDR in a background thread.
 fn spawn_server() {
     thread::spawn(|| {
+        // ops_public: the e2e_introspect / e2e_tool_call benches measure the
+        // real ops endpoints, not the closed-by-default 403.
         let app = App::new("bench-server")
+            .ops_public()
             .get("/bench", "Bench endpoint", |_c| text(200, "ok"))
             .post("/echo", "Echo a JSON body back", |c| {
                 let body = c.json()?;
