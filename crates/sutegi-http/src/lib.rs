@@ -770,7 +770,10 @@ where
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(e) => {
+                accept_error_backoff(&e);
+                continue;
+            }
         };
         // HTTP responses are written whole; never wait for a delayed ACK.
         let _ = stream.set_nodelay(true);
@@ -826,7 +829,7 @@ where
                 thread::sleep(idle);
                 idle = (idle * 2).min(IDLE_MAX);
             }
-            Err(_) => {}
+            Err(e) => accept_error_backoff(&e),
         }
     }
 
@@ -939,6 +942,21 @@ where
 }
 
 // ---- thread pool ----------------------------------------------------------
+
+/// How long the accept loop sleeps after a non-transient accept error.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
+
+/// Back off after an accept error. Out of file descriptors (`EMFILE`) fails
+/// every call immediately, so retrying at once would spin a core at 100%;
+/// a client aborting mid-handshake or a signal is transient and retried now.
+fn accept_error_backoff(e: &io::Error) {
+    if !matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionAborted | io::ErrorKind::Interrupted
+    ) {
+        thread::sleep(ACCEPT_ERROR_BACKOFF);
+    }
+}
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
