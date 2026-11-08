@@ -362,9 +362,9 @@ enum Line {
 /// before any post-read length check can fire — so the read itself is capped.
 ///
 /// `deadline` bounds the wall-clock time this may spend on a slow drip: the
-/// check runs at the top of each iteration, so a client feeding one byte per
-/// interval is cut off with [`Line::Timeout`] once the deadline passes, rather
-/// than pinning the worker under the (larger) per-recv timeout indefinitely.
+/// check runs after every chunk, so a client feeding one byte (or one whole
+/// line) per interval is cut off with [`Line::Timeout`] once the deadline
+/// passes, rather than pinning the worker under the per-recv timeout forever.
 fn read_line_capped<R: BufRead>(
     reader: &mut R,
     buf: &mut Vec<u8>,
@@ -390,16 +390,15 @@ fn read_line_capped<R: BufRead>(
         }
         buf.extend_from_slice(&chunk[..take]);
         reader.consume(take);
-        if done {
-            break;
-        }
-        // The line isn't complete yet, so we're about to loop and block on the
-        // next recv — the only moment a slow drip can burn wall-clock. Check
-        // the deadline here (mirroring the body-read loop below), not on entry:
-        // a line already served whole from the buffer never reads the clock,
-        // keeping the parse hot path syscall-free.
+        // Checked once per chunk, *including* the one that completes the line:
+        // a client dripping one whole `a:b\r\n` per recv never leaves a line
+        // incomplete, so a check skipped on completion never fires and the
+        // worker is pinned forever. One clock read per line is cheap.
         if Instant::now() > deadline {
             return Ok(Line::Timeout);
+        }
+        if done {
+            break;
         }
     }
     if buf.is_empty() {
@@ -457,10 +456,8 @@ pub fn parse_request_deadline<R: BufRead>(
 
 /// Shared parse body. Callers that derive `deadline` from `now` immediately
 /// beforehand (`parse_request`, `handle_connection`) reach it directly, skipping
-/// the redundant up-front deadline check — the per-line and per-body loops read
-/// the clock only when they must actually wait for more input, so the hot path
-/// (a request already buffered) is syscall-free apart from the one `now` used to
-/// derive the deadline.
+/// the redundant up-front deadline check. The clock is read once per request /
+/// header line (see [`read_line_capped`]) and once per partial body read.
 fn parse_request_impl<R: BufRead>(
     reader: &mut R,
     limits: &Limits,
@@ -508,38 +505,49 @@ fn parse_request_impl<R: BufRead>(
             Line::Read(n) => n,
         };
         header_bytes += n;
-        let line = decode_line(&buf)?;
-        let l = line.trim_end_matches(['\r', '\n']);
-        if l.is_empty() {
+        // Field lines are strict: CRLF-terminated, `token ":" OWS value OWS`,
+        // no obs-fold, no bare CR/LF or NUL. Every leniency here is a parse
+        // that some proxy in front of us disagrees with — a smuggling
+        // differential (CWE-444) — so anything else is refused with 400.
+        let Some(raw) = buf.strip_suffix(b"\r\n") else {
+            return Ok(Some(Incoming::Reject { status: 400 }));
+        };
+        if raw.is_empty() {
             break;
         }
-        if let Some((k, v)) = l.split_once(':') {
-            let k = k.trim().to_string();
-            let v = v.trim().to_string();
-            // Transfer-Encoding framing (chunked, …) is not implemented. We
-            // must NOT fall through to Content-Length framing: that treats a
-            // chunked body as a 0-length body and leaves the chunk data in the
-            // buffer to be re-parsed as the next request (CWE-444). Refuse it.
-            if k.eq_ignore_ascii_case("transfer-encoding") {
-                return Ok(Some(Incoming::Reject { status: 501 }));
-            }
-            // Content-Length must be exactly 1*DIGIT that fits in usize, and
-            // consistent if repeated. A malformed or conflicting value used to
-            // coerce to 0, desynchronizing body framing (CWE-444) — reject it.
-            if k.eq_ignore_ascii_case("content-length") {
-                let parsed = match parse_content_length(&v) {
-                    Some(n) => n,
-                    None => return Ok(Some(Incoming::Reject { status: 400 })),
-                };
-                match content_length {
-                    Some(prev) if prev != parsed => {
-                        return Ok(Some(Incoming::Reject { status: 400 }));
-                    }
-                    _ => content_length = Some(parsed),
-                }
-            }
-            headers.push((k, v));
+        let line = decode_line(raw)?;
+        let Some((k, v)) = line.split_once(':') else {
+            return Ok(Some(Incoming::Reject { status: 400 }));
+        };
+        // A leading SP/HTAB (obs-fold) or whitespace before the colon fails
+        // the token check, as does an empty name.
+        if k.is_empty() || !k.bytes().all(is_tchar) || v.bytes().any(|b| b == b'\r' || b == 0) {
+            return Ok(Some(Incoming::Reject { status: 400 }));
         }
+        let v = v.trim_matches([' ', '\t']);
+        // Transfer-Encoding framing (chunked, …) is not implemented. We
+        // must NOT fall through to Content-Length framing: that treats a
+        // chunked body as a 0-length body and leaves the chunk data in the
+        // buffer to be re-parsed as the next request (CWE-444). Refuse it.
+        if k.eq_ignore_ascii_case("transfer-encoding") {
+            return Ok(Some(Incoming::Reject { status: 501 }));
+        }
+        // Content-Length must be exactly 1*DIGIT that fits in usize, and
+        // consistent if repeated. A malformed or conflicting value used to
+        // coerce to 0, desynchronizing body framing (CWE-444) — reject it.
+        if k.eq_ignore_ascii_case("content-length") {
+            let parsed = match parse_content_length(v) {
+                Some(n) => n,
+                None => return Ok(Some(Incoming::Reject { status: 400 })),
+            };
+            match content_length {
+                Some(prev) if prev != parsed => {
+                    return Ok(Some(Incoming::Reject { status: 400 }));
+                }
+                _ => content_length = Some(parsed),
+            }
+        }
+        headers.push((k.to_string(), v.to_string()));
     }
 
     // Refuse oversized bodies before allocating an attacker-controlled buffer.
@@ -580,6 +588,11 @@ fn parse_request_impl<R: BufRead>(
     })))
 }
 
+/// RFC 9110 `tchar`: the bytes allowed in a header field name (`token`).
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
 /// Parse a `Content-Length` field value: exactly `1*DIGIT` that fits in
 /// `usize`. Empty, signed (`+5`/`-5`), non-digit, or overflowing values return
 /// `None` so the caller can reject them, rather than `parse().unwrap_or(0)`
@@ -617,6 +630,10 @@ fn write_head_and_body<W: Write>(
     let mut head = String::with_capacity(256);
     let _ = write!(head, "HTTP/1.1 {} {}\r\n", resp.status, reason);
     let mut has_content_type = false;
+    // Upgrade heads are written verbatim (the app's `connection: upgrade` is
+    // the point); every other body's framing belongs to the server.
+    let server_framed = !matches!(resp.body, Body::Upgrade(_));
+    let keep_alive = keep_alive && !asks_close(&resp);
     for (k, v) in &resp.headers {
         // The single output choke point for CRLF-injection defense (CWE-113):
         // a `\r`/`\n` in a name or value would otherwise split the response
@@ -626,6 +643,12 @@ fn write_head_and_body<W: Write>(
         let v_clean = strip_crlf(v);
         if k_clean.eq_ignore_ascii_case("content-type") {
             has_content_type = true;
+        }
+        // Framing is written once, below, from the body itself. An app-set
+        // copy would sit next to it — two Content-Lengths, or CL + TE — and a
+        // downstream proxy may pick the other one (CWE-444). Drop it.
+        if server_framed && is_framing_header(&k_clean) {
+            continue;
         }
         head.push_str(&k_clean);
         head.push_str(": ");
@@ -671,7 +694,11 @@ fn write_head_and_body<W: Write>(
             if head_only {
                 Ok(())
             } else {
-                producer(w)
+                // Panic isolation, as for the handler: the producer is app
+                // code running on a pool worker. The head is already out, so
+                // the only honest outcome is an error that closes the socket.
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| producer(w)))
+                    .unwrap_or_else(|_| Err(io::Error::other("stream producer panicked")))
             }
         }
         // Upgrades need the raw `TcpStream`, which only the server loop has:
@@ -685,6 +712,24 @@ fn write_head_and_body<W: Write>(
             w.flush()
         }
     }
+}
+
+/// Response headers the server owns: it derives them from the body and the
+/// connection state, so an app-set copy is dropped rather than duplicated.
+fn is_framing_header(name: &str) -> bool {
+    ["content-length", "transfer-encoding", "connection"]
+        .iter()
+        .any(|h| name.eq_ignore_ascii_case(h))
+}
+
+/// Whether the app asked for the connection to close (`Connection: close`).
+/// The server's own `connection` header replaces the app's, so this is how
+/// that request still takes effect.
+fn asks_close(resp: &Response) -> bool {
+    resp.headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("connection")
+            && v.split(',').any(|t| t.trim().eq_ignore_ascii_case("close"))
+    })
 }
 
 /// Write the head of an upgrade response: status line + headers + blank line,
@@ -773,7 +818,10 @@ where
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(e) => {
+                accept_error_backoff(&e);
+                continue;
+            }
         };
         // HTTP responses are written whole; never wait for a delayed ACK.
         let _ = stream.set_nodelay(true);
@@ -829,7 +877,7 @@ where
                 thread::sleep(idle);
                 idle = (idle * 2).min(IDLE_MAX);
             }
-            Err(_) => {}
+            Err(e) => accept_error_backoff(&e),
         }
     }
 
@@ -890,10 +938,17 @@ where
                                   // timeouts belong to the blocking HTTP path.
                     let _ = writer.set_read_timeout(None);
                     let _ = writer.set_write_timeout(None);
-                    takeover(writer, leftover);
-                    return Ok(());
+                    // Panic isolation: the takeover is app code too. A panic
+                    // drops the socket it owned; the worker carries on.
+                    let taken = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        takeover(writer, leftover)
+                    }));
+                    return taken.map_err(|_| io::Error::other("upgrade takeover panicked"));
                 }
-                let persist = keep && !resp.is_stream() && served + 1 < limits.keep_alive_max;
+                let persist = keep
+                    && !resp.is_stream()
+                    && !asks_close(&resp)
+                    && served + 1 < limits.keep_alive_max;
                 // HEAD: emit exactly the headers a GET would (incl. its
                 // Content-Length), but never the body bytes.
                 write_head_and_body(&mut writer, resp, persist, is_head)?;
@@ -942,6 +997,21 @@ where
 }
 
 // ---- thread pool ----------------------------------------------------------
+
+/// How long the accept loop sleeps after a non-transient accept error.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
+
+/// Back off after an accept error. Out of file descriptors (`EMFILE`) fails
+/// every call immediately, so retrying at once would spin a core at 100%;
+/// a client aborting mid-handshake or a signal is transient and retried now.
+fn accept_error_backoff(e: &io::Error) {
+    if !matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionAborted | io::ErrorKind::Interrupted
+    ) {
+        thread::sleep(ACCEPT_ERROR_BACKOFF);
+    }
+}
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
@@ -1362,6 +1432,60 @@ mod tests {
     }
 
     #[test]
+    fn panicking_stream_producer_is_an_error_not_a_panic() {
+        let resp = Response::new(200).with_stream(|_| panic!("producer panic (expected)"));
+        let mut buf = Vec::new();
+        assert!(write_response(&mut buf, resp, false).is_err());
+    }
+
+    #[test]
+    fn worker_survives_panicking_stream_and_upgrade() {
+        use std::io::Read;
+        let addr = "127.0.0.1:18466";
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&shutdown);
+        let server = thread::spawn(move || {
+            serve_until(
+                addr,
+                1,
+                Limits::default(),
+                |req| match req.path.as_str() {
+                    "/stream" => Response::new(200).with_stream(|_| panic!("stream (expected)")),
+                    "/upgrade" => Response::upgrade(|_, _| panic!("takeover (expected)")),
+                    _ => Response::new(200).with_body("alive"),
+                },
+                flag,
+            )
+        });
+        let roundtrip = |path: &str| {
+            let mut stream = (0..100)
+                .find_map(|_| {
+                    TcpStream::connect(addr).ok().or_else(|| {
+                        thread::sleep(Duration::from_millis(10));
+                        None
+                    })
+                })
+                .expect("server never listened");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let req = format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+            stream.write_all(req.as_bytes()).unwrap();
+            let mut buf = Vec::new();
+            let _ = stream.read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).into_owned()
+        };
+        roundtrip("/stream");
+        roundtrip("/upgrade");
+        // The single worker must still be alive to answer this.
+        let s = roundtrip("/");
+        assert!(s.ends_with("alive"), "worker died after a panic: {s:?}");
+
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
     fn thread_pool_runs_jobs() {
         use std::sync::atomic::{AtomicU32, Ordering};
         let count = Arc::new(AtomicU32::new(0));
@@ -1487,6 +1611,87 @@ mod tests {
         }
     }
 
+    /// A reader that hands out one whole line per `read`, sleeping first — the
+    /// slowloris shape that never stalls mid-line.
+    struct LineDrip {
+        lines: Vec<&'static [u8]>,
+        next: usize,
+        delay: Duration,
+    }
+
+    impl io::Read for LineDrip {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            let Some(line) = self.lines.get(self.next) else {
+                return Ok(0);
+            };
+            thread::sleep(self.delay);
+            self.next += 1;
+            out[..line.len()].copy_from_slice(line);
+            Ok(line.len())
+        }
+    }
+
+    #[test]
+    fn whole_line_drip_hits_deadline_408() {
+        // Each recv delivers a complete header line, so a deadline checked only
+        // while a line is incomplete never fires. 10 lines x 200ms = 2s against
+        // a 1s deadline must be cut off with 408, not parsed as a request.
+        let mut lines: Vec<&'static [u8]> = vec![b"GET / HTTP/1.1\r\n"];
+        lines.extend(std::iter::repeat_n(&b"a: b\r\n"[..], 9));
+        lines.push(b"\r\n");
+        let mut reader = BufReader::new(LineDrip {
+            lines,
+            next: 0,
+            delay: Duration::from_millis(200),
+        });
+        let limits = Limits {
+            header_timeout: Duration::from_secs(1),
+            ..Limits::default()
+        };
+        match parse_request(&mut reader, &limits).unwrap() {
+            Some(Incoming::Reject { status }) => assert_eq!(status, 408),
+            _ => panic!("a whole-line drip past the deadline must yield 408"),
+        }
+    }
+
+    #[test]
+    fn malformed_header_lines_are_rejected_400() {
+        // Each of these is parsed differently by some proxy in front of us;
+        // accepting any of them leniently is a request-smuggling differential
+        // (CWE-444), so all must be refused with 400.
+        let cases: &[(&str, &[u8])] = &[
+            ("obs-fold", b"GET / HTTP/1.1\r\nX-A: 1\r\n folded\r\n\r\n"),
+            (
+                "obs-fold tab",
+                b"GET / HTTP/1.1\r\nX-A: 1\r\n\tfolded\r\n\r\n",
+            ),
+            (
+                "space before colon",
+                b"GET / HTTP/1.1\r\nContent-Length : 5\r\n\r\nhello",
+            ),
+            ("no colon", b"GET / HTTP/1.1\r\nnot a header\r\n\r\n"),
+            ("empty name", b"GET / HTTP/1.1\r\n: v\r\n\r\n"),
+            ("non-token name", b"GET / HTTP/1.1\r\nX(A): v\r\n\r\n"),
+            ("bare CR", b"GET / HTTP/1.1\r\nX-A: 1\rX-B: 2\r\n\r\n"),
+            ("NUL in value", b"GET / HTTP/1.1\r\nX-A: 1\x002\r\n\r\n"),
+            ("bare LF line", b"GET / HTTP/1.1\r\nX-A: 1\nX-B: 2\r\n\r\n"),
+            ("bare LF end", b"GET / HTTP/1.1\r\nX-A: 1\r\n\n"),
+        ];
+        for (name, raw) in cases {
+            let mut reader = BufReader::new(*raw);
+            match parse_request(&mut reader, &Limits::default()).unwrap() {
+                Some(Incoming::Reject { status }) => assert_eq!(status, 400, "{name}"),
+                _ => panic!("{name}: malformed header line must be rejected 400"),
+            }
+        }
+        // Tab OWS around a well-formed value is still accepted and trimmed.
+        let raw = b"GET / HTTP/1.1\r\nX-A:\t v \t\r\n\r\n";
+        match parse_request(&mut BufReader::new(&raw[..]), &Limits::default()).unwrap() {
+            Some(Incoming::Request(r)) => assert_eq!(r.header("x-a"), Some("v")),
+            _ => panic!("a well-formed header with tab OWS must parse"),
+        }
+    }
+
     #[test]
     fn write_response_strips_crlf_preventing_response_splitting() {
         // Push a raw header (bypassing with_header's own sanitizing) so this
@@ -1501,6 +1706,46 @@ mod tests {
         assert!(!s.contains("\r\nInjected: yes"), "response splitting: {s}");
         // The CR/LF are stripped, collapsing the value onto one line.
         assert!(s.contains("x-evil: aInjected: yes\r\n"), "got: {s}");
+    }
+
+    #[test]
+    fn app_set_framing_headers_are_not_duplicated() {
+        // App-set framing headers used to be written next to the server's
+        // own, giving two Content-Lengths (or CL + TE) — ambiguous framing
+        // a downstream proxy may resolve differently (CWE-444).
+        let resp = Response::new(200)
+            .with_header("Content-Length", "999")
+            .with_header("Transfer-Encoding", "chunked")
+            .with_header("Connection", "keep-alive")
+            .with_body("hi");
+        let mut buf = Vec::new();
+        write_response(&mut buf, resp, false).unwrap();
+        let s = String::from_utf8(buf).unwrap().to_ascii_lowercase();
+        assert_eq!(s.matches("content-length:").count(), 1, "got: {s}");
+        assert!(s.contains("content-length: 2\r\n"), "got: {s}");
+        assert!(!s.contains("transfer-encoding"), "got: {s}");
+        assert_eq!(s.matches("connection:").count(), 1, "got: {s}");
+        assert!(s.contains("connection: close\r\n"), "got: {s}");
+
+        // An app asking to close wins over the server's keep-alive.
+        let resp = Response::new(200)
+            .with_header("connection", "close")
+            .with_body("hi");
+        assert!(asks_close(&resp));
+        let mut buf = Vec::new();
+        write_response(&mut buf, resp, true).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s.matches("connection:").count(), 1, "got: {s}");
+        assert!(s.contains("connection: close\r\n"), "got: {s}");
+
+        // Streams are close-framed: an app Content-Length must not leak out.
+        let resp = Response::new(200)
+            .with_header("content-length", "5")
+            .with_stream(|w| w.write_all(b"x"));
+        let mut buf = Vec::new();
+        write_response(&mut buf, resp, false).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(!s.contains("content-length"), "got: {s}");
     }
 
     #[test]

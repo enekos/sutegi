@@ -11,6 +11,18 @@
 //! timeout — **at-least-once** delivery. Retries, delays and priorities are
 //! columns, not in-memory timers, so a restart forgets nothing.
 //!
+//! A worker death spends an attempt like any failure: when the lease of a job
+//! whose budget is already used up expires, the next claim dead-letters it
+//! (`last_error = "exceeded max_attempts (worker died)"`) instead of running a
+//! poison job forever. Give jobs that must survive a crash `max_attempts > 1`.
+//!
+//! Every write a worker makes after claiming — heartbeat and settle — is
+//! fenced on its lease (`attempts` + `locked_at`, both rewritten by each
+//! claim), so a worker that outlived its visibility timeout can't delete,
+//! unlock, extend or fail a row another worker has since reclaimed. Its late
+//! writes match nothing and are logged as a lost lease.
+
+//!
 //! How the claim stays exclusive differs by backend, and that is the *only*
 //! dialect-aware line in this crate:
 //!
@@ -57,7 +69,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -102,6 +114,8 @@ pub struct JobCtx<'a> {
     payload: &'a Json,
     store: &'a Store,
     stop: &'a AtomicBool,
+    /// The `locked_at` this worker's lease currently holds; heartbeats move it.
+    lease: &'a AtomicI64,
 }
 
 impl JobCtx<'_> {
@@ -119,13 +133,33 @@ impl JobCtx<'_> {
     /// Push the visibility window forward: the job is still alive. Call this
     /// from long handlers, or a second worker will reclaim the row while the
     /// first is still working.
+    ///
+    /// # Errors
+    ///
+    /// A store error, or a **lost lease**: the window already expired and
+    /// another worker reclaimed the job. The handler should stop — whatever
+    /// it returns afterwards is discarded, since the row is no longer its own.
     pub fn heartbeat(&self) -> Result<(), String> {
-        self.store
-            .execute(
-                "UPDATE sutegi_jobs SET locked_at = ? WHERE id = ?",
-                &[Value::Int(now_ms()), Value::Int(self.id)],
-            )
-            .map(|_| ())
+        let held = self.lease.load(Ordering::Relaxed);
+        let now = now_ms().max(held);
+        let n = self.store.execute(
+            "UPDATE sutegi_jobs SET locked_at = ? \
+             WHERE id = ? AND attempts = ? AND locked_at = ?",
+            &[
+                Value::Int(now),
+                Value::Int(self.id),
+                Value::Int(self.attempts),
+                Value::Int(held),
+            ],
+        )?;
+        if n == 0 {
+            return Err(format!(
+                "lease lost: job {} was reclaimed by another worker",
+                self.id
+            ));
+        }
+        self.lease.store(now, Ordering::Relaxed);
+        Ok(())
     }
 
     /// True once the worker pool has been asked to shut down. Long loops should
@@ -400,8 +434,9 @@ impl Queue {
     // --- running ----------------------------------------------------------
 
     /// Claim and run at most one ready job from the default queue. Returns
-    /// `true` if a job ran (so a caller can keep draining), `false` if the
-    /// queue was idle.
+    /// `true` if a job was taken off the queue — run, or dead-lettered because
+    /// its budget was already spent — so a caller can keep draining, `false`
+    /// if the queue was idle.
     pub fn run_once(&self) -> Result<bool, String> {
         self.run_once_on(DEFAULT_QUEUE, &AtomicBool::new(false))
     }
@@ -409,8 +444,20 @@ impl Queue {
     /// [`run_once`](Queue::run_once) against a named queue. `stop` is what the
     /// handler sees through [`JobCtx::should_stop`].
     pub fn run_once_on(&self, queue: &str, stop: &AtomicBool) -> Result<bool, String> {
-        let Some(job) = self.claim(queue)? else {
-            return Ok(false);
+        let job = match self.claim(queue)? {
+            Claim::Idle => return Ok(false),
+            Claim::DeadLettered { id, name, attempts } => {
+                sutegi_log::error!(
+                    "queue",
+                    "job dead-lettered: its worker died on the last attempt",
+                    queue = queue,
+                    job = name,
+                    job_id = id,
+                    attempts = attempts
+                );
+                return Ok(true);
+            }
+            Claim::Run(job) => job,
         };
         let payload = Json::parse(&job.payload).unwrap_or(Json::Null);
         let inherited = trace_fields(job.trace.as_deref());
@@ -436,6 +483,7 @@ impl Queue {
                     payload: &payload,
                     store: &self.store,
                     stop,
+                    lease: &job.lease,
                 };
                 // A panicking handler must not take the worker thread down, and
                 // must not vanish silently either: treat it as a failure so the
@@ -471,9 +519,15 @@ impl Queue {
         Ok(true)
     }
 
-    /// Claim the next ready job in `queue`, or `None` when there is nothing to
-    /// do. One statement, so the claim is atomic on both backends.
-    fn claim(&self, queue: &str) -> Result<Option<Claimed>, String> {
+    /// Claim the next ready job in `queue`. One statement, so the claim is
+    /// atomic on both backends.
+    ///
+    /// A row whose lease expired with its attempt budget already spent belongs
+    /// to a worker that died mid-job (abort, OOM kill, segfault) on its last
+    /// try — no handler ever reached `settle`. Running it again would loop a
+    /// poison job forever, so the same `UPDATE` dead-letters it instead. Every
+    /// `CASE` reads the row as it was before the update, on both dialects.
+    fn claim(&self, queue: &str) -> Result<Claim, String> {
         let now = now_ms();
         let cutoff = now - self.visibility_timeout.as_millis() as i64;
         // Postgres needs SKIP LOCKED so concurrent workers step over rows
@@ -485,24 +539,34 @@ impl Queue {
             ""
         };
         let sql = format!(
-            "UPDATE sutegi_jobs SET locked_at = ?, attempts = attempts + 1 \
+            "UPDATE sutegi_jobs SET \
+               locked_at = CASE WHEN attempts >= max_attempts THEN NULL \
+                                ELSE CAST(? AS BIGINT) END, \
+               failed_at = CASE WHEN attempts >= max_attempts THEN CAST(? AS BIGINT) \
+                                ELSE NULL END, \
+               last_error = CASE WHEN attempts >= max_attempts THEN CAST(? AS TEXT) \
+                                 ELSE last_error END, \
+               attempts = CASE WHEN attempts >= max_attempts THEN attempts \
+                               ELSE attempts + 1 END \
              WHERE id = (SELECT id FROM sutegi_jobs \
                          WHERE failed_at IS NULL AND queue = ? AND run_at <= ? \
                            AND (locked_at IS NULL OR locked_at < ?) \
                          ORDER BY priority DESC, run_at, id LIMIT 1{skip}) \
-             RETURNING id, name, payload, attempts, max_attempts, trace"
+             RETURNING id, name, payload, attempts, max_attempts, trace, failed_at, locked_at"
         );
         let rows = self.store.query(
             &sql,
             &[
                 Value::Int(now),
+                Value::Int(now),
+                Value::Text(WORKER_DIED.to_string()),
                 Value::Text(queue.to_string()),
                 Value::Int(now),
                 Value::Int(cutoff),
             ],
         )?;
         let Some(row) = rows.into_iter().next() else {
-            return Ok(None);
+            return Ok(Claim::Idle);
         };
         let text = |k: &str| {
             row.get(k)
@@ -511,50 +575,69 @@ impl Queue {
                 .to_string()
         };
         let int = |k: &str, d: i64| row.get(k).and_then(Json::as_i64).unwrap_or(d);
-        Ok(Some(Claimed {
+        if row.get("failed_at").and_then(Json::as_i64).is_some() {
+            return Ok(Claim::DeadLettered {
+                id: int("id", 0),
+                name: text("name"),
+                attempts: int("attempts", 0),
+            });
+        }
+        Ok(Claim::Run(Claimed {
             id: int("id", 0),
             name: text("name"),
             payload: text("payload"),
             attempts: int("attempts", 1),
             max_attempts: int("max_attempts", 1),
             trace: row.get("trace").and_then(Json::as_str).map(str::to_string),
+            lease: AtomicI64::new(int("locked_at", now)),
         }))
     }
 
     /// Land a finished attempt: delete on success, retry with backoff while the
     /// budget lasts, dead-letter when it runs out.
+    ///
+    /// Every write is fenced on the lease this worker holds. If the visibility
+    /// timeout expired and another worker reclaimed the row, nothing matches:
+    /// the late result is dropped and logged, never applied over the new
+    /// owner's run — and it is not a worker error.
     fn settle(&self, job: &Claimed, result: Result<(), String>) -> Result<(), String> {
-        match result {
-            Ok(()) => self
-                .store
-                .execute(
-                    "DELETE FROM sutegi_jobs WHERE id = ?",
-                    &[Value::Int(job.id)],
-                )
-                .map(|_| ()),
-            Err(err) if job.attempts >= job.max_attempts => self
-                .store
-                .execute(
+        const FENCE: &str = "id = ? AND attempts = ? AND locked_at = ?";
+        let fence = [
+            Value::Int(job.id),
+            Value::Int(job.attempts),
+            Value::Int(job.lease.load(Ordering::Relaxed)),
+        ];
+        let (sql, mut params) = match result {
+            Ok(()) => (format!("DELETE FROM sutegi_jobs WHERE {FENCE}"), vec![]),
+            Err(err) if job.attempts >= job.max_attempts => (
+                format!(
                     "UPDATE sutegi_jobs SET failed_at = ?, locked_at = NULL, \
-                         last_error = ? WHERE id = ?",
-                    &[Value::Int(now_ms()), Value::Text(err), Value::Int(job.id)],
-                )
-                .map(|_| ()),
+                     last_error = ? WHERE {FENCE}"
+                ),
+                vec![Value::Int(now_ms()), Value::Text(err)],
+            ),
             Err(err) => {
                 let backoff = self.retry_backoff.as_millis() as i64 * job.attempts.max(1);
-                self.store
-                    .execute(
+                (
+                    format!(
                         "UPDATE sutegi_jobs SET locked_at = NULL, last_error = ?, \
-                         run_at = ? WHERE id = ?",
-                        &[
-                            Value::Text(err),
-                            Value::Int(now_ms() + backoff),
-                            Value::Int(job.id),
-                        ],
-                    )
-                    .map(|_| ())
+                         run_at = ? WHERE {FENCE}"
+                    ),
+                    vec![Value::Text(err), Value::Int(now_ms() + backoff)],
+                )
             }
+        };
+        params.extend(fence);
+        if self.store.execute(&sql, &params)? == 0 {
+            sutegi_log::warn!(
+                "queue",
+                "lease lost: job was reclaimed after its visibility timeout; result dropped",
+                job = job.name,
+                job_id = job.id,
+                attempt = job.attempts
+            );
         }
+        Ok(())
     }
 
     /// Spawn `workers` threads that drain the default queue until the returned
@@ -739,6 +822,24 @@ impl Dispatch<'_> {
     }
 }
 
+/// The `last_error` of a job dead-lettered by [`Queue::claim`] rather than by
+/// a handler's own failure.
+const WORKER_DIED: &str = "exceeded max_attempts (worker died)";
+
+/// What one claim attempt found.
+enum Claim {
+    /// Nothing ready.
+    Idle,
+    /// A job to run.
+    Run(Claimed),
+    /// An expired lease on a spent budget, moved to the dead letter instead.
+    DeadLettered {
+        id: i64,
+        name: String,
+        attempts: i64,
+    },
+}
+
 /// A row this worker has claimed.
 struct Claimed {
     id: i64,
@@ -747,6 +848,9 @@ struct Claimed {
     attempts: i64,
     max_attempts: i64,
     trace: Option<String>,
+    /// The `locked_at` written by this claim (or this worker's last
+    /// heartbeat). With `attempts`, it fences every later write to the row.
+    lease: AtomicI64,
 }
 
 const MAX_TRACE_BYTES: usize = 2048;
@@ -860,6 +964,121 @@ mod tests {
         assert!(!is_unique_violation("no such table: sutegi_jobs"));
         assert!(is_already_exists("relation \"sutegi_jobs\" already exists"));
         assert!(!is_already_exists("syntax error at or near \"CREATE\""));
+    }
+
+    // -- lease fencing ------------------------------------------------------
+    //
+    // Driven through `claim`/`settle` directly so the interleaving is forced,
+    // not timed: worker A claims, its lease expires, worker B reclaims, then A
+    // finally reports back.
+
+    struct TempDb(String);
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                // Best-effort cleanup; a leftover temp file is harmless.
+                let _ = std::fs::remove_file(format!("{}{suffix}", self.0));
+            }
+        }
+    }
+
+    fn stolen_job(tag: &str) -> (TempDb, Queue, Claimed, Claimed) {
+        let path = std::env::temp_dir()
+            .join(format!("sutegi-queue-unit-{tag}-{}.db", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let tmp = TempDb(path);
+        drop(TempDb(tmp.0.clone())); // clear any leftover from a crashed run
+        let db = sutegi_orm::db::Db::open(&tmp.0).expect("open db");
+        let q = Queue::new(db).visibility_timeout(Duration::from_millis(30));
+        q.migrate().expect("migrate");
+        q.dispatch_with("job", Json::Null, 5, Duration::ZERO)
+            .expect("dispatch");
+        let Claim::Run(a) = q.claim(DEFAULT_QUEUE).expect("claim") else {
+            panic!("A should claim");
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        let Claim::Run(b) = q.claim(DEFAULT_QUEUE).expect("claim") else {
+            panic!("B should reclaim after A's lease expired");
+        };
+        assert_eq!(a.id, b.id);
+        (tmp, q, a, b)
+    }
+
+    fn row(q: &Queue, id: i64) -> Option<Json> {
+        q.store()
+            .query(
+                "SELECT locked_at, last_error, failed_at FROM sutegi_jobs WHERE id = ?",
+                &[Value::Int(id)],
+            )
+            .expect("select")
+            .into_iter()
+            .next()
+    }
+
+    #[test]
+    fn a_stale_worker_cannot_delete_a_reclaimed_job() {
+        let (_tmp, q, a, b) = stolen_job("fence-ok");
+        q.settle(&a, Ok(()))
+            .expect("a lost lease is not a worker error");
+        assert!(row(&q, a.id).is_some(), "A's late success deleted B's job");
+        q.settle(&b, Ok(())).expect("settle");
+        assert!(row(&q, b.id).is_none());
+    }
+
+    #[test]
+    fn a_stale_worker_cannot_unlock_or_fail_a_reclaimed_job() {
+        let (_tmp, q, a, b) = stolen_job("fence-err");
+        q.settle(&a, Err("stale".into())).expect("no-op");
+        let r = row(&q, a.id).expect("row");
+        assert_eq!(
+            r.get("locked_at").and_then(Json::as_i64),
+            Some(b.lease.load(Ordering::Relaxed)),
+            "A's late failure unlocked B's running job"
+        );
+        assert_eq!(r.get("last_error"), Some(&Json::Null));
+
+        // B's own failure still lands.
+        q.settle(&b, Err("real".into())).expect("settle");
+        let r = row(&q, b.id).expect("row");
+        assert_eq!(r.get("last_error").and_then(Json::as_str), Some("real"));
+    }
+
+    #[test]
+    fn a_stale_heartbeat_reports_the_lost_lease_and_extends_nothing() {
+        let (_tmp, q, a, b) = stolen_job("fence-hb");
+        let stop = AtomicBool::new(false);
+        let payload = Json::Null;
+        let ctx = |job: &Claimed| -> Result<(), String> {
+            JobCtx {
+                id: job.id,
+                name: &job.name,
+                attempts: job.attempts,
+                max_attempts: job.max_attempts,
+                queue: DEFAULT_QUEUE,
+                payload: &payload,
+                store: q.store(),
+                stop: &stop,
+                lease: &job.lease,
+            }
+            .heartbeat()
+        };
+        let err = ctx(&a).expect_err("A no longer holds the lease");
+        assert!(err.contains("lease lost"), "got: {err}");
+        let held = b.lease.load(Ordering::Relaxed);
+        let locked = row(&q, b.id).and_then(|r| r.get("locked_at").and_then(Json::as_i64));
+        assert_eq!(locked, Some(held), "A's heartbeat moved B's lease");
+
+        // B's heartbeat works, and settle follows the moved lease.
+        std::thread::sleep(Duration::from_millis(2));
+        ctx(&b).expect("B holds the lease");
+        assert!(b.lease.load(Ordering::Relaxed) > held);
+        q.settle(&b, Ok(())).expect("settle");
+        assert!(
+            row(&q, b.id).is_none(),
+            "settle must use the heartbeat's lease"
+        );
     }
 
     #[test]

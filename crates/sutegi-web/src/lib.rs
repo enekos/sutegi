@@ -93,9 +93,13 @@ impl Ctx<'_> {
     }
 
     /// The request body parsed as JSON (empty body → empty object; malformed
-    /// body → a `400` [`Error`]).
+    /// body → a `400` [`Error`]; a body that is not declared JSON → `415`, see
+    /// [`json_body`]).
     pub fn json(&self) -> Result<Json, Error> {
-        json_body(self.req).map_err(Error::bad_request)
+        if !is_json_request(self.req) {
+            return Err(Error::new(415, UNSUPPORTED_JSON_TYPE));
+        }
+        parse_json(self.req).map_err(Error::bad_request)
     }
 
     /// Shared state of type `T`, registered via [`App::state`].
@@ -374,6 +378,9 @@ pub struct App {
     routes: Vec<Route>,
     middleware: Vec<Middleware>,
     ops_guard: Option<Middleware>,
+    /// Explicit opt-in to serving the ops surface with no guard. Off by
+    /// default: no guard and no opt-in means the surface is closed (403).
+    ops_public: bool,
     models: Vec<Json>,
     capabilities: Option<Json>,
     search: Vec<Json>,
@@ -448,6 +455,7 @@ impl App {
             routes: Vec::new(),
             middleware: Vec::new(),
             ops_guard: None,
+            ops_public: false,
             models: Vec::new(),
             capabilities: None,
             search: Vec::new(),
@@ -588,8 +596,9 @@ impl App {
     /// `/__` surface).
     ///
     /// The hub's [`check_origin`](sutegi_channels::Channels::check_origin) /
+    /// [`allow_any_origin`](sutegi_channels::Channels::allow_any_origin) /
     /// [`authorize`](sutegi_channels::Channels::authorize) gates are applied
-    /// to the handshake. Keep a `hub.clone()` to broadcast from HTTP
+    /// to the handshake (same-origin by default). Keep a `hub.clone()` to broadcast from HTTP
     /// handlers or background threads.
     #[cfg(feature = "channels")]
     pub fn channels(mut self, pattern: &str, doc: &str, hub: sutegi_channels::ChannelHub) -> App {
@@ -603,6 +612,9 @@ impl App {
         let mut ws = Ws::new();
         if let Some(origins) = origins {
             ws = ws.check_origin(origins);
+        }
+        if hub.allows_any_origin() {
+            ws = ws.allow_any_origin();
         }
         if let Some(gate) = authorize {
             ws = ws.authorize(move |req: &Request| gate(req));
@@ -761,23 +773,37 @@ impl App {
     /// `/__`-mounted route such as `/__migrations`. Returning `Some(resp)`
     /// denies the request with that response; `None` lets it through.
     ///
-    /// Introspection and tool invocation are **open by default** (that's the
-    /// agent-native contract). In any deployment where the agent surface must
-    /// not be public, set a guard here — e.g. require a shared token or an
-    /// internal network. This runs ahead of the global [`middleware`](Self::middleware)
-    /// chain, and unlike the probes and pre-`0.5.2` behaviour, it *can* gate
-    /// `/__introspect` and `/__metrics`.
+    /// The surface is **closed by default**: with neither a guard nor
+    /// [`ops_public`](Self::ops_public), every guarded `/__` request answers
+    /// `403 Forbidden` — tool invocation runs arbitrary app code against shared
+    /// state and introspection discloses the whole route/model map, so they
+    /// must never be reachable by accident. Set a guard here — e.g. require a
+    /// shared token or an internal network. This runs ahead of the global
+    /// [`middleware`](Self::middleware) chain, and unlike the probes and
+    /// pre-`0.5.2` behaviour, it *can* gate `/__introspect` and `/__metrics`.
     /// ```ignore
-    /// app.ops_guard(|req| match req.header("authorization") {
-    ///     Some(tok) if tok == expected => None,             // allow
+    /// let expected = format!("Bearer {token}");
+    /// app.ops_guard(move |req| match req.header("authorization") {
+    ///     Some(h) if sutegi_crypto::constant_time_eq(h.as_bytes(), expected.as_bytes()) => None,
     ///     _ => Some(Response::new(401).with_body(&b"unauthorized"[..])),
     /// })
     /// ```
+    /// [`bearer`] builds exactly this guard: `app.ops_guard(bearer(&token))`.
     pub fn ops_guard(
         mut self,
         guard: impl Fn(&Request) -> Option<Response> + Send + Sync + 'static,
     ) -> App {
         self.ops_guard = Some(Box::new(guard));
+        self
+    }
+
+    /// Serve the ops/agent surface (`/__introspect`, `/__metrics`, `/__tools*`
+    /// and every other `/__`-mounted route) **without any guard**. Only for
+    /// local development or a listener that is unreachable from outside; a
+    /// set [`ops_guard`](Self::ops_guard) still takes precedence. [`App::serve`]
+    /// prints a warning when this is on.
+    pub fn ops_public(mut self) -> App {
+        self.ops_public = true;
         self
     }
 
@@ -886,11 +912,19 @@ impl App {
         let limits = self.limits;
         let introspect = self.introspection();
         let listeners = std::mem::take(&mut self.listeners);
+        // Framework `/__` routes (tools, channels, actors, …) match ahead of the
+        // app's own: they are mounted last, so a catch-all like
+        // `static_dir("/")` registered earlier would otherwise shadow
+        // `GET /__tools`. Stable, so relative order within each half holds.
+        // Sorted after `introspection()` so the advertised order is unchanged.
+        self.routes
+            .sort_by_key(|r| !matches!(r.segs.first(), Some(Seg::Lit(s)) if s.starts_with("__")));
         let routes = Arc::new(self.routes);
         let middleware = Arc::new(self.middleware);
         let after = Arc::new(self.after);
         let access_log = Arc::new(self.access_log);
         let logs_exposed = self.ops_guard.is_some();
+        let ops_public = self.ops_public;
         let ops_guard = Arc::new(self.ops_guard);
         let readiness = Arc::new(self.readiness);
         let state = Arc::new(self.state);
@@ -937,11 +971,21 @@ impl App {
                 // Runs before the global middleware chain AND before routing, so
                 // it protects the internal surface (tool routes live in the
                 // route table; introspect/metrics are matched below). Unset =
-                // open, the historical default.
+                // closed (403) unless the app opted in with `ops_public()`.
                 if ops_surface {
-                    if let Some(guard) = &*ops_guard {
-                        if let Some(resp) = guard(&req) {
-                            return resp;
+                    match &*ops_guard {
+                        Some(guard) => {
+                            if let Some(resp) = guard(&req) {
+                                return resp;
+                            }
+                        }
+                        None if ops_public => {}
+                        None => {
+                            return Error::forbidden(
+                                "ops surface is closed: configure App::ops_guard \
+                                 (or App::ops_public for local development)",
+                            )
+                            .into_response();
                         }
                     }
                 }
@@ -1072,6 +1116,15 @@ impl App {
         });
         println!("sutegi · {} on http://{addr}", self.name);
         println!("  ops: /__health /__ready /__metrics /__introspect");
+        if self.ops_guard.is_none() {
+            if self.ops_public {
+                println!(
+                    "  WARNING: ops surface (/__introspect /__metrics /__tools*) is PUBLIC — ops_public() with no ops_guard"
+                );
+            } else {
+                println!("  ops surface closed (403) — no ops_guard set; only /__health /__ready are served");
+            }
+        }
         if !self.listeners.is_empty() {
             let names: Vec<&str> = self.listeners.iter().map(|l| l.name.as_str()).collect();
             println!("  listeners: {}", names.join(" "));
@@ -1561,10 +1614,11 @@ pub fn cors_credentialed(
 }
 
 /// A pre-middleware requiring `Authorization: Bearer <token>`; else `401`.
+/// The header is compared in constant time (no early exit on a mismatch).
 pub fn bearer(token: &str) -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static {
     let expected = format!("Bearer {}", token);
     move |req: &Request| match req.header("authorization") {
-        Some(h) if h == expected => None,
+        Some(h) if sutegi_crypto::constant_time_eq(h.as_bytes(), expected.as_bytes()) => None,
         _ => Some(text(401, "401 Unauthorized").with_header("www-authenticate", "Bearer")),
     }
 }
@@ -1579,7 +1633,7 @@ pub fn basic(
         sutegi_crypto::base64_encode(format!("{}:{}", user, pass).as_bytes())
     );
     move |req: &Request| match req.header("authorization") {
-        Some(h) if h == expected => None,
+        Some(h) if sutegi_crypto::constant_time_eq(h.as_bytes(), expected.as_bytes()) => None,
         _ => Some(
             text(401, "401 Unauthorized").with_header("www-authenticate", "Basic realm=\"sutegi\""),
         ),
@@ -1664,8 +1718,38 @@ pub fn sse(
 
 // ---- extractors -----------------------------------------------------------
 
-/// Parse the request body as JSON.
+const UNSUPPORTED_JSON_TYPE: &str = "expected content-type: application/json";
+
+/// Is this request's body declared as JSON? `application/json` or any
+/// `application/*+json`, parameters ignored. A request with *no* body and no
+/// content type also passes (an argument-less call). Anything else — notably
+/// the `text/plain`, form and multipart types a cross-site HTML form can send
+/// without a CORS preflight — does not, which is what makes JSON endpoints
+/// (and `/__tools`) immune to form-based CSRF.
+fn is_json_request(req: &Request) -> bool {
+    let Some(ct) = req.header("content-type") else {
+        return req.body.is_empty();
+    };
+    let essence = ct
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    essence == "application/json"
+        || (essence.starts_with("application/") && essence.ends_with("+json"))
+}
+
+/// Parse the request body as JSON. Errors (without parsing) when the body is
+/// not declared JSON — see [`Ctx::json`], which maps that case to `415`.
 pub fn json_body(req: &Request) -> Result<Json, String> {
+    if !is_json_request(req) {
+        return Err(UNSUPPORTED_JSON_TYPE.to_string());
+    }
+    parse_json(req)
+}
+
+fn parse_json(req: &Request) -> Result<Json, String> {
     let s = std::str::from_utf8(&req.body).map_err(|_| "body is not valid UTF-8".to_string())?;
     if s.trim().is_empty() {
         return Ok(Json::Obj(BTreeMap::new()));
@@ -1925,7 +2009,9 @@ mod tests {
 
     #[test]
     fn json_body_parses_and_defaults_empty() {
-        let r = req(Method::Post, br#"{"a":1}"#);
+        let mut r = req(Method::Post, br#"{"a":1}"#);
+        r.headers
+            .push(("content-type".into(), "application/json".into()));
         assert_eq!(
             json_body(&r).unwrap().get("a").and_then(Json::as_i64),
             Some(1)
@@ -1937,6 +2023,75 @@ mod tests {
         );
         // Malformed JSON is an error.
         assert!(json_body(&req(Method::Post, b"{not json")).is_err());
+    }
+
+    #[test]
+    fn bearer_and_basic_accept_only_the_exact_credential() {
+        let with = |v: &str| {
+            let mut r = req(Method::Get, b"");
+            r.headers.push(("authorization".into(), v.into()));
+            r
+        };
+        let b = bearer("s3cret");
+        assert!(b(&with("Bearer s3cret")).is_none());
+        for bad in ["Bearer s3cre", "Bearer s3cretX", "Bearer S3cret", ""] {
+            assert_eq!(b(&with(bad)).map(|r| r.status), Some(401));
+        }
+        assert_eq!(b(&req(Method::Get, b"")).map(|r| r.status), Some(401));
+        let auth = basic("u", "p");
+        let good = format!("Basic {}", sutegi_crypto::base64_encode(b"u:p"));
+        assert!(auth(&with(&good)).is_none());
+        let bad = format!("Basic {}", sutegi_crypto::base64_encode(b"u:q"));
+        assert_eq!(auth(&with(&bad)).map(|r| r.status), Some(401));
+    }
+
+    #[test]
+    fn json_requires_a_json_content_type() {
+        let svc = App::new("t")
+            .ops_public()
+            .post("/echo", "echo", |c| Ok::<_, Error>(json(200, &c.json()?)))
+            .tool("t", "a tool", schema::object(vec![], &[]), |_c, _a| {
+                Ok(Json::Null)
+            })
+            .service();
+        let call = |path: &str, ct: Option<&str>, body: &[u8]| {
+            let mut r = Request {
+                path: path.into(),
+                ..req(Method::Post, body)
+            };
+            if let Some(ct) = ct {
+                r.headers.push(("Content-Type".into(), ct.into()));
+            }
+            svc(r).status
+        };
+        let body = br#"{"a":1}"#;
+        // The cross-site-form content types (no CORS preflight) are refused.
+        assert_eq!(call("/echo", Some("text/plain"), body), 415);
+        assert_eq!(
+            call("/echo", Some("application/x-www-form-urlencoded"), body),
+            415
+        );
+        assert_eq!(
+            call("/echo", Some("multipart/form-data; boundary=x"), body),
+            415
+        );
+        assert_eq!(call("/__tools/t", Some("text/plain"), body), 415);
+        // A body with no declared type is refused too.
+        assert_eq!(call("/echo", None, body), 415);
+        // JSON, with parameters and `+json` suffixes, case-insensitive.
+        assert_eq!(call("/echo", Some("application/json"), body), 200);
+        assert_eq!(
+            call("/echo", Some("Application/JSON; charset=utf-8"), body),
+            200
+        );
+        assert_eq!(
+            call("/echo", Some("application/merge-patch+json"), body),
+            200
+        );
+        assert_eq!(call("/__tools/t", Some("application/json"), body), 200);
+        // An argument-less call (no body, no type) still works.
+        assert_eq!(call("/__tools/t", None, b""), 200);
+        assert_eq!(call("/echo", Some("text/plain"), b""), 415);
     }
 
     #[test]
@@ -2197,7 +2352,8 @@ mod tests {
 
     #[test]
     fn recent_logs_are_served_only_behind_an_ops_guard() {
-        let open = App::new("t").service();
+        // Even an explicitly public ops surface does not expose the log tail.
+        let open = App::new("t").ops_public().service();
         let get = |svc: &dyn Fn(Request) -> Response, path: &str, query: &str| {
             svc(Request {
                 path: path.into(),
@@ -2298,16 +2454,71 @@ mod tests {
     }
 
     #[test]
-    fn introspect_is_open_without_an_ops_guard() {
-        // Unchanged default: no guard => the agent surface is served.
+    fn ops_surface_is_closed_without_a_guard() {
+        // Fail closed: no guard and no opt-in => every guarded `/__` route is
+        // 403, including tool invocation, while probes and app routes work.
         let svc = App::new("t")
             .get("/", "home", |_c| text(200, "ok"))
+            .get("/__events", "app-mounted ops route", |_c| text(200, "x"))
+            .tool("t", "a tool", schema::object(vec![], &[]), |_c, _a| {
+                Ok(Json::Null)
+            })
+            .service();
+        let call = |path: &str, method: Method| {
+            svc(Request {
+                path: path.into(),
+                ..req(method, b"")
+            })
+            .status
+        };
+        assert_eq!(call("/__introspect", Method::Get), 403);
+        assert_eq!(call("/__metrics", Method::Get), 403);
+        assert_eq!(call("/__tools", Method::Get), 403);
+        assert_eq!(call("/__tools/t", Method::Post), 403);
+        assert_eq!(call("//__tools/t/", Method::Post), 403);
+        assert_eq!(call("/__tools/t/stream", Method::Post), 403);
+        assert_eq!(call("/__events", Method::Get), 403);
+        assert_eq!(call("/__health", Method::Get), 200);
+        assert_eq!(call("/__ready", Method::Get), 200);
+        assert_eq!(call("/", Method::Get), 200);
+    }
+
+    #[test]
+    fn ops_routes_are_not_shadowed_by_a_root_static_dir() {
+        let dir = std::env::temp_dir().join(format!("sutegi-shadow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let svc = App::new("t")
+            .ops_public()
+            .static_dir("/", &dir)
+            .tool("t", "a tool", schema::object(vec![], &[]), |_c, _a| {
+                Ok(Json::Null)
+            })
             .service();
         let resp = svc(Request {
-            path: "/__introspect".into(),
+            path: "/__tools".into(),
             ..req(Method::Get, b"")
         });
+        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(resp.status, 200);
+        assert!(full_body(resp).contains("\"t\""));
+    }
+
+    #[test]
+    fn ops_public_opts_in_and_a_guard_still_wins() {
+        let open = App::new("t").ops_public().service();
+        let intro = |svc: &dyn Fn(Request) -> Response| {
+            svc(Request {
+                path: "/__introspect".into(),
+                ..req(Method::Get, b"")
+            })
+            .status
+        };
+        assert_eq!(intro(&open), 200);
+        let guarded = App::new("t")
+            .ops_public()
+            .ops_guard(|_req| Some(text(401, "nope")))
+            .service();
+        assert_eq!(intro(&guarded), 401);
     }
 
     #[test]
@@ -2333,6 +2544,7 @@ mod tests {
             .listener("noop", "Would panic if spawned.", |_ctx| {
                 panic!("spawned by service()")
             })
+            .ops_public()
             .service();
         let resp = svc(Request {
             path: "/__introspect".into(),

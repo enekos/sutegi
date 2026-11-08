@@ -10,7 +10,8 @@
 //!   return `Ok` and send nothing.
 //!
 //! ```ignore
-//! let mail = AuthMail::new(mailer, b"link-secret", "https://app.example.com", "MyApp");
+//! let secret = config.require("LINK_SECRET")?; // >= 32 random bytes
+//! let mail = AuthMail::new(mailer, secret.as_bytes(), "https://app.example.com", "MyApp");
 //! mail.send_verification(&user)?;                       // on register
 //! mail.confirm_email(&auth.users, &token)?;             // GET /verify-email
 //! mail.send_password_reset(&auth.users, &email)?;       // POST /forgot-password
@@ -42,6 +43,10 @@ impl AuthMail {
     /// `base_url` is your app's public origin (`https://app.example.com`);
     /// links are minted under it. `secret` signs the links — long, random,
     /// configured (rotating it invalidates outstanding links).
+    ///
+    /// # Panics
+    ///
+    /// If `secret` is shorter than [`sutegi_session::MIN_SECRET_LEN`] bytes.
     pub fn new(mailer: Arc<Mailer>, secret: &[u8], base_url: &str, app_name: &str) -> AuthMail {
         AuthMail {
             mailer,
@@ -215,7 +220,12 @@ mod tests {
         users.migrate().unwrap();
         let mem = Memory::new();
         let mailer = Arc::new(Mailer::new(mem.clone(), "App <app@example.com>").unwrap());
-        let mail = AuthMail::new(mailer, b"link-secret", "https://app.test/", "TestApp");
+        let mail = AuthMail::new(
+            mailer,
+            b"link-secret-0123456789abcdef012345",
+            "https://app.test/",
+            "TestApp",
+        );
         (users, mail, mem)
     }
 

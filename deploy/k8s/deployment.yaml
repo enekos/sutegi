@@ -2,6 +2,12 @@
 # 3 replicas, liveness/readiness probes against the built-in endpoints,
 # graceful drain on SIGTERM, Prometheus scrape annotations, and modest
 # resource asks (the binary is tiny, so requests can be small).
+#
+# The /__ ops surface (metrics, introspect, tools) needs `Authorization: Bearer
+# $OPS_TOKEN`; without the secret it stays closed (403). Create it with
+#   kubectl create secret generic sutegi-todo-ops --from-literal=token=$(openssl rand -hex 32)
+# and give the Prometheus scrape job the same bearer token (annotation-based
+# discovery alone cannot authenticate).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -24,6 +30,11 @@ spec:
     spec:
       # Allow in-flight requests to drain before SIGKILL.
       terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
       containers:
         - name: app
           image: sutegi-todo:latest
@@ -34,6 +45,13 @@ spec:
             - { name: HOST, value: "0.0.0.0" }
             - { name: PORT, value: "8080" }
             - { name: WORKERS, value: "8" }
+            - name: OPS_TOKEN
+              valueFrom:
+                secretKeyRef: { name: sutegi-todo-ops, key: token, optional: true }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
           livenessProbe:
             httpGet: { path: /__health, port: 8080 }
             periodSeconds: 10
@@ -42,12 +60,11 @@ spec:
             httpGet: { path: /__ready, port: 8080 }
             periodSeconds: 5
             failureThreshold: 2
-          lifecycle:
-            preStop:
-              # Give the Service time to deregister this pod before we drain,
-              # so no new traffic arrives during shutdown.
-              exec:
-                command: ["sleep", "5"]
+          # No exec preStop hook: the distroless image has no `sleep` (or any
+          # shell), so one would fail. The app drains on SIGTERM within
+          # terminationGracePeriodSeconds. On Kubernetes >= 1.30 you can add
+          # `lifecycle: { preStop: { sleep: { seconds: 5 } } }` (native, no binary)
+          # to let the Service deregister the pod before draining.
           resources:
             requests: { cpu: "50m", memory: "32Mi" }
             limits: { cpu: "500m", memory: "128Mi" }

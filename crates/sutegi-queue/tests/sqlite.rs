@@ -333,7 +333,11 @@ fn a_job_whose_worker_died_is_reclaimed_after_the_visibility_timeout() {
     q.register("resume", |_job| Ok(()));
     q.migrate().expect("migrate");
 
-    let id = q.dispatch("resume", Json::Null).expect("dispatch");
+    // Budget for a second try: a death on the *last* attempt dead-letters
+    // (see the poison-job test below).
+    let id = q
+        .dispatch_with("resume", Json::Null, 2, Duration::ZERO)
+        .expect("dispatch");
     // Simulate a worker that claimed the row and then died: locked, never
     // settled.
     db.execute(
@@ -346,6 +350,45 @@ fn a_job_whose_worker_died_is_reclaimed_after_the_visibility_timeout() {
     std::thread::sleep(Duration::from_millis(70));
     assert!(q.run_once().expect("run"), "lease expired, work resumed");
     assert_eq!(count(&db, "SELECT COUNT(*) AS n FROM sutegi_jobs"), 0);
+}
+
+#[test]
+fn a_poison_job_whose_worker_died_on_its_last_attempt_is_dead_lettered() {
+    let tmp = TempDb::new("poison");
+    let db = tmp.open();
+    let runs = Arc::new(AtomicU32::new(0));
+    let mut q = Queue::new(db.clone()).visibility_timeout(Duration::from_millis(50));
+    let seen = Arc::clone(&runs);
+    q.register("poison", move |_job| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
+    q.migrate().expect("migrate");
+
+    let id = q
+        .dispatch_with("poison", Json::Null, 2, Duration::ZERO)
+        .expect("dispatch");
+    // The worker took its last attempt and was killed outright (abort, OOM):
+    // locked, budget spent, never settled.
+    db.execute(
+        "UPDATE sutegi_jobs SET locked_at = ?, attempts = 2 WHERE id = ?",
+        &[Value::Int(now_ms()), Value::Int(id)],
+    )
+    .expect("lock");
+    std::thread::sleep(Duration::from_millis(70));
+
+    assert!(q.run_once().expect("run"), "the expired row was taken off");
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        0,
+        "a spent job must not run again"
+    );
+    let failed = q.failed(10).expect("failed");
+    assert_eq!(failed.len(), 1);
+    let error = failed[0].get("last_error").and_then(Json::as_str);
+    assert_eq!(error, Some("exceeded max_attempts (worker died)"));
+    assert_eq!(failed[0].get("attempts").and_then(Json::as_i64), Some(2));
+    assert!(!q.run_once().expect("run"), "and it stays dead");
 }
 
 #[test]

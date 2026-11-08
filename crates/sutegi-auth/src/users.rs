@@ -62,6 +62,25 @@ pub struct Users<B: Backend> {
 /// Minimum accepted password length (bytes).
 pub const MIN_PASSWORD_LEN: usize = 8;
 
+/// Maximum accepted password length (bytes). Bounds the PBKDF2 input so an
+/// unauthenticated login cannot hand the hasher megabytes of key material.
+pub const MAX_PASSWORD_LEN: usize = 1024;
+
+/// The length rule shared by every password-setting path.
+fn check_password_len(password: &str) -> Result<(), String> {
+    if password.len() < MIN_PASSWORD_LEN {
+        return Err(format!(
+            "password must be at least {MIN_PASSWORD_LEN} characters"
+        ));
+    }
+    if password.len() > MAX_PASSWORD_LEN {
+        return Err(format!(
+            "password must be at most {MAX_PASSWORD_LEN} characters"
+        ));
+    }
+    Ok(())
+}
+
 impl<B: Backend> Users<B> {
     pub fn new(backend: B) -> Users<B> {
         Users {
@@ -118,7 +137,8 @@ impl<B: Backend> Users<B> {
     }
 
     /// Register with an explicit name and role. Fails on a malformed email,
-    /// a password under [`MIN_PASSWORD_LEN`] bytes, or a taken email.
+    /// a password under [`MIN_PASSWORD_LEN`] or over [`MAX_PASSWORD_LEN`]
+    /// bytes, or a taken email.
     pub fn register_with(
         &self,
         email: &str,
@@ -127,11 +147,7 @@ impl<B: Backend> Users<B> {
         role: &str,
     ) -> Result<User, String> {
         let email = normalize_email(email)?;
-        if password.len() < MIN_PASSWORD_LEN {
-            return Err(format!(
-                "password must be at least {MIN_PASSWORD_LEN} characters"
-            ));
-        }
+        check_password_len(password)?;
         if self.find_by_email(&email)?.is_some() {
             return Err("email already registered".to_string());
         }
@@ -163,8 +179,13 @@ impl<B: Backend> Users<B> {
 
     /// Check credentials. `Ok(None)` covers both "no such user" and "wrong
     /// password" — with one PBKDF2 run burned either way — and `Err` is
-    /// reserved for real store failures.
+    /// reserved for real store failures. A password over
+    /// [`MAX_PASSWORD_LEN`] bytes is rejected before any lookup or hashing
+    /// (it can match no stored hash), whether or not the email exists.
     pub fn authenticate(&self, email: &str, password: &str) -> Result<Option<User>, String> {
+        if password.len() > MAX_PASSWORD_LEN {
+            return Ok(None);
+        }
         let email = match normalize_email(email) {
             Ok(e) => e,
             Err(_) => return Ok(None),
@@ -230,13 +251,9 @@ impl<B: Backend> Users<B> {
             .collect()
     }
 
-    /// Replace a user's password (same length rule as registration).
+    /// Replace a user's password (same length rules as registration).
     pub fn set_password(&self, id: i64, new_password: &str) -> Result<(), String> {
-        if new_password.len() < MIN_PASSWORD_LEN {
-            return Err(format!(
-                "password must be at least {MIN_PASSWORD_LEN} characters"
-            ));
-        }
+        check_password_len(new_password)?;
         let hash = hash_password_with(new_password, self.iterations)?;
         match self.backend.execute(
             "UPDATE users SET password_hash = ? WHERE id = ?",
@@ -256,10 +273,12 @@ impl<B: Backend> Users<B> {
         current: &str,
         new_password: &str,
     ) -> Result<bool, String> {
+        check_password_len(new_password)?;
         let Some(hash) = self.password_hash_of(id)? else {
             return Err(format!("no user with id {id}"));
         };
-        if !verify_password(current, &hash) {
+        // An over-long `current` can match no stored hash: reject unhashed.
+        if current.len() > MAX_PASSWORD_LEN || !verify_password(current, &hash) {
             return Ok(false);
         }
         self.set_password(id, new_password)?;
@@ -385,7 +404,7 @@ fn user_of(row: &Json) -> Result<User, String> {
 
 /// Trim, lowercase, and shape-check an email. Deliberately minimal — one `@`
 /// with something on both sides; real validation is delivery.
-fn normalize_email(email: &str) -> Result<String, String> {
+pub(crate) fn normalize_email(email: &str) -> Result<String, String> {
     let email = email.trim().to_lowercase();
     let ok = email.len() <= 254
         && email
@@ -433,6 +452,34 @@ mod tests {
             .authenticate("nobody@example.com", "correct horse")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn over_long_passwords_rejected_without_hashing() {
+        // Default work factor on purpose: if any path hashed the 2 MiB
+        // input, this test would take minutes instead of milliseconds.
+        let users = Users::new(Db::memory().unwrap());
+        users.migrate().unwrap();
+        let huge = "x".repeat(2 << 20);
+        let at_cap = "y".repeat(MAX_PASSWORD_LEN);
+        let over_cap = "y".repeat(MAX_PASSWORD_LEN + 1);
+
+        let start = std::time::Instant::now();
+        assert!(users.register("big@a.co", &huge).is_err());
+        assert!(users.register("big@a.co", &over_cap).is_err());
+        // Unknown email and known email both reject before the decoy/real hash.
+        assert_eq!(users.authenticate("nobody@a.co", &huge).unwrap(), None);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+
+        let users = store(); // fast work factor for the happy paths
+        let u = users.register("cap@a.co", &at_cap).unwrap();
+        assert!(users.authenticate("cap@a.co", &at_cap).unwrap().is_some());
+        assert_eq!(users.authenticate("cap@a.co", &huge).unwrap(), None);
+        assert!(users.set_password(u.id, &over_cap).is_err());
+        assert!(users.change_password(u.id, &at_cap, &over_cap).is_err());
+        assert_eq!(users.change_password(u.id, &huge, "newpassword"), Ok(false));
+        // Nothing above changed the credential.
+        assert!(users.authenticate("cap@a.co", &at_cap).unwrap().is_some());
     }
 
     #[test]

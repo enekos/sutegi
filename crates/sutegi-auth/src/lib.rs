@@ -58,9 +58,9 @@ pub use flows::AuthMail;
 pub use links::Links;
 pub use password::{hash_password, needs_rehash, verify_password, DEFAULT_ITERATIONS};
 pub use remember::{Remember, REMEMBER_COOKIE, REMEMBER_TTL};
-pub use throttle::Throttle;
+pub use throttle::{login_key, Throttle};
 pub use tokens::{ApiToken, Tokens, TOKEN_PREFIX};
-pub use users::{User, Users, MIN_PASSWORD_LEN};
+pub use users::{User, Users, MAX_PASSWORD_LEN, MIN_PASSWORD_LEN};
 
 use std::sync::Arc;
 use sutegi_json::Json;
@@ -111,13 +111,14 @@ impl<B: Backend> Auth<B> {
         self
     }
 
-    /// Stamp `user` into the (signed) session and attach it to `resp`.
-    /// Existing session data is preserved. The session carries a fingerprint
-    /// of the current password hash, so a password change invalidates every
+    /// Stamp `user` into a **fresh** (signed) session and attach it to
+    /// `resp`. Any pre-login session data — including its CSRF token — is
+    /// discarded, so nothing an attacker planted or learned before login
+    /// carries over (session fixation). The session carries a fingerprint of
+    /// the current password hash, so a password change invalidates every
     /// other session on the next store-checking lookup.
     pub fn login(&self, req: &Request, user: &User, resp: Response) -> Response {
-        let mut s = self.sessions.load(req);
-        self.stamp(&mut s, user.id);
+        let s = self.fresh_session(req, user.id);
         self.sessions.save(&s, resp)
     }
 
@@ -174,32 +175,47 @@ impl<B: Backend> Auth<B> {
     }
 
     /// The logged-in user id, if the request carries a valid, unexpired
-    /// session. Pure cookie-HMAC work — no database access (so no password
-    /// binding check; [`current`](Auth::current) and [`identify`](Auth::identify)
-    /// enforce it).
+    /// session with a password binding. Pure cookie-HMAC work — no database
+    /// access, so the binding is only required to be *present*, not checked
+    /// against the store; [`current`](Auth::current), [`identify`](Auth::identify)
+    /// and [`require_auth`] enforce it.
     pub fn user_id(&self, req: &Request) -> Option<i64> {
+        self.session_of(req).map(|(uid, _)| uid)
+    }
+
+    /// The logged-in [`User`], loaded from the store. A session whose
+    /// password binding is missing or no longer matches the stored hash —
+    /// the password changed since login — is treated as anonymous.
+    pub fn current(&self, req: &Request) -> Result<Option<User>, String> {
+        match self.bound_user_id(req)? {
+            Some(id) => self.users.find(id),
+            None => Ok(None),
+        }
+    }
+
+    /// `(uid, pwb)` from a valid, unexpired session. Fails closed: a session
+    /// without a password binding is anonymous.
+    fn session_of(&self, req: &Request) -> Option<(i64, String)> {
         let s = self.sessions.load(req);
         let exp = s.get(EXP_KEY).and_then(Json::as_i64)?;
         if exp < users::now_secs() {
             return None;
         }
-        s.get(UID_KEY).and_then(Json::as_i64)
+        let uid = s.get(UID_KEY).and_then(Json::as_i64)?;
+        let pwb = s.get_str(PWB_KEY)?;
+        Some((uid, pwb.to_string()))
     }
 
-    /// The logged-in [`User`], loaded from the store (one lookup). A session
-    /// whose password binding no longer matches the stored hash — the
-    /// password changed since login — is treated as anonymous.
-    pub fn current(&self, req: &Request) -> Result<Option<User>, String> {
-        let Some(id) = self.user_id(req) else {
+    /// The session's uid, only if its password binding matches the store
+    /// (one lookup).
+    fn bound_user_id(&self, req: &Request) -> Result<Option<i64>, String> {
+        let Some((id, pwb)) = self.session_of(req) else {
             return Ok(None);
         };
-        let s = self.sessions.load(req);
-        if let Some(pwb) = s.get_str(PWB_KEY) {
-            if self.bind_of(id)?.as_deref() != Some(pwb) {
-                return Ok(None);
-            }
+        if self.bind_of(id)?.as_deref() != Some(pwb.as_str()) {
+            return Ok(None);
         }
-        self.users.find(id)
+        Ok(Some(id))
     }
 
     /// The request's user via session **or** remember-me revival: when the
@@ -229,8 +245,7 @@ impl<B: Backend> Auth<B> {
         let Some(user) = self.users.find(uid)? else {
             return Ok(None);
         };
-        let mut s = self.sessions.load(req);
-        self.stamp(&mut s, user.id);
+        let s = self.fresh_session(req, user.id);
         Ok(Some(Identified {
             user,
             via_remember: true,
@@ -245,6 +260,15 @@ impl<B: Backend> Auth<B> {
         let mut s = self.sessions.load(req);
         let token = self.sessions.csrf(&mut s)?;
         Ok((token, self.sessions.save(&s, resp)))
+    }
+
+    /// A session holding only `uid`'s login stamp: whatever the request's
+    /// session carried before authentication is dropped.
+    fn fresh_session(&self, req: &Request, uid: i64) -> sutegi_session::Session {
+        let mut s = self.sessions.load(req);
+        s.clear();
+        self.stamp(&mut s, uid);
+        s
     }
 
     fn stamp(&self, s: &mut sutegi_session::Session, uid: i64) {
@@ -284,18 +308,20 @@ impl Identified {
     }
 }
 
-/// Guard: reject with `401` JSON unless the request carries a valid session.
-/// Cookie-signature work only — handlers needing the full user call
-/// [`Auth::current`].
+/// Guard: reject with `401` JSON unless the request carries a valid session
+/// whose password binding still matches the store (one lookup per request,
+/// like [`require_role`]) — so a password change logs other devices out of
+/// guarded routes too. Handlers needing the full user call [`Auth::current`].
 pub fn require_auth<B>(
     auth: Arc<Auth<B>>,
 ) -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static
 where
     B: Backend + Send + Sync + 'static,
 {
-    move |req| match auth.user_id(req) {
-        Some(_) => None,
-        None => Some(unauthenticated()),
+    move |req| match auth.bound_user_id(req) {
+        Ok(Some(_)) => None,
+        Ok(None) => Some(unauthenticated()),
+        Err(e) => Some(json(500, &Json::obj(vec![("error", Json::str(e))]))),
     }
 }
 
@@ -342,8 +368,11 @@ where
 
 /// Guard: on mutating methods, require an `X-CSRF-Token` header matching the
 /// session's token (see [`Auth::csrf`]). Reads (`GET`/`HEAD`/`OPTIONS`) pass,
-/// and so do requests authenticating with an `Authorization` header — bearer
-/// callers carry no ambient cookie credential, which is what CSRF forges.
+/// and so do requests authenticated **only** by an `Authorization: Bearer
+/// stg_…` API token — no session cookie rides along, so there is no ambient
+/// credential for CSRF to forge. Any other `Authorization` header (`Basic`,
+/// a non-`stg_` bearer) or any session cookie keeps the check on: a forged
+/// cross-site request can add headers the guard would otherwise trust.
 pub fn require_csrf<B>(
     auth: Arc<Auth<B>>,
 ) -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static
@@ -354,10 +383,11 @@ where
         if matches!(req.method, Method::Get | Method::Head | Method::Options) {
             return None;
         }
-        if req.header("authorization").is_some() {
+        let s = auth.sessions.load(req);
+        let api_token = bearer_of(req).is_some_and(|t| t.starts_with(TOKEN_PREFIX));
+        if api_token && s.is_empty() {
             return None;
         }
-        let s = auth.sessions.load(req);
         let presented = req.header("x-csrf-token").unwrap_or("");
         if auth.sessions.verify_csrf(&s, presented) {
             None
@@ -422,7 +452,10 @@ mod tests {
         let db = Db::memory().unwrap();
         let users = Users::new(db).iterations(1_000);
         users.migrate().unwrap();
-        Arc::new(Auth::new(users, Sessions::new(b"test-secret").insecure()))
+        Arc::new(Auth::new(
+            users,
+            Sessions::new(b"test-secret-0123456789abcdef012345").insecure(),
+        ))
     }
 
     fn request(headers: Vec<(String, String)>) -> Request {
@@ -468,7 +501,7 @@ mod tests {
         let auth_rig = rig();
         let auth = Auth {
             users: Users::new(auth_rig.users.backend().clone()).iterations(1_000),
-            sessions: Sessions::new(b"test-secret").insecure(),
+            sessions: Sessions::new(b"test-secret-0123456789abcdef012345").insecure(),
             remember: None,
             ttl: 0, // expires immediately (ttl(0) would clamp to 1)
         };
@@ -537,7 +570,13 @@ mod tests {
         users.migrate().unwrap();
         let remember = Remember::new(db).insecure();
         remember.migrate().unwrap();
-        Arc::new(Auth::new(users, Sessions::new(b"test-secret").insecure()).remember(remember))
+        Arc::new(
+            Auth::new(
+                users,
+                Sessions::new(b"test-secret-0123456789abcdef012345").insecure(),
+            )
+            .remember(remember),
+        )
     }
 
     fn cookies_of(resp: &Response) -> Vec<(String, String)> {
@@ -561,11 +600,44 @@ mod tests {
         let req = request(vec![("Cookie".into(), cookie)]);
         assert!(auth.current(&req).unwrap().is_some());
 
+        assert!(require_auth(auth.clone())(&req).is_none());
+
         auth.users.set_password(user.id, "newpassword").unwrap();
-        // Cookie-only check still passes (documented); the store check dies.
+        // Cookie-only check still passes (documented); the store checks die.
         assert_eq!(auth.user_id(&req), Some(user.id));
         assert!(auth.current(&req).unwrap().is_none());
         assert!(auth.identify(&req).unwrap().is_none());
+        assert_eq!(require_auth(auth.clone())(&req).unwrap().status, 401);
+    }
+
+    #[test]
+    fn signed_token_is_not_a_session_cookie() {
+        let auth = rig();
+        let user = auth.users.register("victim@a.co", "password1").unwrap();
+        // `Sessions::token` over attacker-chosen JSON, replayed as the cookie.
+        let forged = auth
+            .sessions
+            .token(&format!(r#"{{"uid":{},"exp":99999999999}}"#, user.id));
+        let req = request(vec![("Cookie".into(), format!("sutegi_session={forged}"))]);
+        assert_eq!(auth.user_id(&req), None);
+        assert!(auth.current(&req).unwrap().is_none());
+        assert_eq!(require_auth(auth.clone())(&req).unwrap().status, 401);
+    }
+
+    #[test]
+    fn session_without_password_binding_fails_closed() {
+        let auth = rig();
+        let user = auth.users.register("nopwb@a.co", "password1").unwrap();
+        // A validly signed session that lacks `pwb` (e.g. minted by older
+        // code, or by app code writing `uid` itself).
+        let mut s = auth.sessions.load(&request(vec![]));
+        s.set(UID_KEY, Json::int(user.id));
+        s.set(EXP_KEY, Json::int(users::now_secs() + 3600));
+        let cookie = cookie_of(&auth.sessions.save(&s, Response::new(200)));
+        let req = request(vec![("Cookie".into(), cookie)]);
+        assert_eq!(auth.user_id(&req), None);
+        assert!(auth.current(&req).unwrap().is_none());
+        assert_eq!(require_auth(auth.clone())(&req).unwrap().status, 401);
     }
 
     #[test]
@@ -695,6 +767,61 @@ mod tests {
         let mut bearer = request(vec![("Authorization".into(), "Bearer stg_x".into())]);
         bearer.method = Method::Post;
         assert!(guard(&bearer).is_none());
+    }
+
+    #[test]
+    fn csrf_guard_ignores_authorization_on_cookie_requests() {
+        let auth = rig();
+        let (_, resp) = auth.csrf(&request(vec![]), Response::new(200)).unwrap();
+        let cookie = cookie_of(&resp);
+        let guard = require_csrf(auth.clone());
+
+        // Cookie session + an arbitrary Authorization header: still checked.
+        let mut basic = request(vec![
+            ("Cookie".into(), cookie.clone()),
+            ("Authorization".into(), "Basic dTpw".into()),
+        ]);
+        basic.method = Method::Post;
+        assert_eq!(guard(&basic).unwrap().status, 419);
+
+        // Even an API-token bearer doesn't exempt a request that also
+        // carries the session cookie.
+        let mut both = request(vec![
+            ("Cookie".into(), cookie),
+            ("Authorization".into(), "Bearer stg_x".into()),
+        ]);
+        both.method = Method::Post;
+        assert_eq!(guard(&both).unwrap().status, 419);
+
+        // Non-API bearer without a cookie: no exemption either.
+        let mut other = request(vec![("Authorization".into(), "Bearer abc".into())]);
+        other.method = Method::Post;
+        assert_eq!(guard(&other).unwrap().status, 419);
+    }
+
+    #[test]
+    fn login_starts_a_fresh_session() {
+        let auth = rig();
+        let user = auth.users.register("fix@a.co", "password1").unwrap();
+        // Pre-login session: a CSRF token (known to whoever planted it) and
+        // arbitrary attacker-chosen state.
+        let (old_csrf, resp) = auth.csrf(&request(vec![]), Response::new(200)).unwrap();
+        let mut planted = auth
+            .sessions
+            .load(&request(vec![("Cookie".into(), cookie_of(&resp))]));
+        planted.set("role_hint", Json::str("admin"));
+        let pre = cookie_of(&auth.sessions.save(&planted, Response::new(200)));
+
+        let post = cookie_of(&auth.login(
+            &request(vec![("Cookie".into(), pre)]),
+            &user,
+            Response::new(200),
+        ));
+        let req = request(vec![("Cookie".into(), post)]);
+        let s = auth.sessions.load(&req);
+        assert!(s.get("role_hint").is_none());
+        assert!(!auth.sessions.verify_csrf(&s, &old_csrf));
+        assert_eq!(auth.current(&req).unwrap().unwrap().id, user.id);
     }
 
     #[test]

@@ -4,8 +4,8 @@
 //! a queryable `account_balances` read model (rebuildable from the log).
 //!
 //! ```text
-//! curl -X POST localhost:8080/accounts/42/deposit  -d '{"amount": 100}'
-//! curl -X POST localhost:8080/accounts/42/withdraw -d '{"amount": 30}'
+//! curl -X POST localhost:8080/accounts/42/deposit  -H 'content-type: application/json' -d '{"amount": 100}'
+//! curl -X POST localhost:8080/accounts/42/withdraw -H 'content-type: application/json' -d '{"amount": 30}'
 //! curl         localhost:8080/accounts/42           # folded: {"balance":70,"version":2}
 //! curl         localhost:8080/accounts/42/history   # the raw events
 //! curl         localhost:8080/accounts              # the projected read model
@@ -72,6 +72,8 @@ fn main() -> std::io::Result<()> {
     let _workers = Arc::new(projections).start(); // held: dropping it stops the workers
 
     App::new("ledger-demo")
+        // Local demo: serve /__events unguarded. Use `ops_guard` in production.
+        .ops_public()
         .state(store)
         .post("/accounts/:id/deposit", "Deposit into an account.", |c| {
             let amount = amount_from(c)?;

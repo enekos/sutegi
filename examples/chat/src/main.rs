@@ -102,9 +102,14 @@ fn main() -> std::io::Result<()> {
         }
         Err(_) => println!("chat: single pod (set DATABASE_URL for cross-pod fan-out)"),
     }
+    // The page is served from this app, so the hub's same-origin default is
+    // the CSWSH guard; a page on another host needs `.check_origin([...])`.
     let hub = channels.build();
 
     App::new("chat")
+        // Local demo: serve the /__channels manifest unguarded. Use `ops_guard`
+        // in production.
+        .ops_public()
         .get("/", "The chat page.", |_c| html(200, PAGE))
         .get("/channels.js", "The bundled channels client.", |_c| {
             Response::new(200)

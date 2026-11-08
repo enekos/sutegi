@@ -444,7 +444,13 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
     };
     let mut msg = msg;
     if msg.len() > 240 {
-        msg.truncate(240);
+        // Runs outside catch_unwind: a cut inside a multi-byte char would
+        // panic here and kill the actor before it reports its exit.
+        let mut cut = 240;
+        while !msg.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        msg.truncate(cut);
         msg.push('…');
     }
     msg

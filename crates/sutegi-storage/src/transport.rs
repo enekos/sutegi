@@ -26,6 +26,11 @@ pub const DEFAULT_MAX_BODY: usize = 64 * 1024 * 1024;
 
 const MAX_HEADERS: usize = 100;
 const MAX_LINE: usize = 8 * 1024;
+/// Interim `1xx` blocks tolerated before the final response. A peer streaming
+/// `100 Continue` forever would otherwise hold the caller indefinitely.
+const MAX_INTERIM: usize = 8;
+/// `u64::MAX` is 16 hex digits; anything longer is hostile or broken.
+const MAX_CHUNK_HEX: usize = 16;
 
 /// One outbound request, fully formed and already signed.
 ///
@@ -220,7 +225,7 @@ impl HttpTransport for PlainHttp {
 
         let head_only = req.method.eq_ignore_ascii_case("HEAD");
         let mut reader = BufReader::new(stream);
-        read_response(&mut reader, self.max_body, head_only)
+        read_response(&mut reader, self.max_body, head_only, Framing::Wire)
     }
 }
 
@@ -238,7 +243,10 @@ impl HttpTransport for PlainHttp {
 /// - TLS 1.2 floor; certificate and hostname verification left **on** (there
 ///   is deliberately no knob here that turns it off).
 /// - `--max-filesize` makes `curl` itself refuse an oversized body.
-/// - Interim `1xx` header blocks (`Expect: 100-continue`) are skipped.
+/// - Interim `1xx` header blocks (`Expect: 100-continue`) are skipped, and a
+///   proxy's `CONNECT` reply is suppressed, so the status read is the
+///   origin's — not an `https_proxy`'s `200 Connection established`.
+/// - `-q` comes first in `argv`, so a `~/.curlrc` cannot undo any of this.
 ///
 /// The one thing that does hit disk: a `PUT` body is handed over as a
 /// `0600`, `O_EXCL`-created temp file (`curl` reads its upload from a file, and
@@ -324,6 +332,7 @@ impl SystemCurl {
         ));
         c.push_str("tlsv1.2\n");
         c.push_str("silent\nshow-error\ninclude\nno-location\nhttp1.1\n");
+        c.push_str("suppress-connect-headers\n");
         c.push_str(&format!("connect-timeout = \"{}\"\n", self.connect_timeout));
         c.push_str(&format!("max-time = \"{}\"\n", self.max_time));
         c.push_str(&format!("max-filesize = \"{}\"\n", self.max_body));
@@ -425,7 +434,9 @@ impl HttpTransport for SystemCurl {
         };
         let config = self.config(req, staged.as_ref().map(|t| t.0.as_path()));
 
+        // `-q` must be the very first argument or curl reads ~/.curlrc anyway.
         let mut child = Command::new(&self.program)
+            .arg("-q")
             .arg("--config")
             .arg("-")
             .stdin(Stdio::piped())
@@ -453,11 +464,23 @@ impl HttpTransport for SystemCurl {
         }
         let head_only = req.method.eq_ignore_ascii_case("HEAD");
         let mut reader = BufReader::new(&out.stdout[..]);
-        read_response(&mut reader, self.max_body, head_only)
+        // curl has already de-chunked the body but echoes the original
+        // `Transfer-Encoding`; its stdout ends where the body does.
+        read_response(&mut reader, self.max_body, head_only, Framing::ToEof)
     }
 }
 
 // ---------------------------------------------------- HTTP/1.1 response read
+
+/// How the body is delimited in the stream being read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Framing {
+    /// Raw socket bytes: honour `Transfer-Encoding` / `Content-Length`.
+    Wire,
+    /// Already-decoded output (`curl -i`): the body runs to EOF, and the
+    /// framing headers describe bytes that are no longer there.
+    ToEof,
+}
 
 /// Read one response: status line, headers, body. Interim `1xx` blocks are
 /// consumed and skipped; `chunked` bodies are de-chunked; everything is
@@ -466,44 +489,59 @@ fn read_response<R: BufRead>(
     r: &mut R,
     max_body: usize,
     head_only: bool,
+    framing: Framing,
 ) -> Result<HttpResponse, String> {
+    let mut interim = 0;
     let (status, headers) = loop {
         let status = parse_status(&read_line(r)?)?;
         let headers = read_headers(r)?;
         if !(100..200).contains(&status) {
             break (status, headers);
         }
+        interim += 1;
+        if interim > MAX_INTERIM {
+            return Err(format!("more than {MAX_INTERIM} interim 1xx responses"));
+        }
     };
 
     let mut body = Vec::new();
-    let chunked = headers
+    let chunked = framing == Framing::Wire
+        && headers
+            .iter()
+            .any(|(k, v)| k == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked"));
+    let mut length: Option<u64> = None;
+    let framed = headers
         .iter()
-        .any(|(k, v)| k == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked"));
-    let length = headers
-        .iter()
-        .find(|(k, _)| k == "content-length")
-        .map(|(_, v)| {
-            v.trim()
-                .parse::<u64>()
-                .map_err(|_| format!("bad content-length: {v:?}"))
-        })
-        .transpose()?;
+        .filter(|(k, _)| framing == Framing::Wire && k == "content-length");
+    for (_, v) in framed {
+        let n = parse_decimal(v.trim()).ok_or_else(|| format!("bad content-length: {v:?}"))?;
+        // Conflicting lengths mean the framing cannot be trusted.
+        if length.is_some_and(|prev| prev != n) {
+            return Err("conflicting content-length headers".to_string());
+        }
+        length = Some(n);
+    }
 
     let bodyless = head_only || status == 204 || status == 304;
     if !bodyless {
         if chunked {
             read_chunked(r, max_body, &mut body)?;
         } else if let Some(n) = length {
-            if n > max_body as u64 {
-                return Err(format!("response body {n} exceeds cap {max_body}"));
-            }
-            body.resize(n as usize, 0);
+            let n = usize::try_from(n)
+                .ok()
+                .filter(|&n| n <= max_body)
+                .ok_or_else(|| format!("response body {n} exceeds cap {max_body}"))?;
+            body.resize(n, 0);
             r.read_exact(&mut body)
                 .map_err(|e| format!("read body: {e}"))?;
         } else {
             // No framing: read to EOF, still bounded.
             r.by_ref()
-                .take(max_body as u64 + 1)
+                .take(
+                    u64::try_from(max_body)
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(1),
+                )
                 .read_to_end(&mut body)
                 .map_err(|e| format!("read body: {e}"))?;
             if body.len() > max_body {
@@ -564,22 +602,48 @@ fn read_headers<R: BufRead>(r: &mut R) -> Result<Vec<(String, String)>, String> 
     }
 }
 
+/// Strict unsigned decimal: digits only (no sign, no whitespace), no overflow.
+fn parse_decimal(s: &str) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// Strict chunk-size: 1..=16 hex digits, nothing else (`from_str_radix`
+/// alone would accept a leading `+`).
+fn parse_chunk_size(s: &str) -> Option<u64> {
+    if s.is_empty() || s.len() > MAX_CHUNK_HEX || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(s, 16).ok()
+}
+
 fn read_chunked<R: BufRead>(r: &mut R, max_body: usize, out: &mut Vec<u8>) -> Result<(), String> {
+    let mut trailers = 0;
     loop {
         let line = read_line(r)?;
         let size_hex = line.split(';').next().unwrap_or("").trim();
-        let size = u64::from_str_radix(size_hex, 16)
-            .map_err(|_| format!("bad chunk size: {size_hex:?}"))?;
+        let size =
+            parse_chunk_size(size_hex).ok_or_else(|| format!("bad chunk size: {size_hex:?}"))?;
         if size == 0 {
-            // Trailers, then the terminating blank line.
-            while !read_line(r)?.is_empty() {}
+            // Trailers, then the terminating blank line — bounded like headers.
+            while !read_line(r)?.is_empty() {
+                trailers += 1;
+                if trailers > MAX_HEADERS {
+                    return Err(format!("more than {MAX_HEADERS} trailer lines"));
+                }
+            }
             return Ok(());
         }
-        if out.len() as u64 + size > max_body as u64 {
-            return Err(format!("chunked body exceeds cap {max_body}"));
-        }
+        // Sizes come from the peer: no `as`, no unchecked `+`.
+        let end = usize::try_from(size)
+            .ok()
+            .and_then(|size| out.len().checked_add(size))
+            .filter(|&end| end <= max_body)
+            .ok_or_else(|| format!("chunked body exceeds cap {max_body}"))?;
         let start = out.len();
-        out.resize(start + size as usize, 0);
+        out.resize(end, 0);
         r.read_exact(&mut out[start..])
             .map_err(|e| format!("read chunk: {e}"))?;
         if !read_line(r)?.is_empty() {
@@ -593,7 +657,12 @@ mod tests {
     use super::*;
 
     fn parse(raw: &str, head_only: bool) -> Result<HttpResponse, String> {
-        read_response(&mut BufReader::new(raw.as_bytes()), 1024, head_only)
+        read_response(
+            &mut BufReader::new(raw.as_bytes()),
+            1024,
+            head_only,
+            Framing::Wire,
+        )
     }
 
     #[test]
@@ -649,6 +718,50 @@ mod tests {
         assert!(parse(&raw, false).unwrap_err().contains("exceeds cap"));
         let chunked = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1000\r\n";
         assert!(parse(chunked, false).unwrap_err().contains("exceeds cap"));
+    }
+
+    #[test]
+    fn hostile_chunk_size_errors_instead_of_panicking() {
+        // u64::MAX chunk after one byte: `len + size` used to wrap to 0 and the
+        // slice `out[1..]` panicked (an abort under `panic = "abort"`).
+        let raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                   1\r\nx\r\nffffffffffffffff\r\n";
+        assert!(parse(raw, false).unwrap_err().contains("exceeds cap"));
+        // Same with an unbounded cap: nothing to compare against but overflow.
+        let mut r = BufReader::new(raw.as_bytes());
+        assert!(read_response(&mut r, usize::MAX, false, Framing::Wire).is_err());
+        for bad in ["1ffffffffffffffff", "+5", "-1", "", "0x5"] {
+            let raw = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{bad}\r\n");
+            assert!(
+                parse(&raw, false).unwrap_err().contains("bad chunk size"),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hostile_framing_is_rejected() {
+        let mut r = BufReader::new(&b"HTTP/1.1 200 OK\r\n\r\nabc"[..]);
+        assert_eq!(
+            read_response(&mut r, usize::MAX, false, Framing::Wire)
+                .unwrap()
+                .body,
+            b"abc"
+        );
+        assert!(parse("HTTP/1.1 200 OK\r\nContent-Length: +2\r\n\r\nok", false).is_err());
+        assert!(parse(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\nok!",
+            false
+        )
+        .unwrap_err()
+        .contains("conflicting"));
+        let flood = "HTTP/1.1 100 Continue\r\n\r\n".repeat(50);
+        assert!(parse(&flood, false).unwrap_err().contains("interim"));
+        let trailers = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n{}",
+            "x: y\r\n".repeat(200)
+        );
+        assert!(parse(&trailers, false).unwrap_err().contains("trailer"));
     }
 
     #[test]
@@ -712,6 +825,9 @@ mod tests {
         assert!(cfg.contains("url = \"https://acct.r2.cloudflarestorage.com/bkt/a%20b.txt\"\n"));
         assert!(cfg.contains("proto = \"=https\"\n"));
         assert!(cfg.contains("no-location\n") && cfg.contains("tlsv1.2\n"));
+        // Behind https_proxy, curl -i would otherwise print the proxy's
+        // "200 Connection established" first and a 403 would read as 200.
+        assert!(cfg.contains("suppress-connect-headers\n"));
         assert!(cfg.contains("request = \"PUT\"\n"));
         assert!(cfg.contains("header = \"authorization: AWS4-HMAC-SHA256 Credential=AK/x\"\n"));
         assert!(cfg.contains("upload-file = \"/tmp/x.tmp\"\n"));
@@ -744,6 +860,34 @@ mod tests {
             .allow_http()
             .config(&req, None)
             .contains("insecure"));
+    }
+
+    /// A stand-in `curl` that checks `-q` is first and prints what real curl
+    /// prints for a chunked response: the header kept, the body decoded.
+    #[cfg(unix)]
+    #[test]
+    fn curl_output_is_read_to_eof_and_curlrc_ignored() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("sutegi-fake-curl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("curl");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\n[ \"$1\" = \"-q\" ] || { echo 'first arg not -q' >&2; exit 9; }\n\
+             cat >/dev/null\n\
+             printf 'HTTP/1.1 200 OK\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\nhello'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let res = SystemCurl::at(bin.to_str().unwrap()).send(&HttpRequest {
+            method: "GET",
+            url: "https://bucket.example.com/k".to_string(),
+            headers: vec![],
+            body: b"",
+        });
+        let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+        let res = res.unwrap();
+        assert_eq!((res.status, res.body.as_slice()), (200, &b"hello"[..]));
     }
 
     #[test]

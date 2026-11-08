@@ -3,6 +3,7 @@
 //! admin routes, and API tokens for agents.
 //!
 //! ```text
+//! SESSION_SECRET=$(openssl rand -hex 32) cargo run -p auth-example   # or SUTEGI_ENV=dev
 //! curl -c /tmp/cj -X POST localhost:8080/register -d '{"email":"root@example.com","password":"password1","name":"Root"}'
 //! curl -c /tmp/cj -X POST localhost:8080/login    -d '{"email":"root@example.com","password":"password1","remember":true}'
 //! curl -b /tmp/cj -c /tmp/cj localhost:8080/me      # revives from the remember cookie if the session lapsed
@@ -16,11 +17,15 @@
 //! ```
 //!
 //! The **first registered user becomes `admin`** (bootstrap convention);
-//! everyone after is a plain `user`. Six failed logins in a minute lock the
-//! email+IP pair out (429 with a retry hint).
+//! everyone after is a plain `user`. Login attempts are throttled per
+//! email+IP pair (5 a minute) and per account across all IPs (20 a minute);
+//! past either limit the answer is 429 with a retry hint.
 
 use std::sync::Arc;
+use sutegi::auth::login_key;
+use sutegi::crypto::{hex, random_bytes};
 use sutegi::prelude::*;
+use sutegi::session::MIN_SECRET_LEN;
 
 fn main() -> std::io::Result<()> {
     let db = Db::open(&std::env::var("AUTH_DB").unwrap_or_else(|_| "auth.db".to_string()))
@@ -37,9 +42,12 @@ fn main() -> std::io::Result<()> {
     remember.migrate().expect("migrate remember tokens");
     let throttle = Arc::new(Throttle::new(db.clone())); // 5 attempts / 60 s
     throttle.migrate().expect("migrate throttle");
+    // Per-account limit, IP-independent: looser so one attacker can't
+    // trivially lock a real user out, but rotating IPs buys no extra guesses.
+    let account_throttle = Arc::new(Throttle::new(db.clone()).max(20));
 
-    let secret = std::env::var("SESSION_SECRET")
-        .unwrap_or_else(|_| "dev-only-secret-set-SESSION_SECRET".to_string());
+    let secret = session_secret(|k| std::env::var(k).ok())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     // `.insecure()` drops the cookies' `Secure` flag for local http:// dev.
     let auth =
         Arc::new(Auth::new(users, Sessions::new(secret.as_bytes()).insecure()).remember(remember));
@@ -108,8 +116,16 @@ fn main() -> std::io::Result<()> {
                     .map(|p| p.rsplit_once(':').map(|(host, _)| host).unwrap_or(p))
                     .unwrap_or_default()
                     .to_string();
-                let key = format!("login:{email}|{ip}");
-                if let Some(retry) = throttle.too_many(&key)? {
+                // Count-then-decide in one atomic step per key (no check-
+                // then-hit race), keyed on the normalized email so case or
+                // whitespace variants share the counter.
+                let (client_key, account_key) =
+                    (login_key(email, Some(&ip)), login_key(email, None));
+                let limited = match throttle.attempt(&client_key)? {
+                    Some(retry) => Some(retry),
+                    None => account_throttle.attempt(&account_key)?,
+                };
+                if let Some(retry) = limited {
                     return Ok(json(
                         429,
                         &Json::obj(vec![
@@ -120,7 +136,8 @@ fn main() -> std::io::Result<()> {
                 }
                 match a_login.users.authenticate(email, password)? {
                     Some(user) => {
-                        throttle.clear(&key)?;
+                        throttle.clear(&client_key)?;
+                        account_throttle.clear(&account_key)?;
                         let resp = json(200, &user.to_json());
                         let remember = body.get("remember").and_then(Json::as_bool) == Some(true);
                         Ok::<_, Error>(if remember {
@@ -129,10 +146,8 @@ fn main() -> std::io::Result<()> {
                             a_login.login(c.req, &user, resp)
                         })
                     }
-                    None => {
-                        throttle.hit(&key)?;
-                        Err(Error::unauthorized("bad credentials"))
-                    }
+                    // The failed attempt is already counted by `attempt`.
+                    None => Err(Error::unauthorized("bad credentials")),
                 }
             },
         )
@@ -245,6 +260,29 @@ fn main() -> std::io::Result<()> {
         .serve()
 }
 
+/// `SESSION_SECRET` (≥ 32 bytes) signs sessions and email links. There is
+/// no baked-in fallback — a known default would let anyone forge sessions
+/// on a deployment that forgot to set it. For local hacking, opt in with
+/// `SUTEGI_ENV=dev` to get a random per-process secret (sessions don't
+/// survive a restart).
+fn session_secret(env: impl Fn(&str) -> Option<String>) -> Result<String, String> {
+    match env("SESSION_SECRET") {
+        Some(s) if s.len() >= MIN_SECRET_LEN => Ok(s),
+        Some(s) => Err(format!(
+            "SESSION_SECRET is {} bytes; need at least {MIN_SECRET_LEN} \
+             (generate one with `openssl rand -hex 32`)",
+            s.len()
+        )),
+        None if env("SUTEGI_ENV").as_deref() == Some("dev") => {
+            eprintln!("SUTEGI_ENV=dev: using a random per-process SESSION_SECRET");
+            Ok(hex(&random_bytes(32)?))
+        }
+        None => Err("SESSION_SECRET is not set (or set SUTEGI_ENV=dev for a \
+                     throwaway local secret)"
+            .to_string()),
+    }
+}
+
 fn credentials(body: &Json) -> Result<(&str, &str, &str), Error> {
     let email = body
         .get("email")
@@ -256,4 +294,41 @@ fn credentials(body: &Json) -> Result<(&str, &str, &str), Error> {
         .ok_or_else(|| Error::bad_request("password is required"))?;
     let name = body.get("name").and_then(Json::as_str).unwrap_or("");
     Ok((email, password, name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            vars.iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn missing_secret_refuses_to_start() {
+        assert!(session_secret(env(&[])).is_err());
+        assert!(session_secret(env(&[("SUTEGI_ENV", "production")])).is_err());
+    }
+
+    #[test]
+    fn short_secret_refuses_to_start() {
+        assert!(session_secret(env(&[("SESSION_SECRET", "hunter2")])).is_err());
+    }
+
+    #[test]
+    fn configured_or_explicit_dev_secret_starts() {
+        let good = "a".repeat(MIN_SECRET_LEN);
+        assert_eq!(
+            session_secret(env(&[("SESSION_SECRET", &good)])).unwrap(),
+            good
+        );
+        let a = session_secret(env(&[("SUTEGI_ENV", "dev")])).unwrap();
+        let b = session_secret(env(&[("SUTEGI_ENV", "dev")])).unwrap();
+        assert!(a.len() >= MIN_SECRET_LEN);
+        assert_ne!(a, b, "dev secret is random, never a baked-in constant");
+    }
 }

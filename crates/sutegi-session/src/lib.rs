@@ -21,8 +21,20 @@ use sutegi_crypto::{constant_time_eq, from_hex, hex as to_hex, hmac_sha256, rand
 use sutegi_json::Json;
 use sutegi_web::{Request, Response};
 
+/// Minimum signing-secret length in bytes. HMAC-SHA-256's security is capped
+/// by the key's entropy; a short or human-chosen secret is guessable offline
+/// from any one cookie. 32 random bytes (e.g. `openssl rand -hex 32`) is the
+/// floor.
+pub const MIN_SECRET_LEN: usize = 32;
+
 /// The session key the CSRF token lives under.
 const CSRF_KEY: &str = "_csrf";
+
+/// MAC domain tags. Session cookies and [`Sessions::token`] share one secret
+/// and one `hex.sig` shape, so each MAC is bound to its purpose — otherwise a
+/// token minted over attacker-chosen JSON would verify as a session cookie.
+const SESSION_DOMAIN: &[u8] = b"sutegi.session\0";
+const TOKEN_DOMAIN: &[u8] = b"sutegi.token\0";
 
 /// Session manager: holds the signing secret and cookie policy.
 pub struct Sessions {
@@ -34,7 +46,18 @@ pub struct Sessions {
 
 impl Sessions {
     /// Create a manager from a secret (use a long, random, configured value).
+    ///
+    /// # Panics
+    ///
+    /// If `secret` is shorter than [`MIN_SECRET_LEN`] bytes — a misconfigured
+    /// deployment should fail at startup, not sign forgeable cookies.
     pub fn new(secret: &[u8]) -> Sessions {
+        assert!(
+            secret.len() >= MIN_SECRET_LEN,
+            "Sessions::new: secret is {} bytes, need at least {MIN_SECRET_LEN} \
+             (generate one with `openssl rand -hex 32`)",
+            secret.len()
+        );
         Sessions {
             secret: secret.to_vec(),
             cookie: "sutegi_session".to_string(),
@@ -59,22 +82,28 @@ impl Sessions {
         self
     }
 
-    fn sign(&self, msg: &[u8]) -> String {
-        to_hex(&hmac_sha256(&self.secret, msg))
+    /// HMAC over `domain ‖ msg`; `domain` is one of the `*_DOMAIN` tags.
+    fn sign(&self, domain: &[u8], msg: &[u8]) -> String {
+        let mut tagged = Vec::with_capacity(domain.len() + msg.len());
+        tagged.extend_from_slice(domain);
+        tagged.extend_from_slice(msg);
+        to_hex(&hmac_sha256(&self.secret, &tagged))
     }
 
     /// Sign an arbitrary value into a `<value-hex>.<sig>` token (CSRF tokens,
     /// password-reset links, …). Verify with [`verify_token`](Sessions::verify_token).
+    /// Tokens are MAC'd under a different domain than session cookies, so
+    /// neither verifies as the other.
     pub fn token(&self, value: &str) -> String {
         let hex = to_hex(value.as_bytes());
-        format!("{}.{}", hex, self.sign(value.as_bytes()))
+        format!("{}.{}", hex, self.sign(TOKEN_DOMAIN, value.as_bytes()))
     }
 
     /// Verify a token from [`token`](Sessions::token); returns the original value.
     pub fn verify_token(&self, token: &str) -> Option<String> {
         let (hex, sig) = token.split_once('.')?;
         let bytes = from_hex(hex)?;
-        if constant_time_eq(self.sign(&bytes).as_bytes(), sig.as_bytes()) {
+        if constant_time_eq(self.sign(TOKEN_DOMAIN, &bytes).as_bytes(), sig.as_bytes()) {
             String::from_utf8(bytes).ok()
         } else {
             None
@@ -87,7 +116,8 @@ impl Sessions {
         if let Some(raw) = req.cookie(&self.cookie) {
             if let Some((payload_hex, sig)) = raw.split_once('.') {
                 if let Some(bytes) = from_hex(payload_hex) {
-                    if constant_time_eq(self.sign(&bytes).as_bytes(), sig.as_bytes()) {
+                    let expected = self.sign(SESSION_DOMAIN, &bytes);
+                    if constant_time_eq(expected.as_bytes(), sig.as_bytes()) {
                         if let Ok(s) = std::str::from_utf8(&bytes) {
                             if let Ok(Json::Obj(map)) = Json::parse(s) {
                                 return Session {
@@ -116,7 +146,7 @@ impl Sessions {
     pub fn cookie_for(&self, session: &Session) -> String {
         let payload = Json::Obj(session.data.clone()).to_string();
         let payload_hex = to_hex(payload.as_bytes());
-        let sig = self.sign(payload.as_bytes());
+        let sig = self.sign(SESSION_DOMAIN, payload.as_bytes());
         let mut cookie = format!(
             "{}={}.{}; Path=/; HttpOnly; SameSite=Lax",
             self.cookie, payload_hex, sig
@@ -226,9 +256,17 @@ mod tests {
         kv.split_once('=').unwrap().1.to_string()
     }
 
+    const KEY: &[u8] = b"0123456789abcdef0123456789abcdef";
+
+    #[test]
+    #[should_panic(expected = "need at least 32")]
+    fn short_secret_is_rejected() {
+        let _ = Sessions::new(b"short");
+    }
+
     #[test]
     fn roundtrip_and_tamper() {
-        let s = Sessions::new(b"super-secret-key").insecure();
+        let s = Sessions::new(KEY).insecure();
         let mut sess = s.load(&req_with_cookie("x", "")); // empty
         assert!(sess.is_empty());
         sess.set("user_id", Json::int(42));
@@ -248,15 +286,30 @@ mod tests {
 
     #[test]
     fn token_sign_verify() {
-        let s = Sessions::new(b"k");
+        let s = Sessions::new(KEY);
         let t = s.token("user:42");
         assert_eq!(s.verify_token(&t).as_deref(), Some("user:42"));
         assert!(s.verify_token("deadbeef.badsig").is_none());
     }
 
     #[test]
+    fn tokens_and_session_cookies_do_not_cross_verify() {
+        let s = Sessions::new(KEY).insecure();
+        // A token over attacker-chosen JSON must not load as a session.
+        let forged = s.token(r#"{"uid":1,"exp":99999999999}"#);
+        assert!(s
+            .load(&req_with_cookie("sutegi_session", &forged))
+            .is_empty());
+        // And a real session cookie must not verify as a token.
+        let mut sess = s.load(&req_with_cookie("x", ""));
+        sess.set("uid", Json::int(1));
+        let cookie = cookie_value(&s.save(&sess, Response::new(200)), "sutegi_session");
+        assert!(s.verify_token(&cookie).is_none());
+    }
+
+    #[test]
     fn save_sets_cookie_attributes() {
-        let s = Sessions::new(b"secret"); // secure by default, 1-day max-age
+        let s = Sessions::new(KEY); // secure by default, 1-day max-age
         let mut sess = s.load(&req_with_cookie("x", ""));
         sess.set("k", Json::int(1));
         let header = s
@@ -275,7 +328,7 @@ mod tests {
 
     #[test]
     fn insecure_and_no_max_age_omit_attributes() {
-        let s = Sessions::new(b"secret").insecure().max_age(None);
+        let s = Sessions::new(KEY).insecure().max_age(None);
         let header = s
             .save(
                 &Session {
@@ -295,7 +348,7 @@ mod tests {
 
     #[test]
     fn custom_cookie_name_roundtrips() {
-        let s = Sessions::new(b"k").cookie_name("sid").insecure();
+        let s = Sessions::new(KEY).cookie_name("sid").insecure();
         let mut sess = s.load(&req_with_cookie("sid", ""));
         sess.set("user", Json::str("eneko"));
         let cookie = cookie_value(&s.save(&sess, Response::new(200)), "sid");
@@ -309,7 +362,7 @@ mod tests {
 
     #[test]
     fn clear_expires_cookie() {
-        let s = Sessions::new(b"k");
+        let s = Sessions::new(KEY);
         let header = s
             .clear(Response::new(200))
             .headers
@@ -339,7 +392,7 @@ mod tests {
 
     #[test]
     fn csrf_mints_once_and_verifies_constant_time() {
-        let s = Sessions::new(b"k").insecure();
+        let s = Sessions::new(KEY).insecure();
         let mut sess = s.load(&req_with_cookie("x", ""));
         let t1 = s.csrf(&mut sess).unwrap();
         assert_eq!(t1.len(), 64);
@@ -362,7 +415,7 @@ mod tests {
 
     #[test]
     fn cookie_for_matches_save() {
-        let s = Sessions::new(b"k");
+        let s = Sessions::new(KEY);
         let mut sess = s.load(&req_with_cookie("x", ""));
         sess.set("a", Json::int(1));
         let via_save = s
@@ -377,7 +430,7 @@ mod tests {
 
     #[test]
     fn empty_payload_token_verification_fails_cleanly() {
-        let s = Sessions::new(b"k");
+        let s = Sessions::new(KEY);
         // No dot separator → None, not a panic.
         assert!(s.verify_token("nosig").is_none());
         // Odd-length hex → None.

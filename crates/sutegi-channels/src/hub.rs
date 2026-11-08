@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Instant;
 
 use sutegi_http::Request;
 use sutegi_json::Json;
@@ -30,6 +31,11 @@ fn pubsub_topic(topic: &str) -> String {
     format!("stg:chan:{topic}")
 }
 
+/// Default cap on concurrent memberships per connection.
+const DEFAULT_MAX_JOINS: usize = 100;
+/// Default inbound message rate per connection: sustained per second, burst.
+const DEFAULT_INBOUND_RATE: (u32, u32) = (100, 200);
+
 /// Builder for a [`ChannelHub`].
 ///
 /// ```ignore
@@ -39,19 +45,56 @@ fn pubsub_topic(topic: &str) -> String {
 ///     .check_origin(["https://app.example.com"])
 ///     .build();
 /// ```
-#[derive(Default)]
 pub struct Channels {
     channels: Vec<Channel>,
     broker: Option<Arc<dyn Broker>>,
     allowed_origins: Option<Vec<String>>,
+    allow_any_origin: bool,
     authorize: Option<AuthorizeFn>,
+    max_joins: usize,
+    inbound_rate: (u32, u32),
     #[cfg(feature = "presence")]
     presence_interval: Option<std::time::Duration>,
+}
+
+impl Default for Channels {
+    fn default() -> Channels {
+        Channels {
+            channels: Vec::new(),
+            broker: None,
+            allowed_origins: None,
+            allow_any_origin: false,
+            authorize: None,
+            max_joins: DEFAULT_MAX_JOINS,
+            inbound_rate: DEFAULT_INBOUND_RATE,
+            #[cfg(feature = "presence")]
+            presence_interval: None,
+        }
+    }
 }
 
 impl Channels {
     pub fn new() -> Channels {
         Channels::default()
+    }
+
+    /// Cap on concurrent memberships (joined topics) per connection. A join
+    /// past it is refused with an error reply whose reason is
+    /// `too_many_joins`. Bounds the per-connection membership, broker
+    /// subscription, and presence state a single client can pin. Default 100.
+    pub fn max_joins_per_conn(mut self, max: usize) -> Channels {
+        self.max_joins = max;
+        self
+    }
+
+    /// Per-connection inbound message rate limit (token bucket): `per_sec`
+    /// sustained, bursts up to `burst`. Messages over the limit are dropped
+    /// unprocessed; the first drop of a burst gets one `stg:error` with
+    /// reason `rate_limited`. `per_sec == 0` disables the limit. Default
+    /// 100/s, burst 200.
+    pub fn inbound_rate(mut self, per_sec: u32, burst: u32) -> Channels {
+        self.inbound_rate = (per_sec, burst.max(1));
+        self
     }
 
     /// Register a channel. First matching pattern wins at join time.
@@ -67,14 +110,23 @@ impl Channels {
         self
     }
 
-    /// Origin allowlist for the WebSocket handshake — the CSWSH guard. Any
-    /// endpoint that authenticates by cookie MUST set this (see `Ws::check_origin`).
+    /// Origin allowlist for the WebSocket handshake — the CSWSH guard. Without
+    /// one the endpoint is same-origin by default (`Origin` host must equal
+    /// `Host`; see `Ws::check_origin`). Set it when the page lives elsewhere.
     pub fn check_origin<I, S>(mut self, origins: I) -> Channels
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
         self.allowed_origins = Some(origins.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Accept upgrades from any `Origin`, disabling the same-origin default
+    /// (see `Ws::allow_any_origin`). Only for public, cookieless hubs — with
+    /// it, any site can open the socket with the visitor's cookies.
+    pub fn allow_any_origin(mut self) -> Channels {
+        self.allow_any_origin = true;
         self
     }
 
@@ -102,7 +154,10 @@ impl Channels {
             topics: Mutex::new(HashMap::new()),
             weak: weak.clone(),
             allowed_origins: self.allowed_origins,
+            allow_any_origin: self.allow_any_origin,
             authorize: self.authorize,
+            max_joins: self.max_joins,
+            inbound_rate: self.inbound_rate,
             #[cfg(feature = "presence")]
             presence: {
                 let mut p = crate::presence::PresenceState::default();
@@ -134,7 +189,10 @@ pub(crate) struct HubInner {
     topics: Mutex<HashMap<String, TopicEntry>>,
     weak: Weak<HubInner>,
     allowed_origins: Option<Vec<String>>,
+    allow_any_origin: bool,
     authorize: Option<AuthorizeFn>,
+    max_joins: usize,
+    inbound_rate: (u32, u32),
     #[cfg(feature = "presence")]
     pub(crate) presence: crate::presence::PresenceState,
 }
@@ -143,6 +201,53 @@ struct ConnEntry {
     req: Arc<Request>,
     /// topic → this connection's membership.
     joins: HashMap<String, JoinEntry>,
+    /// Inbound rate-limit token bucket.
+    bucket: Bucket,
+}
+
+/// A token bucket refilled continuously at `per_sec`, capped at `burst`.
+struct Bucket {
+    tokens: f64,
+    last: Instant,
+    /// Already told the client it is limited (until a message gets through).
+    limited: bool,
+}
+
+/// What the rate limiter decided about one inbound message.
+enum Admit {
+    Pass,
+    /// Dropped; the first drop of a burst also notifies the client.
+    Drop {
+        notify: bool,
+    },
+}
+
+impl Bucket {
+    fn full(burst: u32) -> Bucket {
+        Bucket {
+            tokens: f64::from(burst),
+            last: Instant::now(),
+            limited: false,
+        }
+    }
+
+    fn take(&mut self, (per_sec, burst): (u32, u32), now: Instant) -> Admit {
+        if per_sec == 0 {
+            return Admit::Pass;
+        }
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + elapsed * f64::from(per_sec)).min(f64::from(burst));
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            self.limited = false;
+            Admit::Pass
+        } else {
+            let notify = !self.limited;
+            self.limited = true;
+            Admit::Drop { notify }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -207,7 +312,10 @@ impl Socket {
     }
 
     /// The HTTP upgrade request that opened this connection — headers,
-    /// cookies, path, query — for identity decisions in `on_join`.
+    /// cookies, path, query — for identity decisions in `on_join`. Cookies
+    /// are only trustworthy because the handshake refused cross-origin pages
+    /// (same-origin default or `check_origin`); a hub built with
+    /// `allow_any_origin` must not authenticate by cookie.
     pub fn request(&self) -> &Request {
         &self.req
     }
@@ -352,12 +460,28 @@ impl ChannelHub {
             ConnEntry {
                 req: Arc::new(req.clone()),
                 joins: HashMap::new(),
+                bucket: Bucket::full(self.inner.inbound_rate.1),
             },
         );
     }
 
     /// Wire to `Ws::on_message`.
     pub fn on_message(&self, conn: &Conn, msg: Msg) {
+        match self.inner.admit_message(conn.id()) {
+            Admit::Pass => {}
+            Admit::Drop { notify } => {
+                if notify {
+                    conn.send_text(&protocol::serialize(
+                        CONTROL_TOPIC,
+                        EV_ERROR,
+                        None,
+                        None,
+                        &error_payload("rate_limited"),
+                    ));
+                }
+                return;
+            }
+        }
         let text = match msg {
             Msg::Text(t) => t,
             // The protocol is JSON text; binary frames are a client bug.
@@ -399,6 +523,12 @@ impl ChannelHub {
             self.inner.allowed_origins.clone(),
             self.inner.authorize.clone(),
         )
+    }
+
+    /// Whether the builder opted out of the same-origin default
+    /// ([`Channels::allow_any_origin`]), applied by `App::channels`.
+    pub fn allows_any_origin(&self) -> bool {
+        self.inner.allow_any_origin
     }
 }
 
@@ -444,6 +574,12 @@ impl HubInner {
         // (the client rejoined after losing state); tell the old one why.
         if self.membership(conn.id(), &env.topic).is_some() {
             self.teardown(conn, &env.topic, LeaveReason::Rejoin);
+        }
+        // Joins for one connection are dispatched serially on its shard
+        // thread, so this count cannot race the admit below.
+        if self.join_count(conn.id()) >= self.max_joins {
+            self.error_reply(conn, env, "too_many_joins");
+            return;
         }
 
         let join_ref = env.join_ref.clone().or_else(|| env.reference.clone());
@@ -664,6 +800,23 @@ impl HubInner {
     }
 
     // --- small lookups -------------------------------------------------------
+
+    fn join_count(&self, conn_id: u64) -> usize {
+        self.conns
+            .lock()
+            .unwrap()
+            .get(&conn_id)
+            .map_or(0, |e| e.joins.len())
+    }
+
+    /// Charge one inbound message to the connection's rate-limit bucket.
+    fn admit_message(&self, conn_id: u64) -> Admit {
+        let mut conns = self.conns.lock().unwrap();
+        match conns.get_mut(&conn_id) {
+            Some(entry) => entry.bucket.take(self.inbound_rate, Instant::now()),
+            None => Admit::Pass,
+        }
+    }
 
     fn channel_for(&self, topic: &str) -> Option<&Channel> {
         self.channels

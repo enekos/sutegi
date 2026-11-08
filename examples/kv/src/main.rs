@@ -7,9 +7,9 @@
 //! any handler. No `Arc<Mutex<…>>`, no per-route clones.
 //!
 //! ```text
-//! curl -X PUT  localhost:8080/kv/config/theme -d '"dark"'
+//! curl -X PUT  localhost:8080/kv/config/theme -H 'content-type: application/json' -d '"dark"'
 //! curl         localhost:8080/kv/config/theme          # -> "dark"
-//! curl -X PUT  localhost:8080/kv/flags/beta  -d 'true'
+//! curl -X PUT  localhost:8080/kv/flags/beta  -H 'content-type: application/json' -d 'true'
 //! curl         localhost:8080/kv/flags                 # -> {"beta": true}
 //! curl -X DELETE localhost:8080/kv/config/theme
 //! ```

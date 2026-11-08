@@ -65,7 +65,13 @@ impl Ws {
     /// Restrict the handshake to these exact `Origin` values — the built-in
     /// guard against Cross-Site WebSocket Hijacking. A browser always sends
     /// `Origin`; with an allowlist set, a missing or non-matching one is
-    /// refused with `403`. Omit only for non-browser / public endpoints.
+    /// refused with `403`.
+    ///
+    /// Without an allowlist the endpoint is **same-origin by default**: an
+    /// upgrade whose `Origin` host differs from the request's `Host` is
+    /// refused with `403`; a request with no `Origin` (a non-browser client)
+    /// is accepted. Set an allowlist when the page is served from another
+    /// host, or when a proxy rewrites `Host`.
     pub fn check_origin<I, S>(mut self, origins: I) -> Ws
     where
         I: IntoIterator<Item = S>,
@@ -74,6 +80,41 @@ impl Ws {
         self.handlers.allowed_origins = Some(origins.into_iter().map(Into::into).collect());
         self
     }
+
+    /// Accept an upgrade from **any** `Origin`, disabling the same-origin
+    /// default. Only for public endpoints that do not authenticate by cookie
+    /// — otherwise any site the user visits can open the socket as them.
+    /// A [`check_origin`](Ws::check_origin) allowlist, if also set, wins.
+    pub fn allow_any_origin(mut self) -> Ws {
+        self.handlers.allow_any_origin = true;
+        self
+    }
+}
+
+/// Whether an `Origin` header value names the same authority as the
+/// request's `Host` header (case-insensitive, default port ignored). Anything
+/// unparseable — `null`, a missing `Host` — is not same-origin.
+fn same_origin(origin: &str, host: Option<&str>) -> bool {
+    let Some(host) = host else {
+        return false;
+    };
+    let Some((scheme, authority)) = origin.trim().split_once("://") else {
+        return false;
+    };
+    let default_port = match scheme.to_ascii_lowercase().as_str() {
+        "https" | "wss" => Some(":443"),
+        "http" | "ws" => Some(":80"),
+        _ => None,
+    };
+    let normalize = |a: &str| {
+        let a = a.trim().trim_end_matches('/').to_ascii_lowercase();
+        match default_port.and_then(|p| a.strip_suffix(p)) {
+            Some(stripped) => stripped.to_string(),
+            None => a,
+        }
+    };
+    let authority = normalize(authority);
+    !authority.is_empty() && authority == normalize(host)
 }
 
 /// Validate an RFC 6455 client handshake and produce the `101` upgrade
@@ -105,7 +146,9 @@ pub(crate) fn upgrade_response(
         return Response::new(400).with_body(&b"missing Sec-WebSocket-Key"[..]);
     };
     // Cross-site protection, before the 101: an allowlisted Origin must be
-    // present and match, then the custom authorize gate (if any) must pass.
+    // present and match; with no allowlist a browser Origin must be
+    // same-origin unless the endpoint opted out. Then the custom authorize
+    // gate (if any) must pass.
     if let Some(allowed) = &handlers.allowed_origins {
         let ok = req
             .header("origin")
@@ -113,6 +156,12 @@ pub(crate) fn upgrade_response(
             .unwrap_or(false);
         if !ok {
             return Response::new(403).with_body(&b"origin not allowed"[..]);
+        }
+    } else if !handlers.allow_any_origin {
+        if let Some(origin) = req.header("origin") {
+            if !same_origin(origin, req.header("host")) {
+                return Response::new(403).with_body(&b"cross-origin upgrade not allowed"[..]);
+            }
         }
     }
     if let Some(authorize) = &handlers.authorize {
@@ -210,6 +259,86 @@ mod tests {
         // Missing origin with an allowlist set → 403.
         let none = upgrade_response(&with_extra(&[]), &rt, &handlers);
         assert_eq!(none.status, 403);
+    }
+
+    #[test]
+    fn cross_origin_refused_by_default_same_origin_accepted() {
+        let rt = runtime();
+        let handlers = Arc::new(Handlers::default());
+        let up = |extra: &[(&str, &str)]| upgrade_response(&with_extra(extra), &rt, &handlers);
+
+        // CSWSH: an attacker's page opening our socket → 403, no upgrade.
+        let evil = up(&[
+            ("host", "app.example.com"),
+            ("origin", "https://evil.example"),
+        ]);
+        assert_eq!(evil.status, 403);
+        assert!(!evil.is_upgrade());
+        // Opaque origin (sandboxed iframe, file://) is not same-origin.
+        assert_eq!(
+            up(&[("host", "app.example.com"), ("origin", "null")]).status,
+            403
+        );
+        // Same host, different port is a different origin.
+        assert_eq!(
+            up(&[
+                ("host", "app.example.com"),
+                ("origin", "https://app.example.com:8443")
+            ])
+            .status,
+            403
+        );
+        // Origin but no Host to compare against → refused.
+        assert_eq!(up(&[("origin", "https://app.example.com")]).status, 403);
+
+        // Same origin → 101 (case and default port don't matter).
+        assert_eq!(
+            up(&[
+                ("host", "App.Example.com"),
+                ("origin", "https://app.example.com")
+            ])
+            .status,
+            101
+        );
+        assert_eq!(
+            up(&[
+                ("host", "app.example.com:443"),
+                ("origin", "https://app.example.com")
+            ])
+            .status,
+            101
+        );
+        assert_eq!(
+            up(&[
+                ("host", "127.0.0.1:8080"),
+                ("origin", "http://127.0.0.1:8080")
+            ])
+            .status,
+            101
+        );
+        // No Origin at all (non-browser client) → accepted.
+        assert_eq!(up(&[("host", "app.example.com")]).status, 101);
+    }
+
+    #[test]
+    fn allow_any_origin_opts_out_of_the_same_origin_default() {
+        let rt = runtime();
+        let ws = Ws::new().allow_any_origin();
+        let handlers = Arc::new(ws.handlers);
+        let req = with_extra(&[
+            ("host", "app.example.com"),
+            ("origin", "https://evil.example"),
+        ]);
+        assert_eq!(upgrade_response(&req, &rt, &handlers).status, 101);
+
+        // An explicit allowlist still wins over allow_any_origin.
+        let strict = Arc::new(
+            Ws::new()
+                .allow_any_origin()
+                .check_origin(["https://app.example.com"])
+                .handlers,
+        );
+        assert_eq!(upgrade_response(&req, &rt, &strict).status, 403);
     }
 
     #[test]

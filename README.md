@@ -19,13 +19,14 @@ Three design goals, held simultaneously:
 ## Quickstart
 
 ```bash
-cargo run -p todo-example -- 127.0.0.1:8080
+OPS_TOKEN=dev-token cargo run -p todo-example -- 127.0.0.1:8080
 ```
 
 ```bash
-curl localhost:8080/__introspect              # full app surface as JSON
-curl localhost:8080/__tools                   # LLM tool-calling manifest
-curl -X POST localhost:8080/__tools/create_todo -d '{"title":"ship sutegi"}'
+AUTH="Authorization: Bearer dev-token"          # the /__ ops surface is closed without it
+curl -H "$AUTH" localhost:8080/__introspect     # full app surface as JSON
+curl -H "$AUTH" localhost:8080/__tools          # LLM tool-calling manifest
+curl -H "$AUTH" -X POST localhost:8080/__tools/create_todo -H 'content-type: application/json' -d '{"title":"ship sutegi"}'
 curl localhost:8080/api/todos
 ```
 
@@ -149,6 +150,12 @@ Built-in operational endpoints (always on, no feature needed):
 | `GET /__metrics` | Prometheus text (requests total, in-flight, by status class) |
 | `GET /__introspect` | full app surface (routes/models/tools/endpoints) |
 
+`/__health` and `/__ready` are always public. Everything else under `/__`
+(`/__metrics`, `/__introspect`, `/__tools*`, `/__channels`, app-mounted `/__`
+routes) is **closed by default** — `403` until you set `App::ops_guard`
+(e.g. `.ops_guard(bearer(&token))`), or opt out explicitly with
+`App::ops_public()` for local development (`serve()` prints a warning).
+
 ### Configuration
 
 A std-only config layer (`sutegi::config::Config`): `.env` loading, typed
@@ -240,6 +247,8 @@ Full guide: **[docs/HEXAGONAL.md](./docs/HEXAGONAL.md)**.
 
 A sutegi app is drivable by an LLM with no source access and no integration code:
 
+0. Authenticate: the `/__` surface needs the app's `ops_guard` credential
+   (closed with `403` when no guard is set).
 1. `GET /__introspect` → discover routes, data models, and tools.
 2. `GET /__tools` → an Anthropic-style `{name, description, input_schema}` manifest.
 3. `POST /__tools/:name` with a JSON body → invoke a tool; required-field

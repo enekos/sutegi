@@ -175,7 +175,10 @@ fn boot(addr: &'static str, build: impl FnOnce() -> App + Send + 'static) {
 
 fn chat_app() -> App {
     let hub = Channels::new().channel(room_channel()).build();
-    App::new("channels-e2e").channels("/channels", "The chat socket.", hub)
+    App::new("channels-e2e")
+        // The `/__channels` manifest is ops surface: closed without this.
+        .ops_public()
+        .channels("/channels", "The chat socket.", hub)
 }
 
 // --- tests -------------------------------------------------------------------
@@ -418,4 +421,83 @@ fn server_side_hub_broadcast_reaches_members() {
     );
     let msg = c.recv_event("announcement");
     assert_eq!(str_at(&msg, "/payload/body"), Some("maintenance at noon"));
+}
+
+#[test]
+fn joins_per_connection_are_capped() {
+    boot("127.0.0.1:18494", || {
+        let hub = Channels::new()
+            .channel(room_channel())
+            .max_joins_per_conn(2)
+            .build();
+        App::new("channels-join-cap").channels("/channels", "The chat socket.", hub)
+    });
+    let mut c = WsClient::connect("127.0.0.1:18494", "/channels");
+    let nick = || Json::obj(vec![("nick", Json::str("ada"))]);
+    assert_eq!(
+        str_at(&c.join("room:1", nick(), "1"), "/payload/status"),
+        Some("ok")
+    );
+    assert_eq!(
+        str_at(&c.join("room:2", nick(), "2"), "/payload/status"),
+        Some("ok")
+    );
+
+    // Over the cap: refused with the standard error reply.
+    let refused = c.join("room:3", nick(), "3");
+    assert_eq!(str_at(&refused, "/payload/status"), Some("error"));
+    assert_eq!(
+        str_at(&refused, "/payload/response/reason"),
+        Some("too_many_joins")
+    );
+    assert_eq!(str_at(&refused, "/ref"), Some("3"));
+
+    // A rejoin of a held topic is not a new membership.
+    assert_eq!(
+        str_at(&c.join("room:2", nick(), "4"), "/payload/status"),
+        Some("ok")
+    );
+
+    // Leaving frees a slot.
+    c.send(r#"{"topic":"room:1","event":"stg:leave","ref":"l1"}"#);
+    c.recv_event("stg:reply");
+    assert_eq!(
+        str_at(&c.join("room:3", nick(), "5"), "/payload/status"),
+        Some("ok")
+    );
+}
+
+#[test]
+fn inbound_messages_are_rate_limited_per_connection() {
+    boot("127.0.0.1:18495", || {
+        let hub = Channels::new()
+            .channel(room_channel())
+            .inbound_rate(1, 3)
+            .build();
+        App::new("channels-rate").channels("/channels", "The chat socket.", hub)
+    });
+    let mut c = WsClient::connect("127.0.0.1:18495", "/channels");
+    for i in 0..3 {
+        c.send(&format!(
+            r#"{{"topic":"stg","event":"heartbeat","ref":"hb{i}"}}"#
+        ));
+    }
+    // Burst exhausted: the next two are dropped, only the first is reported.
+    c.send(r#"{"topic":"stg","event":"heartbeat","ref":"over1"}"#);
+    c.send(r#"{"topic":"stg","event":"heartbeat","ref":"over2"}"#);
+    for i in 0..3 {
+        let reply = c.recv();
+        assert_eq!(str_at(&reply, "/event"), Some("stg:reply"));
+        assert_eq!(str_at(&reply, "/ref"), Some(format!("hb{i}").as_str()));
+    }
+    let limited = c.recv();
+    assert_eq!(str_at(&limited, "/event"), Some("stg:error"));
+    assert_eq!(str_at(&limited, "/payload/reason"), Some("rate_limited"));
+
+    // The bucket refills: after a second one more message gets through, and
+    // nothing was queued for the dropped ones.
+    thread::sleep(Duration::from_millis(1100));
+    c.send(r#"{"topic":"stg","event":"heartbeat","ref":"after"}"#);
+    let reply = c.recv();
+    assert_eq!(str_at(&reply, "/ref"), Some("after"));
 }

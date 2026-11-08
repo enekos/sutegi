@@ -35,11 +35,13 @@ fn main() -> std::io::Result<()> {
         .ws(
             "/ws",
             "Chat socket. Pass ?name=<nick>; every text message is broadcast to the room.",
-            // Public, cookieless demo, so no origin gate. An app that
-            // authenticates the socket by cookie MUST add one or it's open to
-            // cross-site hijacking: `.check_origin(["https://app.example.com"])`
-            // (or `.authorize(|req| ...)` for a token check) — both refuse
-            // before the 101.
+            // The page is served from this same app, so the same-origin
+            // default (Origin host must equal Host) is all the CSWSH guard it
+            // needs. A page on another host needs
+            // `.check_origin(["https://app.example.com"])`; a public,
+            // cookieless socket may opt out with `.allow_any_origin()`;
+            // `.authorize(|req| ...)` adds a token check. All refuse before
+            // the 101.
             Ws::new()
                 .on_open(|conn: &Conn, req: &Request| {
                     let name = req

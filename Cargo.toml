@@ -64,6 +64,9 @@ codegen-units = 1   # better cross-module size optimization
 strip = true        # strip symbols
 # panic stays "unwind": request, job, socket-callback and actor isolation all
 # rest on catch_unwind, which "abort" turns into a process exit.
+# Checked arithmetic turns a size/offset overflow on untrusted input into a
+# (caught) panic rather than a silent wrap.
+overflow-checks = true
 
 [workspace.lints.rust]
 unsafe_code = "deny"

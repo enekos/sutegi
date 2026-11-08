@@ -80,6 +80,8 @@ const AI: &str = "127.0.0.1:18152";
 fn routing_ops_and_middleware_end_to_end() {
     boot(MAIN, || {
         App::new("itest")
+            // Exercises /__metrics + /__introspect: opt in to an open ops surface.
+            .ops_public()
             .state(String::from("app-state"))
             .get("/", "root", |_c| "hello")
             .get("/users/:id", "fetch a user", |c| {
@@ -178,7 +180,7 @@ fn routing_ops_and_middleware_end_to_end() {
 #[test]
 fn ai_tool_surface_over_http() {
     boot(AI, || {
-        App::new("ai-itest").tool(
+        App::new("ai-itest").ops_public().tool(
             "echo",
             "Echo a message back.",
             schema::object(vec![("msg", schema::string("text to echo"))], &["msg"]),

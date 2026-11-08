@@ -39,7 +39,7 @@ let hub = Channels::new()
             }),
     )
     // .broker(PgPubSub::connect(&pg_cfg)?)   // ← cross-pod; omit = single pod
-    // .check_origin(["https://app.example.com"])  // MUST set if cookies auth the socket
+    // .check_origin(["https://app.example.com"])  // page on another host; default is same-origin
     .build();
 
 App::new("chat")
@@ -146,9 +146,17 @@ keep anything stronger in a table.
 - Per-connection ordering is guaranteed (callbacks inline on the shard).
   Cross-connection ordering within a topic follows broker order: in-process
   is synchronous; PG delivers `NOTIFY` in commit order.
+- Per-connection bounds: `max_joins_per_conn` (default 100; over it the
+  join gets an error reply with reason `too_many_joins`) and `inbound_rate`
+  (token bucket, default 100 msg/s, burst 200; excess is dropped with one
+  `stg:error` `rate_limited`).
 - The `/__channels` endpoint, like the whole `/__` surface, is gated by
-  `App::ops_guard`. A cookie-authenticated socket endpoint MUST set
-  `check_origin` (CSWSH) — same rule as `App::ws`.
+  `App::ops_guard` (`403` when unset, unless `App::ops_public()`). The socket
+  handshake is **same-origin by default** (CSWSH): a browser `Origin` whose
+  host differs from `Host` gets `403`; clients without `Origin` are accepted.
+  Use `check_origin([...])` when the page is served from another host (or a
+  proxy rewrites `Host`), and `allow_any_origin()` only for public, cookieless
+  hubs — same rule as `App::ws`.
 
 ## Try it
 
