@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-08
+
+The security release. A whole-repo audit at v0.12.0 found one cross-user data leak and four unauthenticated ways to take a server down; this release fixes every critical/high/medium-with-reach finding. **Several defaults now fail closed — read *Breaking* before upgrading.**
+
+### Security
+
+- ws: **a retained `Conn`/`Socket` could deliver to a different user.** Reclaiming slab slots reset their generation to 0, so a handle kept from a closed connection matched the next occupant of its slot — the documented "reply from your own thread" pattern sent one user's frames to another. Liveness now keys on the never-reused u64 connection id.
+- Crypto: **PBKDF2 cost no longer scales with password length.** The HMAC was re-keyed every iteration, so a 2 MB password on an unauthenticated login cost ~40 CPU-minutes. Keys are now derived once per call, and `sutegi-auth` caps passwords at `MAX_PASSWORD_LEN` (1024 bytes) before hashing.
+- HTTP: **the read deadline holds again** (slowloris). A client dripping one whole header line just under the per-recv timeout bypassed the wall-clock deadline; it is now checked per request and header line, answering 408. Accept errors back off for 20 ms instead of spinning a core when out of file descriptors.
+- Session: **`Sessions::token` output is no longer a valid session cookie.** Both were `hex(value).hmac` under one key, so any attacker-influenced value an app signed could be replayed as a session (`{"uid":1,…}` → admin). The MACs are domain-separated, and a session without the password binding is anonymous.
+- Web: **the ops surface is closed by default.** With no `ops_guard`, every `/__` path except `/__health` and `/__ready` answers 403 — `/__tools*` used to let anyone invoke tools against app state. `/__` routes match ahead of app routes, so `static_dir("/")` can no longer shadow them. Bearer/basic credentials compare in constant time.
+- Web: **`Ctx::json` / `json_body` answer 415 to non-JSON content types**, closing cross-site `text/plain` form posts to JSON endpoints and tools.
+- ws/channels: **WebSocket upgrades are same-origin by default** (CSWSH). A browser `Origin` whose host differs from `Host` gets 403.
+- Auth: `require_csrf` exempts only a `stg_` bearer request with no session cookie (any `Authorization` header used to skip it); the login throttle counts atomically (`Throttle::attempt`) and normalizes emails (`login_key`); login and remember-me revival start a fresh session.
+- HTTP: header field lines are parsed strictly (obs-fold, non-token names, whitespace before the colon, missing colon, bare CR/LF/NUL → 400) to close desync behind lenient proxies; app-set framing headers are dropped instead of duplicated; stream producers and upgrade takeovers run under `catch_unwind`.
+- Mail: addresses are limited to an injection-proof mailbox subset (no `,` `<` `>` whitespace or leading `-`), re-checked at send; sendmail gets `--` before recipients; SMTP never sends credentials in cleartext to a non-loopback peer, nor `AUTH` a server did not advertise.
+- Storage: the chunked-response parser uses checked arithmetic (a `ffffffffffffffff` chunk size panicked the process); `SystemCurl` reads the real status behind a proxy (`suppress-connect-headers`), ignores `~/.curlrc` and stops double-de-chunking.
+- Postgres client: backend message lengths are range-checked before allocating; a short MD5 auth message no longer panics; a failed connect never leaks a pool slot; cleartext-password auth and an unverified SCRAM `AuthenticationOk` are refused (MITM downgrade).
+- Queue: a job whose worker died on its last attempt is dead-lettered instead of crash-looping every worker; heartbeat and settle are fenced on the claimed lease, so a timed-out worker can no longer delete, unlock or extend a job another worker is running.
+- Channels: joins per connection (`max_joins_per_conn`, default 100) and inbound messages (`inbound_rate`, 100/s, burst 200) are capped. `PgPubSub` publishes through a bounded queue on its own thread instead of blocking the reactor on a NOTIFY round-trip.
+- Actors: a panic message is truncated on a char boundary (a multi-byte char at byte 240 killed the actor before the supervisor saw it); `OneForOne` restarts only the crashed child.
+- Build: release profile enables `overflow-checks`.
+
+### Breaking
+
+- **All existing session cookies and `Sessions::token` values stop verifying** — every user is logged out once; remember-me cookies revive sessions.
+- `Sessions::new` / `Links::new` / `AuthMail::new` panic on secrets shorter than 32 bytes (`MIN_SECRET_LEN`). `require_auth` checks the password binding (one store lookup per request).
+- An app without `ops_guard` gets 403 on `/__introspect`, `/__metrics`, `/__tools*`; opt in with `App::ops_public()`. Non-JSON bodies to `Ctx::json` get 415.
+- Cross-origin WebSocket upgrades get 403; use `check_origin([...])` or `allow_any_origin()`.
+- SMTP with credentials to a non-loopback relay fails unless `Smtp::allow_plaintext_auth(true)` / `MAIL_SMTP_ALLOW_PLAINTEXT_AUTH=1`. Quoted local parts and address literals are rejected.
+- Postgres: `sslmode=require|verify-ca|verify-full` is a config error until TLS exists (it used to connect in plaintext silently); cleartext password auth needs `require_auth=password`.
+- Queue: a worker death spends an attempt — with the default `max_attempts = 1` a crashed job is dead-lettered, not re-run. `JobCtx::heartbeat` returns `Err("lease lost: …")` once another worker reclaimed the job.
+- New public fields on `sutegi_ws::Handlers` and `sutegi_pg::Config`; struct literals need `..Default::default()`. `PgPubSub::try_publish` returning `Ok` means queued, not sent.
+- Deploy: the todo/storage examples need `OPS_TOKEN`; nginx proxies only `/__health` and `/__ready`; the container runs as uid 65532 with a read-only root filesystem; the auth example refuses to start without `SESSION_SECRET` (or `SUTEGI_ENV=dev`).
+
 ### Fixed
 
 - **Release builds unwind again.** The workspace profile set `panic = "abort"`, which turned every `catch_unwind` the framework relies on — handler 500s, queue job failures, ws callbacks, actor supervision — into a process exit in the shipped example binaries. The profile now keeps the default, and the docs that recommended `abort` say to keep `unwind`. Cost, measured: `hello` 437 → 487 KB, `todo` 1.53 → 1.63 MB.
@@ -18,6 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - The workspace denies `unsafe_code`, `unsafe_op_in_unsafe_fn`, undocumented unsafe blocks and multi-op unsafe blocks. Only `sutegi-ws`'s poller, `sutegi-web`'s `graceful` signal handler and the `ws-load` example opt back in, each at module or function scope.
+
+## [0.10.0 – 0.12.0] - 2026-08 … 2026-10-17
+
+Shipped without per-version sections; everything below landed across 0.10.0, 0.11.0 and 0.12.0.
 
 ### Added
 
