@@ -18,6 +18,10 @@ Three design goals, held simultaneously:
 
 ## Quickstart
 
+**[Browse the documentation](docs/README.md)** — the complete website content as
+Markdown, including the [overview](docs/OVERVIEW.md), [Todo tutorial](docs/TUTORIAL.md),
+and 53 reference topics with previous/next navigation.
+
 ```bash
 OPS_TOKEN=dev-token cargo run -p todo-example -- 127.0.0.1:8080
 ```

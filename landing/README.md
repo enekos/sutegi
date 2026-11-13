@@ -25,15 +25,32 @@ npm run preview
 `vite.config.ts` sets `base: '/sutegi/'` for GitHub Pages at
 `enekos.github.io/sutegi/`. Publish `dist/`.
 
-## Structure (cloned from Marrow)
+## Markdown documentation
+
+All authored landing and reference content is also available in the
+[GitHub documentation index](../docs/README.md). Regenerate it after editing the
+Svelte content:
+
+```bash
+pnpm docs:export
+pnpm docs:check
+```
+
+The exporter uses the existing Svelte parser to retain prose, examples, tables,
+and callouts. It rewrites website routes to relative Markdown links and adds
+previous/next navigation. CI checks that the committed export stays current.
+The existing in-depth guides in `docs/` remain hand-maintained.
+
+## Structure
 
 ```
 index.html          Vite entry (meta, fonts, #app)
 src/main.ts         mounts the app
-src/App.svelte      renders <Landing/>
+src/App.svelte      routes between <Landing/> and <Docs/>
 src/app.css         Tailwind import + theme tokens + animations
-src/Landing.svelte  the whole page (hero, what, how, features, use-cases,
-                    quickstart, extensive docs accordions, live introspect, CTA)
+src/Landing.svelte  hero, features, use-cases, quickstart, tutorial, live introspect
+src/Docs.svelte     grouped documentation reference
+scripts/export-docs.mjs  exports both pages to ../docs/ as Markdown
 ```
 
 The **Introspect a live app** panel fetches `/__introspect` from a running
