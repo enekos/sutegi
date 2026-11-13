@@ -87,11 +87,11 @@
   // --- terminal animation ---
   let visibleLines = $state(0);
   const terminalLines = [
-    { text: '> cargo run -p todo-example', delay: 0 },
+    { text: '> OPS_TOKEN=dev-token cargo run -p todo-example', delay: 0 },
     { text: '[sutegi] todo-demo on http://0.0.0.0:8080', delay: 900, success: true },
-    { text: '> curl localhost:8080/__introspect', delay: 1800 },
+    { text: '> curl -H "Authorization: Bearer dev-token" localhost:8080/__introspect', delay: 1800 },
     { text: '{ "framework": "sutegi", "routes": [...], "tools": [...] }', delay: 2700, success: true },
-    { text: '> curl -X POST localhost:8080/__tools/create_todo', delay: 3500 },
+    { text: `> curl -H "Authorization: Bearer dev-token" -H 'Content-Type: application/json' -X POST localhost:8080/__tools/create_todo -d '{"title":"ship sutegi"}'`, delay: 3500 },
     { text: '{ "id": 1, "title": "ship sutegi", "done": false }', delay: 4300, success: true },
   ];
   onMount(() => {
@@ -131,7 +131,9 @@ sutegi = { version = "*", features = ["sqlite", "graceful"] }  # single-node
   const codeMain = `use sutegi::prelude::*;
 
 fn main() -> std::io::Result<()> {
+    let ops_token = std::env::var("OPS_TOKEN").expect("set OPS_TOKEN");
     App::new("hello")
+        .ops_guard(bearer(&ops_token))
         // handler: one &Ctx in, anything IntoResponse out
         .get("/", "Health check", |_| "sutegi up")
         .get("/hello/:name", "Greet", |c| {
@@ -140,9 +142,15 @@ fn main() -> std::io::Result<()> {
         .serve()   // reads HOST/PORT/WORKERS; graceful drain on SIGTERM
 }`;
 
-  const codeTalk = `curl localhost:8080/__introspect   # full app surface as JSON
-curl localhost:8080/__tools        # LLM tool-calling manifest
-curl -X POST localhost:8080/__tools/create_todo -d '{"title":"ship sutegi"}'`;
+  const codeTalk = `OPS_TOKEN=dev-token cargo run
+
+# From another terminal:
+AUTH="Authorization: Bearer dev-token"
+curl -H "$AUTH" localhost:8080/__introspect   # full app surface as JSON
+curl -H "$AUTH" localhost:8080/__tools        # LLM tool-calling manifest
+
+# After adding create_todo (tutorial Step 6):
+curl -H "$AUTH" -H 'Content-Type: application/json' -X POST localhost:8080/__tools/create_todo -d '{"title":"ship sutegi"}'`;
 
   // --- tutorial (guided walkthrough: build a Todo API) ---
   // Each chapter builds on the last. `lead`, `tip` and `note` are rendered as
@@ -262,7 +270,9 @@ let body = c.validate(&rules)?;   // Err -> { "email": ["… valid email …"] }
         {
           id: 'agent', icon: Zap, kicker: 'Step 6', title: 'Make it agent-native',
           lead: 'Here’s where sutegi differs from every other framework. Tools are first-class on the <code>App</code>: register a closure with <code>.tool(...)</code> and it’s instantly exposed to an LLM — a manifest at <code>/__tools</code>, a validated invocation endpoint, and an SSE variant via <code>.stream_tool(...)</code>. The closure shares app state through an owned <code>ToolCtx</code> (<code>c.db::&lt;Db&gt;()</code>, <code>c.state::&lt;T&gt;()</code>) and gets the already schema-validated <code>Json</code> args. An agent discovers your whole app via <code>/__introspect</code> and acts on it over plain JSON — no SDK, no glue layer.',
-          code: `.tool("create_todo", "Create a todo",
+          code: `// Add to the App builder; set OPS_TOKEN before running the app.
+.ops_guard(bearer(&std::env::var("OPS_TOKEN").expect("set OPS_TOKEN")))
+.tool("create_todo", "Create a todo",
     schema::object(vec![("title", schema::string("the title"))], &["title"]),
     |c, args| {
         let todo = Todo::from_input(&args)?;   // args already schema-validated
@@ -279,6 +289,7 @@ let body = c.validate(&rules)?;   // Err -> { "email": ["… valid email …"] }
 // GET  /__tools               -> manifest { name, description, input_schema }
 // POST /__tools/create_todo   -> invoke (args validated -> 422 on failure)
 // POST /__tools/:name/stream  -> SSE for streaming tools`,
+          note: 'The agent surface is closed by default (<code>403</code> without an <code>ops_guard</code>). Send <code>Authorization: Bearer &lt;OPS_TOKEN&gt;</code> when calling these endpoints, and <code>Content-Type: application/json</code> when posting tool arguments.',
           tip: 'That’s the entire integration — the old <code>Tool</code>/<code>StreamTool</code> traits and <code>ToolRegistry</code> are gone. Point any agent at <code>/__introspect</code> for the surface and <code>/__tools</code> for the call manifest — the same app you built for humans is now drivable by a model.',
         },
         {

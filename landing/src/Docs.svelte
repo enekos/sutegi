@@ -139,19 +139,21 @@ cargo add sutegi
 # tool surface are always present; there is no "ai" feature to enable.
 [dependencies]
 # Single-node app: bundled SQLite + graceful shutdown.
-sutegi = { version = "0.10", features = ["sqlite", "graceful"] }
+sutegi = { version = "0.13", features = ["sqlite", "graceful"] }
 
 # Multi-pod app: Postgres, the durable queue, cross-pod realtime.
-# sutegi = { version = "0.10", features = [
+# sutegi = { version = "0.13", features = [
 #     "postgres", "queue", "channels", "pubsub-postgres", "graceful" ] }
 
 # Nothing but the HTTP core — ~480 KB, no ORM, no derives:
-# sutegi = { version = "0.10", default-features = false }`;
+# sutegi = { version = "0.13", default-features = false }`;
 
   const cFirstApp = `use sutegi::prelude::*;
 
 fn main() -> std::io::Result<()> {
+    let ops_token = std::env::var("OPS_TOKEN").expect("set OPS_TOKEN");
     App::new("hello")
+        .ops_guard(bearer(&ops_token))
         .get("/", "Health check", |_| "sutegi up")
         .get("/hello/:name", "Greet someone", |c| {
             format!("hi, {}", c.param("name").unwrap_or("world"))
@@ -159,12 +161,13 @@ fn main() -> std::io::Result<()> {
         .serve()   // reads HOST/PORT/WORKERS (or argv[1]); drains on SIGTERM
 }`;
 
-  const cFirstRun = `cargo run
+  const cFirstRun = `OPS_TOKEN=dev-token cargo run
 # sutegi · hello on http://0.0.0.0:8080
 #   ops: /__health /__ready /__metrics /__introspect
 
+# From another terminal:
 curl localhost:8080/hello/ada        # -> hi, ada
-curl localhost:8080/__introspect     # the whole app surface, as JSON`;
+curl -H 'Authorization: Bearer dev-token' localhost:8080/__introspect`;
 
   const cConfig = `use sutegi::config::Config;
 
@@ -645,9 +648,12 @@ App::new("settings")
     })
     .serve()`;
 
-  const cAgents = `curl localhost:8080/__introspect
+  const cAgents = `# For the included demo: OPS_TOKEN=dev-token cargo run -p todo-example
+# For your own app, configure .ops_guard(bearer(&ops_token)) first.
+AUTH="Authorization: Bearer dev-token"
+curl -H "$AUTH" localhost:8080/__introspect
 # {
-#   "framework": "sutegi", "version": "0.10.0", "name": "todo",
+#   "framework": "sutegi", "version": "0.13.0", "name": "todo",
 #   "routes": [ { "method": "GET", "pattern": "/todos/:id", "doc": "…" } ],
 #   "models": [ … ], "tools": [ … ],
 #   "capabilities": { "backend": "postgres", "skip_locked": true, … },
@@ -657,10 +663,10 @@ App::new("settings")
 #                  "ready": "/__ready", "metrics": "/__metrics" }
 # }
 
-curl localhost:8080/__tools
+curl -H "$AUTH" localhost:8080/__tools
 # [ { "name": "create_todo", "description": "…", "input_schema": {…}, "streaming": false } ]
 
-curl -X POST localhost:8080/__tools/create_todo -d '{"title":"ship sutegi"}'
+curl -H "$AUTH" -H 'Content-Type: application/json' -X POST localhost:8080/__tools/create_todo -d '{"title":"ship sutegi"}'
 # args are validated against the tool's schema -> 422 on a bad shape`;
 
   const cTools = `App::new("todo")
@@ -1709,9 +1715,9 @@ App::new("api")
           <div class="callout note">
             <div class="callout-title"><code>ops_guard</code> is the one that protects <code>/__</code></div>
             <p>
-              Introspection and tool invocation are <strong class="text-white">open by default</strong> — that is the
-              agent-native contract. In any deployment where the agent surface must not be public, set an
-              <code>ops_guard</code>: it runs ahead of the global middleware chain for every <code>/__</code>-mounted
+              Introspection and tool invocation are <strong class="text-white">closed by default</strong>: without
+              an <code>ops_guard</code>, they return <code>403</code>. Configure the guard and send the credential it
+              expects. It runs ahead of the global middleware chain for every <code>/__</code>-mounted
               route (<code>/__introspect</code>, <code>/__metrics</code>, <code>/__tools*</code>,
               <code>/__channels</code>, <code>/__actors</code>, your own), while <code>/__health</code> and
               <code>/__ready</code> stay open so orchestrator probes need no credential. It is gated on the segments
@@ -2715,9 +2721,8 @@ App::new("api")
           <p>
             Because <code>Db</code> is <code>Clone</code>, clone a handle for the readiness probe before you hand
             ownership to <code>.state()</code>. The probes are intentionally credential-free and disclose nothing;
-            everything else under <code>/__</code> should sit behind an
-            <a href="#/docs/middleware" class="lnk"><code>ops_guard</code></a> in any deployment where the agent
-            surface is not meant to be public.
+            everything else under <code>/__</code> is closed by default (<code>403</code>). Configure an
+            <a href="#/docs/middleware" class="lnk"><code>ops_guard</code></a> to grant authenticated access.
           </p>
         </article>
 
