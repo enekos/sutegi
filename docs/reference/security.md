@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Deploying](deploying.md) · [Documentation index](../README.md)
+[← Crypto primitives](crypto.md) · [Documentation index](../README.md) · [Backends & capabilities →](backend.md)
 
 # Security posture
 
@@ -9,7 +9,7 @@ sutegi ships panic isolation, bounded bodies and headers, two slowloris deadline
 ## Two traps worth reading even if you never touch the code
 
 - **Gate on router segments, not on the path string.** The ops guard used to test `req.path.starts_with("/__")` — but the router trims and splits, so `//__tools/x` reached the same route while failing that test, leaving tool invocation and introspection reachable without the configured credential (CWE-288). The check and the dispatch now agree by construction. **Audit your reverse proxy too**: Apache’s idiomatic `<LocationMatch "^/__">` has the identical blind spot, so a deployment can look doubly protected and be neither. (`MergeSlashes`, on by default since 2.4.39, collapses it — which makes the anchored form correct by accident and one directive away from not being. `^/+__` is free.)
-- **A credentialed WebSocket needs `check_origin`.** The same-origin policy does not stop a cross-origin handshake from carrying cookies. See [WebSockets](websockets.md).
+- **A credentialed WebSocket must not `allow_any_origin`.** The same-origin policy does not stop a cross-origin handshake from carrying cookies; sutegi’s same-origin default does, and `check_origin` widens it to an allowlist. See [WebSockets](websockets.md).
 
 The S3 path is hardened in the places subprocess-based HTTP usually is not: credentials go to `curl` on stdin so `Authorization` is invisible to `ps`, the protocol is pinned with `--proto =https`, redirect following is off so a 3xx cannot replay a signature at an attacker-chosen host, TLS floors at 1.2, bodies are capped, certificate verification cannot be disabled, `PUT` bodies stage through a `0600` `O_EXCL` temp file, and `S3Store`’s `Debug` redacts the secret key.
 
@@ -20,4 +20,4 @@ The S3 path is hardened in the places subprocess-based HTTP usually is not: cred
 
 ---
 
-[← Deploying](deploying.md) · [Documentation index](../README.md)
+[← Crypto primitives](crypto.md) · [Documentation index](../README.md) · [Backends & capabilities →](backend.md)

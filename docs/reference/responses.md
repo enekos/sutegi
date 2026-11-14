@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Requests & the Ctx](requests.md) · [Documentation index](../README.md) · [Middleware, CORS & guards →](middleware.md)
+[← Requests & the Ctx](requests.md) · [Documentation index](../README.md) · [Templates →](templates.md)
 
 # Responses & errors
 
@@ -37,4 +37,4 @@ Err(Error::unprocessable("bad shape")           // 422 with structured fields
 
 ---
 
-[← Requests & the Ctx](requests.md) · [Documentation index](../README.md) · [Middleware, CORS & guards →](middleware.md)
+[← Requests & the Ctx](requests.md) · [Documentation index](../README.md) · [Templates →](templates.md)

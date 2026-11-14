@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← PubSub](pubsub.md) · [Documentation index](../README.md) · [Queues →](queues.md)
+[← PubSub](pubsub.md) · [Documentation index](../README.md) · [Testing →](testing.md)
 
 # Channels & presence
 
@@ -31,7 +31,7 @@ let hub = Channels::new()
             }),
     )
     // .broker(PgPubSub::connect(&pg_cfg)?)          // <- the only cross-pod change
-    .check_origin(["https://app.example.com"])       // MUST set if cookies auth the socket
+    .check_origin(["https://app.example.com"])       // page on another host; same-origin is the default
     .build();
 
 App::new("chat")
@@ -69,6 +69,32 @@ room.join().receive("ok", () => {});
 room.push("new_msg", {body: "hello"});
 ```
 
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant H as ChannelHub on the shard
+    participant CB as Channel callbacks
+    participant B as Broker
+    participant O as Other members
+    C->>H: stg:join room:1 with payload
+    H->>CB: on_join(socket, payload)
+    CB-->>H: Ok(response)
+    H->>B: subscribe stg:chan:room:1 (first member on this pod)
+    H-->>C: stg:reply ok
+    H->>CB: after_join callbacks, e.g. Presence::track
+    CB->>B: presence join diff, for other pods
+    CB-->>O: presence_diff to local members
+    CB-->>C: presence_diff, then presence_state
+    C->>H: new_msg with payload
+    H->>CB: on("new_msg")
+    CB->>B: socket.broadcast publishes to stg:chan:room:1
+    B->>H: deliver on this pod and on every subscribed pod
+    H-->>C: new_msg frame
+    H-->>O: same shared frame, one inject per shard
+```
+
+*A join, a tracked presence and a broadcast. Every broadcast goes through the broker, so one path serves one pod or many.*
+
 ## Join lifecycle notes
 
 - Inside `on_join` the member is **not admitted yet**: a broadcast there reaches the room but not the joiner, and a push lands before the join reply. Use `socket.after_join(…)` for welcome pushes — it runs after the ok reply is on the wire, and never runs if the join is refused.
@@ -84,6 +110,9 @@ The `presence` feature adds who’s-online tracking: `Presence::track` / `untrac
 >
 > Each pod re-publishes its local state every `presence_heartbeat` (default 30 s) and expires pods silent for ~2.5×, reporting their members as leaves. So a crashed pod’s users can linger up to ~75 s, and partition conflicts resolve by expiry. That is the right trade for a “who’s online” sidebar; keep anything stronger in a table.
 
+> [!TIP]
+> **Deep dive:** [the long-form guide](../REALTIME.md), with every option and edge case.
+
 ---
 
-[← PubSub](pubsub.md) · [Documentation index](../README.md) · [Queues →](queues.md)
+[← PubSub](pubsub.md) · [Documentation index](../README.md) · [Testing →](testing.md)

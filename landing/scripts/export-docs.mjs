@@ -44,7 +44,7 @@ function constants(ast) {
   for (const statement of ast.instance.content.body) {
     if (statement.type !== 'VariableDeclaration' || statement.kind !== 'const') continue;
     for (const { id, init } of statement.declarations) {
-      if (/^(nav|tutorial|terminalLines|finalTitle|installCmd|c[A-Z]\w*|code\w+)$/.test(id.name))
+      if (/^(nav|tutorial|terminalLines|finalTitle|installCmd|[cd][A-Z]\w*|code\w+)$/.test(id.name))
         scope[id.name] = value(init, scope);
       if (init?.type === 'CallExpression' && init.callee.name === 'useScramble')
         scope[id.name] = value(init.arguments[0], scope);
@@ -137,8 +137,11 @@ function render(node, scope, file, plain = false) {
       return value(node.expression, scope).map((item, i) => render(node.body,
         { ...scope, [node.context.name]: item, [node.index ?? '__index']: i }, file, plain)).join('');
     case 'RenderTag': {
+      const [arg, caption] = node.expression.arguments;
+      // Diagrams are Mermaid source; GitHub renders the fence natively.
+      if (node.expression.callee.name === 'diagram')
+        return fence(value(arg, scope), 'mermaid') + `*${escape(value(caption, scope))}*\n\n`;
       if (node.expression.callee.name !== 'code') throw new Error('Unknown snippet');
-      const arg = node.expression.arguments[0];
       return fence(value(arg, scope), languages[arg.name] ?? 'rust');
     }
     case 'RegularElement': break;
@@ -207,7 +210,8 @@ for (const [i, topic] of topics.entries()) {
   const article = articles.find((a) => attr(a, 'id') === topic.id);
   // The colored group kicker is already represented by the index groups.
   const nodes = article.fragment.nodes.filter((n) => !(n.name === 'div' && attr(n, 'class').includes('uppercase')));
-  const body = nodes.map((n) => render(n, docData, file)).join('');
+  let body = nodes.map((n) => render(n, docData, file)).join('');
+  if (topic.deep) body += `\n\n> [!TIP]\n> **Deep dive:** [the long-form guide](../${topic.deep}), with every option and edge case.\n`;
   const nav = [i > 0 ? `[← ${topics[i - 1].title}](${topics[i - 1].id}.md)` : '',
     '[Documentation index](../README.md)',
     i + 1 < topics.length ? `[${topics[i + 1].title} →](${topics[i + 1].id}.md)` : ''].filter(Boolean).join(' · ');
@@ -277,13 +281,14 @@ output(overviewFile, 'landing/src/Landing.svelte', tidy(overview));
 
 let index = '# Sutegi documentation\n\nRead the full website content here on GitHub. Start with the [overview](OVERVIEW.md), follow the [Todo tutorial](TUTORIAL.md), or browse a reference topic below.\n\n[Project README](../README.md) · [Website](https://enekos.github.io/sutegi/) · [Examples](../examples) · [Agent contract](../AGENTS.md)\n';
 for (const group of docData.nav)
-  index += `\n\n## ${group.group}\n\n${group.items.map((t) => `- [${t.title}](reference/${t.id}.md)`).join('\n')}`;
-index += '\n\n## In-depth guides\n\n';
+  index += `\n\n## ${group.group}\n\n${group.items.map((t) => `- [${t.title}](reference/${t.id}.md)` +
+    (t.deep ? ` · [deep dive](${t.deep})` : '')).join('\n')}`;
+index += '\n\n## Deep dives\n\nLong-form guides, maintained by hand and linked from the reference page they extend.\n\n';
 for (const name of readdirSync(resolve(root, 'docs')).filter((n) => n.endsWith('.md') && !['README.md', 'OVERVIEW.md', 'TUTORIAL.md'].includes(n)).sort()) {
   const title = read(`docs/${name}`).match(/^# (.+)$/m)?.[1] ?? name;
   index += `- [${title}](${name})\n`;
 }
-index += '\n\n## Maintaining these docs\n\nThe overview, tutorial, reference pages, and this index are generated from the website source. Edit `landing/src/Landing.svelte` or `landing/src/Docs.svelte`, then run:\n\n```bash\ncd landing\npnpm install --frozen-lockfile\npnpm docs:export\npnpm docs:check\n```\n\nCommit the regenerated Markdown with the source change. The existing in-depth guides are maintained directly.\n';
+index += '\n\n## Maintaining these docs\n\nThe overview, tutorial, reference pages, and this index are generated from the website source. Edit `landing/src/Landing.svelte` or `landing/src/Docs.svelte`, then run:\n\n```bash\ncd landing\npnpm install --frozen-lockfile\npnpm docs:export\npnpm docs:check\n```\n\nCommit the regenerated Markdown with the source change. The deep dives are maintained directly.\n\nDiagrams are Mermaid. On the website, a `const dName` string in `Docs.svelte` is placed with `{@render diagram(dName, \'caption\')}` and rendered in the browser; the export writes it as a ` ```mermaid ` fence, which GitHub renders. In the deep dives, write the fence directly.\n';
 output('docs/README.md', 'landing/src/{Landing,Docs}.svelte and docs/*.md', index);
 
 // Check relative links in the exported navigation and prose. Code samples can

@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Static files](static.md) · [Documentation index](../README.md) · [Relations →](relations.md)
+[← The key/value store](kv.md) · [Documentation index](../README.md) · [Relations →](relations.md)
 
 # Models
 
@@ -42,6 +42,22 @@ Todo::delete(&db, 1.into())?;
 .get("/todos/:id", "show", |c| c.model::<Todo, Db>("id").map(|t| t.to_json()))
 ```
 
+```mermaid
+flowchart LR
+  S["derive(Model) on struct Todo"] --> M["impl Model: schema(), table(), primary_key()"]
+  S --> R["impl FromRow"]
+  S --> I["impl FromInput"]
+  S --> H["to_json(), to_values(), save()"]
+  S --> L["with_field() batch loader per relation"]
+  M --> IR["TableSchema: the schema IR"]
+  IR --> G["migrate:gen diff and migrate:drift"]
+  IR --> Y["Model::migrate: additive dev sync"]
+  R --> T["all_typed, find_typed, fetch"]
+  I --> C["from_input: lenient hydrate of a partial payload"]
+```
+
+*One derive on a plain struct generates the schema IR, the typed readers and writers, and a batch loader per relation.*
+
 The `#[model(…)]` attributes are the mapping controls, and everything except `skip` flows into the schema IR the migration diff reads:
 
 - `table = "…"` (struct level) — override the inferred snake\_case plural name.
@@ -56,4 +72,4 @@ The derive also generates `from_input()` — a lenient hydrate from a partial cl
 
 ---
 
-[← Static files](static.md) · [Documentation index](../README.md) · [Relations →](relations.md)
+[← The key/value store](kv.md) · [Documentation index](../README.md) · [Relations →](relations.md)

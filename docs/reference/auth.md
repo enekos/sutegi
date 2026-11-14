@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Actors & supervision](actors.md) · [Documentation index](../README.md) · [Sessions & CSRF →](sessions.md)
+[← File storage](storage.md) · [Documentation index](../README.md) · [Crypto primitives →](crypto.md)
 
 # Authentication
 
@@ -30,7 +30,7 @@ App::new("app")
         }
         match auth.users.authenticate(email, password)? {
             Some(u) => { throttle.clear(&key)?;
-                         Ok::<_, Error>(auth.login_remembered(c.req, &u, remember, resp)) }
+                         Ok::<_, Error>(auth.login_remembered(c.req, &u, json(200, &u.to_json()))?) }
             None => { throttle.hit(&key)?; Err(Error::unauthorized("bad credentials")) }
         }
     })
@@ -47,6 +47,34 @@ App::new("app")
     .serve()
 ```
 
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant H as POST /login handler
+  participant T as Throttle
+  participant U as Users
+  participant A as Auth
+  C->>H: email and password
+  H->>T: too_many(login key)
+  alt over the limit
+    H-->>C: 429 with retry_after
+  else under the limit
+    H->>U: authenticate(email, password)
+    Note over U: PBKDF2 verify, a decoy hash for unknown emails, rehash if iterations are stale
+    alt no match
+      H->>T: hit(key)
+      H-->>C: 401 bad credentials
+    else match
+      H->>T: clear(key)
+      H->>A: login_remembered(req, user, resp)
+      Note over A: fresh session with uid, exp and a password-hash fingerprint, pre-login data and CSRF dropped
+      A-->>C: Set-Cookie session and Set-Cookie remember (selector.validator)
+    end
+  end
+```
+
+*Login: throttle, verify the password, then mint a fresh session and a remember cookie.*
+
 ## What the production pieces do
 
 - **Remember me** — selector/validator cookies where only the validator’s SHA-256 is stored, the validator *rotates on every use* (a stolen-then-replayed copy revokes the row, surfacing the theft), tokens are bound to the password hash at mint, and server-side expiry (default 30 days) ignores whatever the client claims.
@@ -60,6 +88,24 @@ App::new("app")
 
 Unknown emails burn the same PBKDF2 time as wrong passwords, so the endpoint does not become a user enumeration oracle.
 
+```mermaid
+flowchart TD
+  R["Auth::identify(req)"] --> S{"session HMAC valid and exp in the future?"}
+  S -->|"yes"| B{"fingerprint matches the current password hash?"}
+  B -->|"yes"| OK["user from the session, no new cookies"]
+  B -->|"no"| RC
+  S -->|"no"| RC{"remember store and remember cookie present?"}
+  RC -->|"no"| ANON["anonymous (None)"]
+  RC -->|"yes"| SEL{"selector row exists?"}
+  SEL -->|"no"| ANON
+  SEL -->|"yes"| VAL{"validator SHA-256 matches, unexpired, bound to the current password hash?"}
+  VAL -->|"no"| DEL["delete the row, anonymous"]
+  VAL -->|"yes"| ROT["rotate the validator, mint a fresh session"]
+  ROT --> ATT["Identified::attach sets both cookies"]
+```
+
+*How Auth::identify resolves a request: a live session, else a remember-me revival that rotates the token, else anonymous.*
+
 > [!TIP]
 > **Verification & reset**
 >
@@ -67,4 +113,4 @@ Unknown emails burn the same PBKDF2 time as wrong passwords, so the endpoint doe
 
 ---
 
-[← Actors & supervision](actors.md) · [Documentation index](../README.md) · [Sessions & CSRF →](sessions.md)
+[← File storage](storage.md) · [Documentation index](../README.md) · [Crypto primitives →](crypto.md)

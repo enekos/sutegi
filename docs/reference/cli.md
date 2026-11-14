@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Directory & conventions](layout.md) · [Documentation index](../README.md) · [Routing →](routing.md)
+[← Logging](logging.md) · [Documentation index](../README.md) · [The REPL →](repl.md)
 
 # The CLI
 
@@ -19,4 +19,4 @@ Migration verbs are *not* here — they live in your own binary, because they ne
 
 ---
 
-[← Directory & conventions](layout.md) · [Documentation index](../README.md) · [Routing →](routing.md)
+[← Logging](logging.md) · [Documentation index](../README.md) · [The REPL →](repl.md)

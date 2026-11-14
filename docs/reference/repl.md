@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Testing](testing.md) · [Documentation index](../README.md) · [Inside the server →](internals.md)
+[← The CLI](cli.md) · [Documentation index](../README.md) · [Collections →](collections.md)
 
 # The REPL
 
@@ -33,4 +33,4 @@ Two transports, one command set. In-process it consumes the built `App`; remote 
 
 ---
 
-[← Testing](testing.md) · [Documentation index](../README.md) · [Inside the server →](internals.md)
+[← The CLI](cli.md) · [Documentation index](../README.md) · [Collections →](collections.md)

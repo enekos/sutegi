@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Models](models.md) · [Documentation index](../README.md) · [The query builder →](queries.md)
+[← Models](models.md) · [Documentation index](../README.md) · [The agent surface →](agents.md)
 
 # Relations
 
@@ -32,8 +32,40 @@ for u in &users { println!("{} wrote {}", u.name, u.posts.len()); }
 let posts = Post::with_author(&db, Post::all_typed(&db)?)?;
 ```
 
+```mermaid
+erDiagram
+  users ||--o{ posts : "has_many posts / belongs_to author"
+  users {
+    i64 id PK
+    String name
+  }
+  posts {
+    i64 id PK
+    String title
+    i64 author_id FK "indexed, ON DELETE CASCADE"
+  }
+```
+
+*The running example: posts.author\_id is the indexed foreign key both relation fields join on.*
+
 `belongs_to` also carries the foreign key into the schema, including `on_delete = "cascade"`, so the migration diff sees it. Join keys are integers (the usual primary/foreign-key case), and loading is explicit rather than lazy: there is no hidden query behind a field access.
+
+```mermaid
+sequenceDiagram
+  participant App
+  participant Loader as User::with_posts
+  participant DB as Backend
+  App->>DB: User::all_typed - SELECT * FROM users
+  DB-->>App: users 1, 2, 3
+  App->>Loader: with_posts(db, users)
+  Loader->>DB: SELECT * FROM posts WHERE author_id IN (1, 2, 3)
+  DB-->>Loader: every child row, one round-trip
+  Loader->>Loader: group rows by author_id, hydrate Post via FromRow
+  Loader-->>App: users with posts attached (empty Vec when none)
+```
+
+*with\_posts loads every child in one IN (…) query and groups the rows in Rust: two queries, not N+1.*
 
 ---
 
-[← Models](models.md) · [Documentation index](../README.md) · [The query builder →](queries.md)
+[← Models](models.md) · [Documentation index](../README.md) · [The agent surface →](agents.md)

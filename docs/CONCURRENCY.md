@@ -27,6 +27,21 @@ let claimed = tx.select(
   **error** with `unsupported`: altered contention semantics are the point,
   and SQLite can't express them.
 
+```mermaid
+sequenceDiagram
+  participant A as Worker A
+  participant PG as Postgres
+  participant B as Worker B
+  A->>PG: BEGIN
+  A->>PG: SELECT * FROM jobs WHERE state = $1 ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED
+  PG-->>A: job 1, now row-locked by A
+  B->>PG: BEGIN
+  B->>PG: the same SELECT ... FOR UPDATE SKIP LOCKED
+  PG-->>B: job 2 - job 1 is skipped, not waited on
+  A->>PG: mark job 1 claimed, COMMIT (row lock released)
+  B->>PG: mark job 2 claimed, COMMIT
+```
+
 ## Isolation levels
 
 ```rust
@@ -42,6 +57,28 @@ lock is taken (`Serializable` → `BEGIN EXCLUSIVE`, `RepeatableRead` →
 `BEGIN IMMEDIATE`, `ReadCommitted` → `BEGIN`) — stronger than asked is
 honest, weaker would not be. Backends without the capability error rather
 than silently running weaker.
+
+```mermaid
+sequenceDiagram
+  participant App as App retry loop
+  participant A as pg.transact_with
+  participant PG as Postgres
+  participant B as Other writer
+  App->>A: transact_with(Serializable, f)
+  A->>PG: BEGIN ISOLATION LEVEL SERIALIZABLE
+  A->>PG: SELECT n - reads 0
+  B->>PG: BEGIN ISOLATION LEVEL SERIALIZABLE
+  B->>PG: SELECT n - reads 0
+  B->>PG: UPDATE n = 1, COMMIT
+  A->>PG: UPDATE n = 1
+  PG-->>A: postgres error [40001] could not serialize
+  A->>PG: ROLLBACK
+  A-->>App: Err containing 40001
+  Note over App: sutegi does not retry - the loop is yours
+  App->>A: transact_with again
+  A->>PG: BEGIN, SELECT n - reads 1, UPDATE n = 2, COMMIT
+  A-->>App: Ok
+```
 
 ## RETURNING on UPDATE / DELETE
 

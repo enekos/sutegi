@@ -1,10 +1,41 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Is it production-ready?](honesty.md) · [Documentation index](../README.md) · [Installation →](installation.md)
+[← Request lifecycle](internals.md) · [Documentation index](../README.md) · [Hexagonal architecture →](hexagonal.md)
 
 # The workspace map
 
 sutegi is one facade crate over twenty-odd small ones. You depend on `sutegi` and switch features on; the table is here so you know what you are reading when you open the source, and so an error message from `sutegi_orm` or `sutegi_pg` tells you where to look.
+
+```mermaid
+flowchart TD
+  CLI["sutegi-cli"] --> REPL["sutegi-repl"]
+  REPL --> WEB["sutegi-web"]
+  REPL --> HTTP["sutegi-http"]
+  REPL -.-> ORM["sutegi-orm"]
+  AUTH["sutegi-auth"] --> SESSION["sutegi-session"]
+  AUTH --> WEB
+  AUTH --> ORM
+  AUTH -.-> MAIL["sutegi-mail"]
+  SESSION --> WEB
+  HEX["sutegi-hexagon"] --> WEB
+  WEB --> HTTP
+  WEB -.-> ORM
+  WEB -.-> VALIDATE["sutegi-validate"]
+  WEB -.-> ACTORS["sutegi-actors"]
+  WEB -.-> CHANNELS["sutegi-channels"]
+  WEB -.-> WS["sutegi-ws"]
+  CHANNELS --> WS
+  CHANNELS --> PUBSUB["sutegi-pubsub"]
+  CHANNELS --> HTTP
+  WS --> HTTP
+  MAIL --> TEMPLATE["sutegi-template"]
+  JOBS["sutegi-events, sutegi-queue"] --> ORM
+  STORAGE["sutegi-storage"] -.-> ORM
+  ORM -.-> PG["sutegi-pg"]
+  PUBSUB -.-> PG
+```
+
+*Internal dependencies between workspace crates; dotted edges are optional. sutegi-json, sutegi-crypto and sutegi-log, used almost everywhere, are left out.*
 
 | Crate | Feature | Responsibility |
 | --- | --- | --- |
@@ -33,4 +64,4 @@ sutegi is one facade crate over twenty-odd small ones. You depend on `sutegi` an
 
 ---
 
-[← Is it production-ready?](honesty.md) · [Documentation index](../README.md) · [Installation →](installation.md)
+[← Request lifecycle](internals.md) · [Documentation index](../README.md) · [Hexagonal architecture →](hexagonal.md)

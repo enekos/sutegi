@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Sessions & CSRF](sessions.md) · [Documentation index](../README.md) · [File storage →](storage.md)
+[← Event sourcing](events.md) · [Documentation index](../README.md) · [Queues →](queues.md)
 
 # Mail
 
@@ -53,4 +53,4 @@ impl Transport for Resend {
 
 ---
 
-[← Sessions & CSRF](sessions.md) · [Documentation index](../README.md) · [File storage →](storage.md)
+[← Event sourcing](events.md) · [Documentation index](../README.md) · [Queues →](queues.md)

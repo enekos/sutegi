@@ -6,14 +6,15 @@
   // #anchor links: a route is only a hash that begins with "#/".
   //   #features        -> landing (browser scrolls to the section)
   //   #/docs           -> docs page, top
-  //   #/docs/routing   -> docs page, scrolled to the "routing" section
+  //   #/docs/routing   -> the "routing" page
+  //   #/docs/routing/route-groups -> that page, scrolled to a heading
   function parse() {
     const h = window.location.hash
     if (h.startsWith('#/')) {
-      const [page, section] = h.slice(2).split('/')
-      return { page: page || 'home', section: section || '' }
+      const [page, section, anchor] = h.slice(2).split('/')
+      return { page: page || 'home', section: section || '', anchor: anchor || '' }
     }
-    return { page: 'home', section: '' }
+    return { page: 'home', section: '', anchor: '' }
   }
 
   let route = $state(parse())
@@ -25,7 +26,7 @@
 </script>
 
 {#if route.page === 'docs'}
-  <Docs section={route.section} />
+  <Docs section={route.section} anchor={route.anchor} />
 {:else}
   <Landing />
 {/if}

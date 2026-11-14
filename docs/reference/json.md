@@ -33,10 +33,28 @@ let posts = db.select(
 
 The path grammar is a deliberate subset — identifier keys and `[n]` indexes — because exotic keys need per-engine quoting rules while identifiers compile everywhere. This is the first builder feature whose SQL *shape* differs per engine, so the builder stores parsed segments and the executing backend compiles them: `json_extract(col, ?)` with typed values on SQLite, `col #>> ?` with a bound `{a,b,0}` text array and value-driven casts on Postgres (`::numeric` so `9 < 10` compares as numbers). Containment is Postgres only; SQLite errors honestly rather than emulating subset semantics with `json_each` walks.
 
+```mermaid
+flowchart TD
+  W["where_json(meta, $.stats.views, >, 50)"] --> P{"parse_json_path"}
+  P -- malformed --> E["builder error, returned at build"]
+  P -- ok --> S["segments: Key stats, Key views"]
+  S --> X{"executing backend dialect"}
+  X -- SQLite --> L["json_extract(meta, ?) > ? with $.stats.views and 50 bound"]
+  X -- Postgres --> G["(meta #>> ?)::numeric > ? with {stats,views} and 50 bound"]
+  C["where_json_contains(meta, doc)"] --> Y{"executing backend dialect"}
+  Y -- SQLite --> N["Err: unsupported json_contains"]
+  Y -- Postgres --> K["meta @> ?::jsonb"]
+```
+
+*The path is parsed once into segments; the executing backend compiles them for its dialect, always binding the path as a parameter.*
+
 > [!NOTE]
 > **Indexing**
 >
 > A `jsonb` GIN index for containment-heavy tables is not emitted by migrations yet — the schema IR learns non-btree index kinds alongside the search work. Add one by hand if `@>` gets hot: `CREATE INDEX ON docs USING GIN (meta)`.
+
+> [!TIP]
+> **Deep dive:** [the long-form guide](../JSON.md), with every option and edge case.
 
 ---
 

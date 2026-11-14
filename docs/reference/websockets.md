@@ -30,6 +30,32 @@ let frame = text_frame("maintenance at noon");
 for conn in &conns { conn.send_shared(&frame); }
 ```
 
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant W as HTTP worker thread
+    participant R as WsRuntime
+    participant S as Reactor shard thread
+    C->>W: GET /ws with Upgrade: websocket
+    W->>W: check handshake, Origin, authorize, has_capacity
+    alt refused before the 101
+        W-->>C: 400, 403, 426 or 503
+    else accepted
+        W-->>C: 101 Switching Protocols
+        W->>R: takeover(socket, pipelined bytes)
+        R->>R: reserve slot (global and per-IP caps)
+        R->>S: inject Adopt (round-robin) and wake the shard
+        Note over W: worker goes back to serving HTTP
+        S->>S: non-blocking, register fd with kqueue or epoll
+        S->>S: on_open, then parse pipelined frames
+        C->>S: frames
+        S->>S: on_message inline, per-connection order
+        S-->>C: queued frames (dropped past max_buffered)
+    end
+```
+
+*The HTTP worker checks the handshake, writes the 101 and hands the raw socket to a reactor shard, then goes back to serving HTTP.*
+
 Measured on a dev laptop: 80,000 live sockets at 0.0% idle CPU, a broadcast enqueue of 80k shared-`Arc` frames in ~1.5 ms, and 5k-fleet delivery at p50 15 ms / max 30 ms end-to-end. The codec is strict RFC 6455 — masking required, minimal length encodings, control-frame rules, close-code validation, UTF-8 enforcement — with a deterministic fuzz suite behind it.
 
 - **Callbacks run inline on the shard**, which is what guarantees per-connection ordering. Keep them CPU-quick; push blocking work to your own threads and answer later through the cloneable `Conn`.
@@ -38,9 +64,12 @@ Measured on a dev laptop: 80,000 live sockets at 0.0% idle CPU, a broadcast enqu
 - Every knob lives in [`WsConfig`](options.md), and `ws_config` must come *before* the first `.ws(…)` — that call starts the reactor.
 
 > [!WARNING]
-> **Cookie-authenticated sockets must pin their origins**
+> **Cookie-authenticated sockets and origins**
 >
-> A browser sends cookies on a cross-origin WebSocket handshake and the same-origin policy does not stop it. If your socket is authenticated by a cookie, call `check_origin([…])` — otherwise any page on the internet can open an authenticated socket as your user (CSWSH). Bearer-token clients are unaffected: they carry no ambient credential.
+> A browser sends cookies on a cross-origin WebSocket handshake and the same-origin policy does not stop it, so sutegi does: by default an upgrade whose `Origin` names a different host than `Host` gets a `403`. Call `check_origin([…])` when the page is served from another host or a proxy rewrites `Host`. `allow_any_origin()` turns the check off — only for public sockets that do not authenticate by cookie, or any page on the internet can open one as your user (CSWSH).
+
+> [!TIP]
+> **Deep dive:** [the long-form guide](../REALTIME.md), with every option and edge case.
 
 ---
 

@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← The CLI](cli.md) · [Documentation index](../README.md) · [Requests & the Ctx →](requests.md)
+[← Listeners](listeners.md) · [Documentation index](../README.md) · [Middleware, CORS & guards →](middleware.md)
 
 # Routing
 
@@ -33,4 +33,4 @@ The router splits on segments after trimming leading and trailing slashes, so `/
 
 ---
 
-[← The CLI](cli.md) · [Documentation index](../README.md) · [Requests & the Ctx →](requests.md)
+[← Listeners](listeners.md) · [Documentation index](../README.md) · [Middleware, CORS & guards →](middleware.md)

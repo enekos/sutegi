@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Philosophy & the bet](philosophy.md) · [Documentation index](../README.md) · [The workspace map →](crates.md)
+[← Philosophy & the bet](philosophy.md) · [Documentation index](../README.md) · [Installation →](installation.md)
 
 # Is it production-ready?
 
@@ -10,7 +10,7 @@ The honest answer is: **it depends on what you are asking sutegi to do, and how 
 
 The core is small enough to read in an afternoon and is exercised hard. Beyond the unit suite, a deterministic, pure-`std` **fuzz and differential harness** hammers every hand-rolled surface — JSON, HTTP, the crypto primitives, the Postgres wire protocol, the RFC 6455 WebSocket codec, templating, SigV4 — and runs in CI as a required gate. Building that harness caught and fixed several real bugs (a JSON stack-overflow DoS, an HTTP unbounded line-read, an unchecked PG frame panic, a SCRAM iteration-count DoS, and more), and the JSON parser is checked round-trip against `serde_json` on hundreds of thousands of cases. The query builder guards identifiers against SQL injection, and the search grammar sanitizes input before it can reach engine query syntax — both matter precisely because an AI tool argument can reach a column, a sort slot or a match expression.
 
-The concurrency claims are tested against real servers, not asserted: queue claim exclusivity under six concurrent workers, crash recovery through an expired lease, a lost-update race surfacing as `40001` under `Serializable`, a rolled-back write never waking a watcher, and two OS processes chatting through one PostgreSQL over channels.
+The concurrency claims are tested against real servers, not asserted: queue claim exclusivity under six concurrent workers, crash recovery through an expired lease, a lost-update race surfacing as `40001` under `Serializable`, a rolled-back write never waking a Postgres watcher, and two OS processes chatting through one PostgreSQL over channels.
 
 > [!WARNING]
 > **The hand-rolled surface is the thing to weigh**
@@ -38,4 +38,4 @@ Laravel and Phoenix took years and large communities. sutegi is a broad, coheren
 
 ---
 
-[← Philosophy & the bet](philosophy.md) · [Documentation index](../README.md) · [The workspace map →](crates.md)
+[← Philosophy & the bet](philosophy.md) · [Documentation index](../README.md) · [Installation →](installation.md)

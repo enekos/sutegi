@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Queues](queues.md) · [Documentation index](../README.md) · [Authentication →](auth.md)
+[← Queues](queues.md) · [Documentation index](../README.md) · [File storage →](storage.md)
 
 # Actors & supervision
 
@@ -40,6 +40,25 @@ let sup = Supervisor::new("pipeline")
 App::new("myapp").actors(sup.registry()).serve()?;   // GET /__actors
 ```
 
+```mermaid
+flowchart TD
+    X["child thread exits: panic caught, or stopped"] --> E["Exit with id, generation, reason sent to the supervisor"]
+    E --> S{"stale generation?"}
+    S -->|yes| IG["ignored"]
+    S -->|no| P{"restart policy"}
+    P -->|"Temporary, or Transient after a clean stop"| DOWN["child stays down"]
+    P -->|"Permanent, or Transient after a crash"| I{"more than max restarts in window?"}
+    I -->|yes| FAIL["stop every child in reverse order, supervisor Failed"]
+    I -->|no| BO["sleep the child's backoff"]
+    BO --> ST{"strategy"}
+    ST -->|OneForOne| R1["the exited child"]
+    ST -->|RestForOne| R2["it and every later sibling"]
+    ST -->|OneForAll| R3["every child"]
+    R1 & R2 & R3 --> RS["stop the set in reverse order, restart in start order from the factory"]
+```
+
+*What the supervisor does with each child exit: restart policy, then the intensity cap, then the strategy picks which children restart.*
+
 - **Bounded mailbox** (default 1024): a full mailbox fails `tell` fast with `TellError::Full`, so backpressure is explicit rather than a hidden unbounded queue.
 - **Let it crash.** A panic in `handle` kills only that actor and is reported as `ExitReason::Crashed`. Lifecycle hooks `started()` / `stopped(&reason)` run on every (re)start and exit. `stop()` is queued behind pending messages, so the mailbox drains first.
 - **Restart intensity** (default 3 per 5 s) fails the supervisor and stops all children when exceeded, so a crash-looping child cannot burn a thread forever. `RestForOne`/`OneForAll` stop dependents in reverse order and restart them in start order.
@@ -51,6 +70,9 @@ App::new("myapp").actors(sup.registry()).serve()?;   // GET /__actors
 >
 > This is supervision and fault isolation, not BEAM-scale lightweight processes: thousands of actors, not millions. There are no links or monitors beyond the supervisor relationship, no distribution (Postgres is the bus), and no hot code reload. Supervision rests on `catch_unwind`, so it needs `panic = "unwind"` (the Rust default): an app that sets `panic = "abort"` turns every actor crash into a process exit.
 
+> [!TIP]
+> **Deep dive:** [the long-form guide](../ACTORS.md), with every option and edge case.
+
 ---
 
-[← Queues](queues.md) · [Documentation index](../README.md) · [Authentication →](auth.md)
+[← Queues](queues.md) · [Documentation index](../README.md) · [File storage →](storage.md)

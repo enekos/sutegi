@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Listeners](listeners.md) · [Documentation index](../README.md) · [Operational endpoints →](ops.md)
+[← Testing](testing.md) · [Documentation index](../README.md) · [Operational endpoints →](ops.md)
 
 # Tuning & limits
 
@@ -56,4 +56,4 @@ Pool sizes are constructor arguments rather than builder methods: `Db::open_pool
 
 ---
 
-[← Listeners](listeners.md) · [Documentation index](../README.md) · [Operational endpoints →](ops.md)
+[← Testing](testing.md) · [Documentation index](../README.md) · [Operational endpoints →](ops.md)

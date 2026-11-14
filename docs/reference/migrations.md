@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Reactive queries](reactive.md) · [Documentation index](../README.md) · [The key/value store →](kv.md)
+[← The query builder](queries.md) · [Documentation index](../README.md) · [Locks, isolation, bulk →](concurrency.md)
 
 # Migrations
 
@@ -36,9 +36,41 @@ myapp migrate:drift              # three-way report: DB vs migrations vs models
 myapp migrate:fresh              # roll everything back and re-run (dev only)
 ```
 
+```mermaid
+stateDiagram-v2
+  [*] --> Pending: file written by migrate:gen or by hand
+  Pending --> Applied: migrate - up + history row in one tx
+  Applied --> Pending: migrate:rollback - down + row delete in one tx
+  Applied --> Tampered: file edited or renamed
+  Tampered --> Applied: Migrator repair re-stamps the history
+  Applied --> Orphan: file deleted from code
+  note right of Tampered
+    the next migrate errors before touching anything
+  end note
+  note right of Orphan
+    a rollback batch containing it is refused whole
+  end note
+```
+
+*A migration's life as \_sutegi\_migrations sees it, including the edited-file and deleted-file states the guards catch.*
+
 ## Diff against history, not the live database
 
 `migrate:gen` computes changes by diffing your models against the *shadow schema* — the schema you get by folding every existing migration’s ops in memory. It never consults your live database to decide what to generate, so the same repository state always produces the same migration no matter what anyone’s local database happens to contain. The live database is consulted for exactly one thing: **drift detection**, which reports both *DB vs migrations* (a hand-edit, or migrations not fully applied) and *models vs migrations* (you changed a model and have not run `:gen`). `sutegi::migrate::report_json` is the same report as JSON, ready to mount at `/__migrations` for agents and dashboards.
+
+```mermaid
+flowchart LR
+  F["migration files: ops JSON"] --> SH["shadow schema: ops folded in memory"]
+  M["derive(Model) schemas"] --> GEN["migrate:gen = diff(shadow, models)"]
+  SH --> GEN
+  GEN --> NF["new timestamped migration file"]
+  SH --> D1["drift: diff(shadow, live DB)"]
+  DB["live database, introspected"] --> D1
+  SH --> D2["drift: diff(shadow, models)"]
+  M --> D2
+```
+
+*migrate:gen diffs models against the folded history; the live database is read only for the two drift comparisons.*
 
 ## Safety classes
 
@@ -47,6 +79,27 @@ myapp migrate:fresh              # roll everything back and re-run (dev only)
 - **Destructive** — drop a table or column, a lossy type change. `:gen` writes these but flags them loudly; the committed, reviewed file is your approval.
 
 **Renames are never guessed.** A dropped column plus an added column of the same type generate a drop + add pair with a “possible rename?” warning — edit the file to a rename op if that is what you meant, which preserves the data. Applied migrations are checksummed in `_sutegi_migrations`, so editing a file after the fact fails the next `migrate` rather than silently diverging (`Migrator::repair` re-stamps after a deliberate edit). On Postgres, `run`/`rollback` take a session advisory lock, so many pods booting at once serialize instead of racing.
+
+```mermaid
+flowchart TD
+  A["Migrator::run"] --> V{"versions well-formed and unique?"}
+  V -- no --> X1["Err, database untouched"]
+  V -- yes --> LK["poll try_lock(sutegi:migrations), up to 300 s"]
+  LK -- timeout --> X2["Err: another runner is active"]
+  LK -- held --> H["ensure _sutegi_migrations, read history"]
+  H --> C{"checksums, names and order OK?"}
+  C -- no --> X1
+  C -- yes --> N{"next pending migration?"}
+  N -- none --> DONE["drop lock, return applied versions"]
+  N -- yes --> T["write tx on one connection"]
+  T --> RC{"already in history? re-check"}
+  RC -- yes --> N
+  RC -- no --> UP["run up, insert history row"]
+  UP -- ok --> CM["COMMIT"] --> N
+  UP -- error --> RB["ROLLBACK: no schema change, no row; Err"]
+```
+
+*Migrator::run validates before touching anything, serializes runners on a lock, and applies each migration atomically with its history row.*
 
 > [!TIP]
 > **Dev-mode sync**
@@ -58,6 +111,9 @@ myapp migrate:fresh              # roll everything back and re-run (dev only)
 >
 > `down` restores schema *shape, not data* — a dropped column comes back empty. The schema IR covers tables, columns, secondary indexes and single-column foreign keys; views, triggers, sequences, CHECK constraints and multi-column FKs are out of scope (use a closure migration). On SQLite, changing a column’s type or nullability is a full table rebuild — rows survive, but it is heavier than the in-place `ALTER` Postgres does.
 
+> [!TIP]
+> **Deep dive:** [the long-form guide](../MIGRATIONS.md), with every option and edge case.
+
 ---
 
-[← Reactive queries](reactive.md) · [Documentation index](../README.md) · [The key/value store →](kv.md)
+[← The query builder](queries.md) · [Documentation index](../README.md) · [Locks, isolation, bulk →](concurrency.md)

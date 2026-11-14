@@ -32,10 +32,33 @@ std::thread::spawn(move || loop {
 //   SELECT pg_try_advisory_lock(<sutegi_orm::lock_key("scheduler-leader")>);
 ```
 
+```mermaid
+sequenceDiagram
+  participant A as Pod A
+  participant PG as Postgres
+  participant B as Pod B
+  A->>PG: open a dedicated session, not a pooled one
+  A->>PG: SELECT pg_try_advisory_lock(lock_key(janitor))
+  PG-->>A: true - guard owns the session
+  B->>PG: open a dedicated session
+  B->>PG: SELECT pg_try_advisory_lock(lock_key(janitor))
+  PG-->>B: false
+  B->>PG: close the session
+  Note over B: with_lock returns Ok(None) - another pod ran it
+  A->>A: run f() while the guard holds the session
+  A->>PG: guard drops, session closes
+  Note over PG: session gone = lock released, the same path as a crashed holder
+```
+
+*Two pods race with\_lock("janitor", Duration::ZERO, …): one wins and holds the lock on its own session; the loser gets Ok(None).*
+
 - **Postgres is cluster-scoped** via `pg_try_advisory_lock` on a *dedicated* session — never a pooled connection, so a leader lock held for the process lifetime cannot starve request traffic. Release is closing that session, which is exactly what the server does when a holder crashes, so crash-release needs no cleanup path.
 - **SQLite is process-scoped**: a named-mutex registry keyed per database file. Two OS processes on the same file do *not* contend — believe the capability.
 - Inside a Postgres transaction, `try_lock` is transaction-scoped (`pg_try_advisory_xact_lock`) and releases at COMMIT, **not** at guard drop.
 - `with_lock` reconnects per call on Postgres — fine for a janitor loop, wrong in a request hot path. These are for coordination, not thousands of concurrent holds.
+
+> [!TIP]
+> **Deep dive:** [the long-form guide](../LOCKS.md), with every option and edge case.
 
 ---
 
