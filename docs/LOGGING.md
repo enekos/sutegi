@@ -24,6 +24,23 @@ log::warn!("llm", "call failed", provider = "gemini", ms = elapsed, error = %err
   `passwd`, `secret`, `token`, `authorization`, `cookie`, `api_key` or
   `apikey` is written as `[redacted]`, wherever it came from.
 
+What happens to one event:
+
+```mermaid
+flowchart TD
+  EV["log::info!(target, msg, fields)"] --> CAP{"inside log::capture?"}
+  CAP -->|"no"| LVL{"level at or above SUTEGI_LOG for this target?"}
+  LVL -->|"no"| DROP["dropped"]
+  LVL -->|"yes"| MERGE
+  CAP -->|"yes, any level"| MERGE["merge fields: event, then innermost scope outward, first key wins"]
+  MERGE --> RED["redact secret-named keys"]
+  RED --> C2{"capturing?"}
+  C2 -->|"yes"| REC["appended to this thread's captured records"]
+  C2 -->|"no"| CNT["count per level for /__metrics"]
+  CNT --> RING["ring buffer of the last 512, served by /__logs"]
+  RING --> OUT["one JSON or text line on stderr"]
+```
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -70,6 +87,26 @@ client and not the proxy. 5xx responses log at error, and the
 `job`, `job_id` and `attempt` added. A request that enqueues work and the job
 that later fails share one `rid`. Every attempt is logged: success at debug
 with `ms`, a failure that will retry at warn, the last one at error.
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant AL as AccessLog
+  participant H as Handler
+  participant Q as Queue
+  participant DB as sutegi_jobs
+  participant W as Queue worker
+  C->>AL: request, optional x-request-id
+  AL->>AL: open scope with rid
+  AL->>H: middleware and handler run inside the scope
+  H->>Q: dispatch(job)
+  Q->>DB: insert row, trace = current context as JSON
+  H-->>AL: response
+  AL-->>C: one http request line, x-request-id header
+  W->>DB: claim the job
+  W->>W: reopen scope from trace, add job, job_id, attempt
+  W->>W: run the handler, every line carries the same rid
+```
 
 `Queue::migrate` adds the `trace` column to a table created by an older
 sutegi. A queue that skipped `migrate` cannot store the trace of a dispatch

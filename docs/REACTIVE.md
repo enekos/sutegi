@@ -49,6 +49,32 @@ watcher re-runs its query and diffs by pk:
   the diff is empty, nothing is sent)
 - the pk column must be part of the watched selection (the diff keys on it)
 
+```mermaid
+sequenceDiagram
+  participant W as Writer (any pod or psql)
+  participant PG as Postgres
+  participant L as LISTEN session
+  participant K as Watcher worker
+  participant S as Subscription
+  W->>PG: BEGIN, UPDATE todos
+  Note over PG: statement trigger _sutegi_watch_todos calls pg_notify(sutegi_changes, todos)
+  alt the write commits
+    W->>PG: COMMIT
+    PG-->>L: NOTIFY delivered, payload todos
+    L->>K: table todos changed
+    Note over K: debounce 25 ms, coalesce the burst
+    K->>PG: re-run every watched query on todos
+    PG-->>K: current rows
+    K->>K: diff by pk against the last snapshot
+    opt diff not empty
+      K->>S: Change with added, updated, removed
+    end
+  else the write rolls back
+    W->>PG: ROLLBACK
+    Note over PG,L: the queued notification is discarded, no watcher wakes
+  end
+```
+
 Guardrails: 1024 live subscriptions per `Watcher` (then `watch()` errors);
 one requery per table per debounce window regardless of burst size (20
 writes → typically 1 `Change` carrying all 20 rows, tested). Row-level

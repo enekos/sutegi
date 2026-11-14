@@ -30,6 +30,25 @@ The artifacts are framework-managed, `_sutegi_`-prefixed, and invisible to schem
 
 Hybrid search is reciprocal-rank fusion (`Σ 1/(60+rank)`) merged in Rust over two legs — the lexical one above, and pgvector pushdown where `capabilities().vector` is true, portable brute-force cosine otherwise. A document ranked well in *both* legs beats one ranked first in a single leg and absent from the other.
 
+```mermaid
+flowchart TD
+  Q["hybrid_search(query text, query vector, k)"] --> LX["lexical leg: search(), top n = max(4k, 50) by _rank"]
+  Q --> VQ{"capabilities().vector?"}
+  VQ -- yes --> VP["pushdown: ORDER BY col <=> ? LIMIT n"]
+  VQ -- no --> VB["brute force: embedding::nearest, cosine, in Rust"]
+  LX --> F["RRF in Rust: score += 1 / (60 + rank) per leg"]
+  VP --> F
+  VB --> F
+  F --> T["sort by fused score, keep top k"]
+  T --> R["SELECT rows WHERE pk IN (top k)"]
+  R --> O["re-order to fused rank, attach _score"]
+```
+
+*Each leg returns ranked primary keys; reciprocal-rank fusion merges them in Rust, then the winners are fetched in one query.*
+
+> [!TIP]
+> **Deep dive:** [the long-form guide](../SEARCH.md), with every option and edge case.
+
 ---
 
 [← JSON path queries](json.md) · [Documentation index](../README.md) · [Embeddings & vectors →](vectors.md)

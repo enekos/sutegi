@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Hexagonal architecture](hexagonal.md) · [Documentation index](../README.md) · [The REPL →](repl.md)
+[← Channels & presence](channels.md) · [Documentation index](../README.md) · [Tuning & limits →](options.md)
 
 # Testing
 
@@ -31,4 +31,4 @@ The pieces that need a server or a real engine are testable too, and the framewo
 
 ---
 
-[← Hexagonal architecture](hexagonal.md) · [Documentation index](../README.md) · [The REPL →](repl.md)
+[← Channels & presence](channels.md) · [Documentation index](../README.md) · [Tuning & limits →](options.md)

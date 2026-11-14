@@ -13,6 +13,34 @@ Phoenix is the design reference throughout; the deltas are deliberate and
 documented (object envelope instead of positional array, heartbeat presence
 instead of delta-CRDT, agent introspection as a first-class surface).
 
+An upgrade is the one place the blocking HTTP side and the evented side
+meet. The worker validates the handshake, writes the `101`, hands the raw
+socket to a reactor shard and returns to serving HTTP:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant W as HTTP worker thread
+    participant R as WsRuntime
+    participant S as Reactor shard thread
+    C->>W: GET /ws with Upgrade: websocket
+    W->>W: check handshake, Origin, authorize, has_capacity
+    alt refused before the 101
+        W-->>C: 400, 403, 426 or 503
+    else accepted
+        W-->>C: 101 Switching Protocols
+        W->>R: takeover(socket, pipelined bytes)
+        R->>R: reserve slot (global and per-IP caps)
+        R->>S: inject Adopt (round-robin) and wake the shard
+        Note over W: worker goes back to serving HTTP
+        S->>S: non-blocking, register fd with kqueue or epoll
+        S->>S: on_open, then parse pipelined frames
+        C->>S: frames
+        S->>S: on_message inline, per-connection order
+        S-->>C: queued frames (dropped past max_buffered)
+    end
+```
+
 ## Channels in five minutes
 
 ```rust
@@ -98,12 +126,60 @@ room.push("new_msg", {body: "hello"});
 - `assigns` are per-membership JSON state (`socket.assign` /
   `socket.assign_get`), gone on leave/disconnect.
 
+One join, a tracked presence, then a broadcast. The first member on a pod
+subscribes the hub to `stg:chan:<topic>` on the broker; every broadcast goes
+through the broker, so the path is the same on one pod or many:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant H as ChannelHub on the shard
+    participant CB as Channel callbacks
+    participant B as Broker
+    participant O as Other members
+    C->>H: stg:join room:1 with payload
+    H->>CB: on_join(socket, payload)
+    CB-->>H: Ok(response)
+    H->>B: subscribe stg:chan:room:1 (first member on this pod)
+    H-->>C: stg:reply ok
+    H->>CB: after_join callbacks, e.g. Presence::track
+    CB->>B: presence join diff, for other pods
+    CB-->>O: presence_diff to local members
+    CB-->>C: presence_diff, then presence_state
+    C->>H: new_msg with payload
+    H->>CB: on("new_msg")
+    CB->>B: socket.broadcast publishes to stg:chan:room:1
+    B->>H: deliver on this pod and on every subscribed pod
+    H-->>C: new_msg frame
+    H-->>O: same shared frame, one inject per shard
+```
+
 ## Cross-pod fan-out (PgPubSub)
 
 `Channels::broker(PgPubSub::connect(&cfg)?)` is the only change between one
 pod and a fleet. Every broker `LISTEN`s on one PG channel; topics travel
 inside the payload envelope; a pod recognizes its own instance id and skips
 the echo (local delivery already happened synchronously at publish).
+
+```mermaid
+flowchart LR
+    subgraph PodA["Pod A"]
+        P["publish(topic, msg)"] --> LA["local subscribers on A (synchronous)"]
+        P --> Q["bounded queue (full: dropped)"]
+        Q --> PUB["publisher thread"]
+        LSA["listener thread A"]
+    end
+    PUB -->|"pg_notify with envelope (instance, topic, msg)"| PG[("Postgres channel sutegi_pubsub")]
+    PG -->|"NOTIFY"| LSA
+    PG -->|"NOTIFY"| LSB
+    LSA --> SKIP["own instance id: echo skipped"]
+    subgraph PodB["Pod B"]
+        LSB["listener thread B"] --> LB["local subscribers on B"]
+    end
+```
+
+The publisher queue is bounded: when it is full, or the `NOTIFY` fails, the
+message is dropped from the cross-pod path and counted in `dropped()`.
 
 Honest limits, by design:
 

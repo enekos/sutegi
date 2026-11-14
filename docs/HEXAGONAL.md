@@ -9,21 +9,19 @@ to sutegi's pieces. The worked reference is [`examples/hexagonal`](../examples/h
 > **Source dependencies point inward.** Outer layers know about inner layers,
 > never the reverse.
 
+```mermaid
+flowchart LR
+  HTTP["inbound adapter: HTTP route"] -->|"execute(input)"| UC["use case (impl UseCase)"]
+  TOOL["inbound adapter: AI tool"] -->|"execute(input)"| UC
+  UC -->|"uses"| DOM["domain: entities and rules, no framework"]
+  UC -->|"depends on"| PORT["outbound port: TodoRepository trait"]
+  MEM["outbound adapter: in-memory repo"] -.->|"implements"| PORT
+  SQL["outbound adapter: repo over a Backend"] -.->|"implements"| PORT
+  ROOT["composition root (main.rs)"] -->|"picks one repo, injects it"| UC
 ```
-            inbound adapters                       outbound adapters
-         (HTTP handlers, AI tools)              (SQLite repo, HTTP client)
-                    │  call                            ▲  implement
-                    ▼                                  │
-            ┌───────────────┐     depends on    ┌──────────────┐
-            │  application  │ ─────────────────▶│    ports     │
-            │  (use cases)  │                   │   (traits)   │
-            └───────┬───────┘                   └──────────────┘
-                    │ uses
-                    ▼
-            ┌───────────────┐
-            │    domain     │   pure: entities + rules, no framework
-            └───────────────┘
-```
+
+Every arrow points inward: adapters call or implement, the use case depends only on
+the port and the domain, and only the composition root names a concrete adapter.
 
 If you ever find yourself writing `use sutegi::...` in the domain layer, stop —
 that's the rule being broken.

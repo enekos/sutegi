@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Inside the server](internals.md) · [Documentation index](../README.md) · [Tuning & limits →](options.md)
+[← Hexagonal architecture](hexagonal.md) · [Documentation index](../README.md) · [Routing →](routing.md)
 
 # Listeners
 
@@ -33,6 +33,34 @@ App::new("metrics-demo")
 // GET /__introspect gains: "listeners": [ { "name": …, "doc": … } ]
 ```
 
+```mermaid
+sequenceDiagram
+  participant App as run_until or run_graceful
+  participant L as listener thread
+  participant S as HTTP server
+  participant F as shutdown flag
+  App->>L: spawn sutegi-listener-name, call the closure with ListenerCtx
+  App->>S: serve_until(addr, workers, flag)
+  loop each lap
+    L->>F: should_stop()?
+    F-->>L: false
+    L->>L: recv with a read timeout, handle the packet
+  end
+  Note over F: SIGTERM or SIGINT (or your code) sets the flag
+  par server drains
+    S->>S: stop accepting, finish in-flight requests
+  and listener notices
+    L->>F: should_stop()?
+    F-->>L: true
+    L->>L: leave the loop, return
+  end
+  S-->>App: serve_until returns
+  App->>L: join() waits until the closure has returned
+  Note over L: a panic is caught and logged once, the thread ends and is not restarted
+```
+
+*Listeners and the HTTP server share one shutdown flag; the server drains, then joins each listener once its closure returns.*
+
 `ListenerCtx` is deliberately tiny: `should_stop()` (true once shutdown has begun), `state::<T>()` / `try_state::<T>()` — the same typed state handlers and tools see — `db::<B>()` as sugar for a backend, and `name()`.
 
 > [!WARNING]
@@ -42,6 +70,9 @@ App::new("metrics-demo")
 
 A panicking listener **does not restart and does not take the server down**: the panic is caught, one line lands on stderr, and the thread ends. If the loop must survive crashes, own that policy — wrap the body in a retry loop, or run it under an [actor supervisor](actors.md) and keep the listener as the thin socket shim. Discovery is name and doc only; which port and protocol the loop speaks belongs in the doc string, where agents read it.
 
+> [!TIP]
+> **Deep dive:** [the long-form guide](../LISTENERS.md), with every option and edge case.
+
 ---
 
-[← Inside the server](internals.md) · [Documentation index](../README.md) · [Tuning & limits →](options.md)
+[← Hexagonal architecture](hexagonal.md) · [Documentation index](../README.md) · [Routing →](routing.md)

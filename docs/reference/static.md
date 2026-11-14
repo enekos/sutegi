@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Validation](validation.md) · [Documentation index](../README.md) · [Models →](models.md)
+[← Validation](validation.md) · [Documentation index](../README.md) · [Logging →](logging.md)
 
 # Static files
 
@@ -22,4 +22,4 @@ Traversal attempts, dotfiles and backslashes are `404`s rather than reads outsid
 
 ---
 
-[← Validation](validation.md) · [Documentation index](../README.md) · [Models →](models.md)
+[← Validation](validation.md) · [Documentation index](../README.md) · [Logging →](logging.md)

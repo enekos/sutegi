@@ -12,12 +12,14 @@ If you have used Laravel, the shape will feel familiar: an expressive router, an
 
 They are written to be read in order the first time and grepped after. The path is deliberate:
 
-- **Getting started** — install, boot a first app, and learn how features, configuration and the CLI work.
-- **The basics** — routing, the request context, responses, middleware, and validation: the everyday request loop.
-- **Database** — models and relations, the query builder, the one `Backend` trait behind SQLite and Postgres, then the deeper seams: locks, JSON paths, search, embeddings, live queries, migrations, KV.
-- **Agents & realtime** — the introspection surface, tools, streaming, WebSockets, pubsub, channels, the durable queue, and actors.
-- **Framework services** — auth, sessions, mail, storage, event sourcing, templates, collections, crypto: opt-in pillars you reach for as needed.
-- **Architecture & operations** — hexagonal structure, testing, the REPL, what the server actually does per request, every tuning knob, the operational endpoints, deploying, and an honest security posture.
+- **Getting Started** — install, boot a first app, configure it, pick features, and ship it.
+- **Architecture Concepts** — what happens to a request, how the crates fit together, hexagonal structure, and non-HTTP listeners.
+- **The Basics** — routing, middleware, the request context, responses, templates, sessions, validation and logging: the everyday request loop.
+- **Digging Deeper** — the CLI and REPL, collections, event sourcing, mail, the durable queue, actors and file storage.
+- **Security** — authentication, the crypto primitives, and an honest security posture.
+- **Database** and **ORM** — the one `Backend` trait behind SQLite and Postgres, the query builder, migrations, then the deeper seams: locks, JSON paths, search, embeddings, live queries, KV; models and relations on top.
+- **AI Agents** and **Realtime** — the introspection surface and tools, then streaming, WebSockets, pubsub and channels.
+- **Testing** and **Operations** — testing in-process, every tuning knob, and the operational endpoints.
 
 > [!NOTE]
 > **Start here**

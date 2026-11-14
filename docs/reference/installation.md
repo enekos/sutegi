@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← The workspace map](crates.md) · [Documentation index](../README.md) · [Your first app →](first-app.md)
+[← Is it production-ready?](honesty.md) · [Documentation index](../README.md) · [Your first app →](first-app.md)
 
 # Installation
 
@@ -31,4 +31,4 @@ sutegi = { version = "0.13", features = ["sqlite", "graceful"] }
 
 ---
 
-[← The workspace map](crates.md) · [Documentation index](../README.md) · [Your first app →](first-app.md)
+[← Is it production-ready?](honesty.md) · [Documentation index](../README.md) · [Your first app →](first-app.md)

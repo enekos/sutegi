@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Channels & presence](channels.md) · [Documentation index](../README.md) · [Actors & supervision →](actors.md)
+[← Mail](mail.md) · [Documentation index](../README.md) · [Actors & supervision →](actors.md)
 
 # Queues
 
@@ -44,6 +44,32 @@ queue.stats()?; queue.stats_for("video")?;
 queue.cross_pod();                  // true on Postgres — the honest answer
 ```
 
+```mermaid
+stateDiagram-v2
+    [*] --> Ready: dispatch
+    [*] --> Scheduled: dispatch with delay
+    Scheduled --> Ready: run_at reached
+    Ready --> Running: claim sets attempts + 1 and locked_at
+    Running --> Running: heartbeat
+    Running --> [*]: Ok, row deleted
+    Running --> Scheduled: Err and attempts below max, run_at = now + backoff x attempts
+    Running --> Dead: Err or panic on the last attempt
+    Running --> LeaseExpired: no heartbeat within visibility_timeout
+    LeaseExpired --> Running: reclaimed by another worker
+    LeaseExpired --> Dead: next claim finds attempts at max, worker died
+    Dead --> Ready: retry(id) resets attempts
+    Dead --> [*]: purge_failed
+    Dead: Dead letter (failed_at set)
+    note right of LeaseExpired
+        heartbeat and settle are fenced on
+        attempts and locked_at: after a reclaim
+        the old worker matches no row and
+        its result is dropped.
+    end note
+```
+
+*A job row's lifecycle: the claim takes a lease, heartbeats and results are fenced on it, and failures retry with linear backoff until the row is a dead letter.*
+
 Claims are exclusive on both backends: `FOR UPDATE SKIP LOCKED` wherever `capabilities().skip_locked` says it exists, and on SQLite the serialized writer already provides it, since the second `UPDATE … RETURNING` no longer sees the claimed row. Postgres additionally makes that exclusivity *cross-pod*; `queue.cross_pod()` tells you which guarantee you actually have instead of letting the docs imply the stronger one.
 
 - **Named queues with their own pools** — `.queue("video")` plus `start_on("video", 1)`, so a slow job class cannot starve a fast one.
@@ -56,4 +82,4 @@ Timestamps are epoch milliseconds supplied by the caller rather than SQL `now()`
 
 ---
 
-[← Channels & presence](channels.md) · [Documentation index](../README.md) · [Actors & supervision →](actors.md)
+[← Mail](mail.md) · [Documentation index](../README.md) · [Actors & supervision →](actors.md)

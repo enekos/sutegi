@@ -11,76 +11,94 @@ Read the full website content here on GitHub. Start with the [overview](OVERVIEW
 - [Introduction](reference/introduction.md)
 - [Philosophy & the bet](reference/philosophy.md)
 - [Is it production-ready?](reference/honesty.md)
-- [The workspace map](reference/crates.md)
 
-## Getting started
+## Getting Started
 
 - [Installation](reference/installation.md)
 - [Your first app](reference/first-app.md)
-- [Feature flags](reference/features.md)
 - [Configuration](reference/configuration.md)
-- [Directory & conventions](reference/layout.md)
-- [The CLI](reference/cli.md)
+- [Feature flags](reference/features.md)
+- [Directory structure](reference/layout.md)
+- [Deployment](reference/deploying.md)
 
-## The basics
+## Architecture Concepts
+
+- [Request lifecycle](reference/internals.md)
+- [The workspace map](reference/crates.md)
+- [Hexagonal architecture](reference/hexagonal.md) · [deep dive](HEXAGONAL.md)
+- [Listeners](reference/listeners.md) · [deep dive](LISTENERS.md)
+
+## The Basics
 
 - [Routing](reference/routing.md)
+- [Middleware, CORS & guards](reference/middleware.md)
 - [Requests & the Ctx](reference/requests.md)
 - [Responses & errors](reference/responses.md)
-- [Middleware, CORS & guards](reference/middleware.md)
+- [Templates](reference/templates.md)
+- [Sessions & CSRF](reference/sessions.md)
 - [Validation](reference/validation.md)
 - [Static files](reference/static.md)
+- [Logging](reference/logging.md) · [deep dive](LOGGING.md)
+
+## Digging Deeper
+
+- [The CLI](reference/cli.md)
+- [The REPL](reference/repl.md)
+- [Collections](reference/collections.md)
+- [Event sourcing](reference/events.md)
+- [Mail](reference/mail.md)
+- [Queues](reference/queues.md)
+- [Actors & supervision](reference/actors.md) · [deep dive](ACTORS.md)
+- [File storage](reference/storage.md)
+
+## Security
+
+- [Authentication](reference/auth.md)
+- [Crypto primitives](reference/crypto.md)
+- [Security posture](reference/security.md)
 
 ## Database
 
-- [Models](reference/models.md)
-- [Relations](reference/relations.md)
-- [The query builder](reference/queries.md)
 - [Backends & capabilities](reference/backend.md)
-- [Locks, isolation, bulk](reference/concurrency.md)
-- [Advisory locks](reference/advisory.md)
-- [JSON path queries](reference/json.md)
-- [Full-text & hybrid search](reference/search.md)
+- [The query builder](reference/queries.md)
+- [Migrations](reference/migrations.md) · [deep dive](MIGRATIONS.md)
+- [Locks, isolation, bulk](reference/concurrency.md) · [deep dive](CONCURRENCY.md)
+- [Advisory locks](reference/advisory.md) · [deep dive](LOCKS.md)
+- [JSON path queries](reference/json.md) · [deep dive](JSON.md)
+- [Full-text & hybrid search](reference/search.md) · [deep dive](SEARCH.md)
 - [Embeddings & vectors](reference/vectors.md)
-- [Reactive queries](reference/reactive.md)
-- [Migrations](reference/migrations.md)
+- [Reactive queries](reference/reactive.md) · [deep dive](REACTIVE.md)
 - [The key/value store](reference/kv.md)
 
-## Agents & realtime
+## ORM
+
+- [Models](reference/models.md)
+- [Relations](reference/relations.md)
+
+## AI Agents
 
 - [The agent surface](reference/agents.md)
 - [Defining tools](reference/tools.md)
+
+## Realtime
+
 - [Streaming & SSE](reference/streaming.md)
-- [WebSockets](reference/websockets.md)
-- [PubSub](reference/pubsub.md)
-- [Channels & presence](reference/channels.md)
-- [Queues](reference/queues.md)
-- [Actors & supervision](reference/actors.md)
+- [WebSockets](reference/websockets.md) · [deep dive](REALTIME.md)
+- [PubSub](reference/pubsub.md) · [deep dive](REALTIME.md)
+- [Channels & presence](reference/channels.md) · [deep dive](REALTIME.md)
 
-## Framework services
+## Testing
 
-- [Authentication](reference/auth.md)
-- [Sessions & CSRF](reference/sessions.md)
-- [Mail](reference/mail.md)
-- [File storage](reference/storage.md)
-- [Event sourcing](reference/events.md)
-- [Templates](reference/templates.md)
-- [Collections](reference/collections.md)
-- [Crypto primitives](reference/crypto.md)
-
-## Architecture & operations
-
-- [Hexagonal architecture](reference/hexagonal.md)
 - [Testing](reference/testing.md)
-- [The REPL](reference/repl.md)
-- [Inside the server](reference/internals.md)
-- [Listeners](reference/listeners.md)
+
+## Operations
+
 - [Tuning & limits](reference/options.md)
 - [Operational endpoints](reference/ops.md)
-- [Deploying](reference/deploying.md)
-- [Security posture](reference/security.md)
 
-## In-depth guides
+## Deep dives
+
+Long-form guides, maintained by hand and linked from the reference page they extend.
 
 - [Actors & supervision](ACTORS.md)
 - [Concurrency & throughput](CONCURRENCY.md)
@@ -105,4 +123,6 @@ pnpm docs:export
 pnpm docs:check
 ```
 
-Commit the regenerated Markdown with the source change. The existing in-depth guides are maintained directly.
+Commit the regenerated Markdown with the source change. The deep dives are maintained directly.
+
+Diagrams are Mermaid. On the website, a `const dName` string in `Docs.svelte` is placed with `{@render diagram(dName, 'caption')}` and rendered in the browser; the export writes it as a ` ```mermaid ` fence, which GitHub renders. In the deep dives, write the fence directly.
