@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Relations](relations.md) · [Documentation index](../README.md) · [Backends & capabilities →](backend.md)
+[← Backends & capabilities](backend.md) · [Documentation index](../README.md) · [Migrations →](migrations.md)
 
 # The query builder
 
@@ -46,6 +46,24 @@ let rows = db.query("SELECT count(*) AS n FROM todos WHERE done = ?", &[true.int
 
 `QueryBuilder`, `UpdateBuilder` and `DeleteBuilder` can also be used directly against a table name when there is no model, and `build()` hands you the `(sql, params)` pair — which is why the core ships no driver at all and the default binary stays tiny.
 
+```mermaid
+flowchart TD
+  Q["Model::query() or QueryBuilder::table()"] --> S["Backend::select(qb)"]
+  S --> G{"JSON used and caps.json_path off?"}
+  G -- yes --> E1["Err: unsupported json_path"]
+  G -- no --> B["qb.build_for(dialect)"]
+  B -- "bad identifier, operator or path" --> E2["Err from the builder"]
+  B -- ok --> P["SQL with ? placeholders + bound params"]
+  P --> L{"row lock requested?"}
+  L -- yes --> R["append FOR UPDATE / FOR SHARE per caps, or Err"]
+  L -- no --> X["Backend::query(sql, params)"]
+  R --> X
+  X --> D1["SQLite: ? bound natively"]
+  X --> D2["Postgres: ? rewritten to $1..$n"]
+```
+
+*The builder only stores the request; Backend::select gates on capabilities, compiles for its dialect, adds row locks, then binds the parameters.*
+
 ---
 
-[← Relations](relations.md) · [Documentation index](../README.md) · [Backends & capabilities →](backend.md)
+[← Backends & capabilities](backend.md) · [Documentation index](../README.md) · [Migrations →](migrations.md)

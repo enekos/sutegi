@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Configuration](configuration.md) · [Documentation index](../README.md) · [The CLI →](cli.md)
+[← Feature flags](features.md) · [Documentation index](../README.md) · [Deployment →](deploying.md)
 
 # Directory & conventions
 
@@ -13,4 +13,4 @@ A minimal app is a single `main.rs`. As it grows, the conventional layout separa
 
 ---
 
-[← Configuration](configuration.md) · [Documentation index](../README.md) · [The CLI →](cli.md)
+[← Feature flags](features.md) · [Documentation index](../README.md) · [Deployment →](deploying.md)

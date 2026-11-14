@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← The query builder](queries.md) · [Documentation index](../README.md) · [Locks, isolation, bulk →](concurrency.md)
+[← Security posture](security.md) · [Documentation index](../README.md) · [The query builder →](queries.md)
 
 # Backends & capabilities
 
@@ -27,9 +27,59 @@ db.transact(|tx| { tx.insert("todos", &[("title", "x".into())], "id")?; Ok(()) }
 
 The trait is small — five required primitives (`query`, `execute`, `insert`, `upsert`, `migrate`) — and everything else (`select`, `count`, `paginate`, transactions, locks, bulk insert…) is a default method implemented once on top. It is object-safe, so `&dyn Backend` works; the typed helpers are `Self: Sized`-gated.
 
+```mermaid
+classDiagram
+  class Backend {
+    <<trait>>
+    +query(sql, params) rows
+    +execute(sql, params) usize
+    +insert(table, cols, pk) i64
+    +upsert(table, cols, conflict, pk) i64
+    +migrate(schema)
+    +capabilities() BackendCaps
+    +defaults: select, count, paginate, insert_many, try_lock, lock
+  }
+  class Transactional {
+    <<trait>>
+    +run_in_tx(f)
+    +run_in_tx_with(isolation, f)
+  }
+  class BackendCaps {
+    +advisory_locks CapScope
+    +live_queries CapScope
+    +row_locks, skip_locked, bulk_copy bool
+    +json_path, json_contains, fts, vector bool
+  }
+  class Db {
+    sqlite feature
+    +try_lock via a process-wide registry
+  }
+  class Pg {
+    postgres feature
+    +try_lock via a dedicated session
+    +insert_many via COPY FROM STDIN
+  }
+  class PgTx {
+    +try_lock via xact lock, freed at COMMIT
+  }
+  class SqliteTx {
+    caps: no locks, no isolation
+  }
+  Backend <|-- Transactional
+  Backend <|.. Db
+  Backend <|.. Pg
+  Backend <|.. PgTx
+  Backend <|.. SqliteTx
+  Transactional <|.. Db
+  Transactional <|.. Pg
+  Backend ..> BackendCaps : capabilities()
+```
+
+*Five required primitives plus capabilities(); each store, and each transaction handle, overrides only what it does differently.*
+
 ## Where the engines differ, a bit says so
 
-Some things genuinely cannot be papered over. `Backend::capabilities()` returns a `BackendCaps` descriptor — the honest default is everything off, so a backend never advertises what it has not implemented — and a gated call returns `unsupported: <cap> is not available on <backend>` before any SQL is sent. `App::register_capabilities(db.capabilities())` publishes the block in `/__introspect`, so an agent reads what the store can do instead of finding out from a dialect error.
+Some things genuinely cannot be papered over. `Backend::capabilities()` returns a `BackendCaps` descriptor — the honest default is everything off, so a backend never advertises what it has not implemented — and a gated call returns `unsupported: <cap> is not available on the <backend> backend` before any SQL is sent. `App::register_capabilities(db.capabilities())` publishes the block in `/__introspect`, so an agent reads what the store can do instead of finding out from a dialect error.
 
 ```rust
 // Ask the store what it can do — never find out from a dialect SQL error.
@@ -49,7 +99,7 @@ App::new("api")
     .serve()
 
 // Gated features return one uniform error instead of leaking dialect SQL:
-// Err("unsupported: json_contains is not available on sqlite")
+// Err("unsupported: json_contains is not available on the sqlite backend")
 ```
 
 | Capability | SQLite | Postgres |
@@ -70,4 +120,4 @@ A capability describes the *framework* surface, not the underlying C library: bu
 
 ---
 
-[← The query builder](queries.md) · [Documentation index](../README.md) · [Locks, isolation, bulk →](concurrency.md)
+[← Security posture](security.md) · [Documentation index](../README.md) · [The query builder →](queries.md)

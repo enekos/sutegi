@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Installation](installation.md) · [Documentation index](../README.md) · [Feature flags →](features.md)
+[← Installation](installation.md) · [Documentation index](../README.md) · [Configuration →](configuration.md)
 
 # Your first app
 
@@ -38,4 +38,4 @@ curl -H 'Authorization: Bearer dev-token' localhost:8080/__introspect
 
 ---
 
-[← Installation](installation.md) · [Documentation index](../README.md) · [Feature flags →](features.md)
+[← Installation](installation.md) · [Documentation index](../README.md) · [Configuration →](configuration.md)

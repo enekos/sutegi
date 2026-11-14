@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Middleware, CORS & guards](middleware.md) · [Documentation index](../README.md) · [Static files →](static.md)
+[← Sessions & CSRF](sessions.md) · [Documentation index](../README.md) · [Static files →](static.md)
 
 # Validation
 
@@ -46,4 +46,4 @@ The rule set covers the everyday cases: `Required`, type rules (`Str`, `Integer`
 
 ---
 
-[← Middleware, CORS & guards](middleware.md) · [Documentation index](../README.md) · [Static files →](static.md)
+[← Sessions & CSRF](sessions.md) · [Documentation index](../README.md) · [Static files →](static.md)

@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Migrations](migrations.md) · [Documentation index](../README.md) · [The agent surface →](agents.md)
+[← Reactive queries](reactive.md) · [Documentation index](../README.md) · [Models →](models.md)
 
 # The key/value store
 
@@ -36,4 +36,4 @@ On a single SQLite node it is the natural home for config and flags; on Postgres
 
 ---
 
-[← Migrations](migrations.md) · [Documentation index](../README.md) · [The agent surface →](agents.md)
+[← Reactive queries](reactive.md) · [Documentation index](../README.md) · [Models →](models.md)

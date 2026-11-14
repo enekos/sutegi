@@ -47,9 +47,9 @@ tool instead of finding out from an error.
 GET /__tools
 ```
 
-Returns an array of `{ name, description, input_schema }` — the exact shape
-expected by LLM tool-calling APIs (Anthropic-style). Feed it straight into your
-tool definitions.
+Returns an array of `{ name, description, input_schema, streaming }` — the
+shape expected by LLM tool-calling APIs (Anthropic-style) plus a `streaming`
+flag (see §4). Feed it straight into your tool definitions.
 
 ## 3. Invoke a tool
 
@@ -64,7 +64,9 @@ Content-Type: application/json
 - `422 { "error": "validation failed", "errors": { "<field>": ["..."] } }` →
   arguments failed the tool's JSON Schema (type, `required`, `enum`, bounds).
   The `errors` map is keyed by dotted field path — fix those fields and retry.
-- `404 { "error": "unknown tool '<name>'" }` → no such tool.
+  (Only when the app is built with the `validate` feature.)
+- `404 { "error": "unknown tool '<name>'" }` → no such unary tool. A streaming
+  tool posted here also answers `404`; use `/__tools/<name>/stream`.
 - `400 { "error": "..." }` → the body was not valid JSON.
 - `415 { "error": "..." }` → a non-empty body without `Content-Type:
   application/json` (or `+json`).
@@ -82,7 +84,8 @@ Content-Type: application/json
 ```
 
 - Response is `text/event-stream`; read it incrementally. Frames look like
-  `data: <chunk>\n\n`, with a final `event: done` frame.
+  `data: <chunk>\n\n`. Tools conventionally end with an `event: done` frame;
+  the framework does not add one, so also treat the socket closing as the end.
 - Validation still runs first: a bad argument object returns a normal JSON
   `422` *before* the stream opens, so you can distinguish "rejected" from
   "stream ended".

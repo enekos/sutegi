@@ -31,6 +31,27 @@ App::new("todo")
 // POST /__tools/stream_answer/stream -> the SSE variant
 ```
 
+```mermaid
+flowchart TD
+  REQ["POST /__tools/name"] --> OG{"ops_guard passes?"}
+  OG -->|"no"| EG["the guard's 401 or 403 (403 when unset)"]
+  OG -->|"yes"| MW{"global middleware passes?"}
+  MW -->|"no"| EM["the middleware's response"]
+  MW -->|"yes"| CT{"content-type JSON, or no body?"}
+  CT -->|"no"| E415["415"]
+  CT -->|"yes"| PJ{"body parses as JSON?"}
+  PJ -->|"no"| E400["400"]
+  PJ -->|"yes"| FIND{"unary tool with this name?"}
+  FIND -->|"no, streaming tools included"| E404["404 unknown tool"]
+  FIND -->|"yes"| VAL{"args match input_schema?"}
+  VAL -->|"no"| E422["422 with errors by field path"]
+  VAL -->|"yes"| RUN["closure(ctx, args)"]
+  RUN -->|"Ok"| OK["200 JSON result"]
+  RUN -->|"Err"| ERR["the error's own status"]
+```
+
+*Each check a unary tool call passes, and the status it returns when it fails (the 422 schema check needs the validate feature).*
+
 A tool and an HTTP route can — and usually should — be two adapters over one [use case](hexagonal.md). Write the logic once; expose it to both audiences.
 
 ---

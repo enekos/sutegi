@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Collections](collections.md) · [Documentation index](../README.md) · [Hexagonal architecture →](hexagonal.md)
+[← Authentication](auth.md) · [Documentation index](../README.md) · [Security posture →](security.md)
 
 # Crypto primitives
 
@@ -41,4 +41,4 @@ The choices are deliberate: ChaCha20-Poly1305 over AES because add-rotate-xor is
 
 ---
 
-[← Collections](collections.md) · [Documentation index](../README.md) · [Hexagonal architecture →](hexagonal.md)
+[← Authentication](auth.md) · [Documentation index](../README.md) · [Security posture →](security.md)

@@ -1,11 +1,13 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
-  import { Flame, GitBranch, ArrowLeft, ArrowRight, Menu, X } from 'lucide-svelte';
+  import { onMount, tick } from 'svelte';
+  import { Flame, GitBranch, ArrowLeft, ArrowRight, Menu, X, Search, FileText, BookOpen } from 'lucide-svelte';
 
-  // Section to scroll to on load / hash change (from #/docs/<section>)
-  let { section = '' }: { section?: string } = $props();
+  // #/docs/<section>[/<anchor>]: the page to show, and a heading on it.
+  let { section = '', anchor = '' }: { section?: string; anchor?: string } = $props();
 
   // --- sidebar structure (Laravel-style grouped nav) ---
+  // One page per item. `deep` names the hand-written long-form guide in docs/
+  // that the page links to at its foot.
   const nav = [
     {
       group: 'Prologue',
@@ -13,112 +15,247 @@
         { id: 'introduction', title: 'Introduction' },
         { id: 'philosophy', title: 'Philosophy & the bet' },
         { id: 'honesty', title: 'Is it production-ready?' },
-        { id: 'crates', title: 'The workspace map' },
       ],
     },
     {
-      group: 'Getting started',
+      group: 'Getting Started',
       items: [
         { id: 'installation', title: 'Installation' },
         { id: 'first-app', title: 'Your first app' },
-        { id: 'features', title: 'Feature flags' },
         { id: 'configuration', title: 'Configuration' },
-        { id: 'layout', title: 'Directory & conventions' },
-        { id: 'cli', title: 'The CLI' },
+        { id: 'features', title: 'Feature flags' },
+        { id: 'layout', title: 'Directory structure' },
+        { id: 'deploying', title: 'Deployment' },
       ],
     },
     {
-      group: 'The basics',
+      group: 'Architecture Concepts',
+      items: [
+        { id: 'internals', title: 'Request lifecycle' },
+        { id: 'crates', title: 'The workspace map' },
+        { id: 'hexagonal', title: 'Hexagonal architecture', deep: 'HEXAGONAL.md' },
+        { id: 'listeners', title: 'Listeners', deep: 'LISTENERS.md' },
+      ],
+    },
+    {
+      group: 'The Basics',
       items: [
         { id: 'routing', title: 'Routing' },
+        { id: 'middleware', title: 'Middleware, CORS & guards' },
         { id: 'requests', title: 'Requests & the Ctx' },
         { id: 'responses', title: 'Responses & errors' },
-        { id: 'middleware', title: 'Middleware, CORS & guards' },
+        { id: 'templates', title: 'Templates' },
+        { id: 'sessions', title: 'Sessions & CSRF' },
         { id: 'validation', title: 'Validation' },
         { id: 'static', title: 'Static files' },
+        { id: 'logging', title: 'Logging', deep: 'LOGGING.md' },
+      ],
+    },
+    {
+      group: 'Digging Deeper',
+      items: [
+        { id: 'cli', title: 'The CLI' },
+        { id: 'repl', title: 'The REPL' },
+        { id: 'collections', title: 'Collections' },
+        { id: 'events', title: 'Event sourcing' },
+        { id: 'mail', title: 'Mail' },
+        { id: 'queues', title: 'Queues' },
+        { id: 'actors', title: 'Actors & supervision', deep: 'ACTORS.md' },
+        { id: 'storage', title: 'File storage' },
+      ],
+    },
+    {
+      group: 'Security',
+      items: [
+        { id: 'auth', title: 'Authentication' },
+        { id: 'crypto', title: 'Crypto primitives' },
+        { id: 'security', title: 'Security posture' },
       ],
     },
     {
       group: 'Database',
       items: [
-        { id: 'models', title: 'Models' },
-        { id: 'relations', title: 'Relations' },
-        { id: 'queries', title: 'The query builder' },
         { id: 'backend', title: 'Backends & capabilities' },
-        { id: 'concurrency', title: 'Locks, isolation, bulk' },
-        { id: 'advisory', title: 'Advisory locks' },
-        { id: 'json', title: 'JSON path queries' },
-        { id: 'search', title: 'Full-text & hybrid search' },
+        { id: 'queries', title: 'The query builder' },
+        { id: 'migrations', title: 'Migrations', deep: 'MIGRATIONS.md' },
+        { id: 'concurrency', title: 'Locks, isolation, bulk', deep: 'CONCURRENCY.md' },
+        { id: 'advisory', title: 'Advisory locks', deep: 'LOCKS.md' },
+        { id: 'json', title: 'JSON path queries', deep: 'JSON.md' },
+        { id: 'search', title: 'Full-text & hybrid search', deep: 'SEARCH.md' },
         { id: 'vectors', title: 'Embeddings & vectors' },
-        { id: 'reactive', title: 'Reactive queries' },
-        { id: 'migrations', title: 'Migrations' },
+        { id: 'reactive', title: 'Reactive queries', deep: 'REACTIVE.md' },
         { id: 'kv', title: 'The key/value store' },
       ],
     },
     {
-      group: 'Agents & realtime',
+      group: 'ORM',
+      items: [
+        { id: 'models', title: 'Models' },
+        { id: 'relations', title: 'Relations' },
+      ],
+    },
+    {
+      group: 'AI Agents',
       items: [
         { id: 'agents', title: 'The agent surface' },
         { id: 'tools', title: 'Defining tools' },
+      ],
+    },
+    {
+      group: 'Realtime',
+      items: [
         { id: 'streaming', title: 'Streaming & SSE' },
-        { id: 'websockets', title: 'WebSockets' },
-        { id: 'pubsub', title: 'PubSub' },
-        { id: 'channels', title: 'Channels & presence' },
-        { id: 'queues', title: 'Queues' },
-        { id: 'actors', title: 'Actors & supervision' },
+        { id: 'websockets', title: 'WebSockets', deep: 'REALTIME.md' },
+        { id: 'pubsub', title: 'PubSub', deep: 'REALTIME.md' },
+        { id: 'channels', title: 'Channels & presence', deep: 'REALTIME.md' },
       ],
     },
     {
-      group: 'Framework services',
+      group: 'Testing',
       items: [
-        { id: 'auth', title: 'Authentication' },
-        { id: 'sessions', title: 'Sessions & CSRF' },
-        { id: 'mail', title: 'Mail' },
-        { id: 'storage', title: 'File storage' },
-        { id: 'events', title: 'Event sourcing' },
-        { id: 'templates', title: 'Templates' },
-        { id: 'collections', title: 'Collections' },
-        { id: 'crypto', title: 'Crypto primitives' },
-      ],
-    },
-    {
-      group: 'Architecture & operations',
-      items: [
-        { id: 'hexagonal', title: 'Hexagonal architecture' },
         { id: 'testing', title: 'Testing' },
-        { id: 'repl', title: 'The REPL' },
-        { id: 'internals', title: 'Inside the server' },
-        { id: 'listeners', title: 'Listeners' },
+      ],
+    },
+    {
+      group: 'Operations',
+      items: [
         { id: 'options', title: 'Tuning & limits' },
         { id: 'ops', title: 'Operational endpoints' },
-        { id: 'deploying', title: 'Deploying' },
-        { id: 'security', title: 'Security posture' },
       ],
     },
   ];
+  const topics = nav.flatMap((g) => g.items.map((it) => ({ ...it, group: g.group })));
+  const ghBlob = 'https://github.com/enekos/sutegi/blob/master/';
 
-  // --- scrollspy ---
-  let active = $state('introduction');
-  onMount(() => {
-    const io = new IntersectionObserver(
-      (entries) => entries.forEach((e) => { if (e.isIntersecting) active = e.target.id; }),
-      { rootMargin: '-10% 0px -80% 0px', threshold: 0 },
-    );
-    document.querySelectorAll('article[id]').forEach((el) => io.observe(el));
-    return () => io.disconnect();
+  // --- one page per topic ---
+  // Every article stays in the markup (the Markdown export reads them all);
+  // only the current one is shown.
+  const current = $derived(topics.some((t) => t.id === section) ? section : 'introduction');
+  const index = $derived(topics.findIndex((t) => t.id === current));
+  const page = $derived(topics[index]);
+  const prev = $derived(topics[index - 1]);
+  const next = $derived(topics[index + 1]);
+
+  // "On this page": the current article's h3s, given stable ids.
+  const slug = (t: string) => t.toLowerCase().replace(/&/g, 'and').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  let toc = $state<{ id: string; text: string }[]>([]);
+  let activeHeading = $state('');
+
+  $effect(() => {
+    const id = current;
+    const target = anchor;
+    let io: IntersectionObserver | undefined;
+    tick().then(() => {
+      document.querySelectorAll('article[id]').forEach((el) => el.classList.toggle('is-active', el.id === id));
+      const article = document.getElementById(id);
+      if (!article) return;
+      const hs = [...article.querySelectorAll('h3')];
+      toc = hs.map((h) => {
+        h.id ||= slug(h.textContent ?? '');
+        return { id: h.id, text: h.textContent ?? '' };
+      });
+      activeHeading = '';
+      io = new IntersectionObserver(
+        (entries) => entries.forEach((e) => { if (e.isIntersecting) activeHeading = e.target.id; }),
+        { rootMargin: '-10% 0px -75% 0px', threshold: 0 },
+      );
+      hs.forEach((h) => io!.observe(h));
+      const el = target && article.querySelector(`[id="${target}"]`);
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      else window.scrollTo({ top: 0 });
+      document.querySelector('aside a[aria-current="page"]')?.scrollIntoView({ block: 'nearest' });
+      renderDiagrams(article);
+    });
+    return () => io?.disconnect();
   });
 
-  // --- deep-link scroll (#/docs/<section>) ---
-  function scrollToSection(id: string) {
-    const el = document.getElementById(id);
-    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    else window.scrollTo({ top: 0 });
+  // --- Mermaid, loaded on first use from a pinned CDN build ---
+  // Kept out of the single-file bundle: most pages have no diagram, and the
+  // source stays readable in the <pre> if the CDN is unreachable.
+  const MERMAID = 'https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs';
+  let mermaid: Promise<any> | undefined;
+  function renderDiagrams(root: HTMLElement) {
+    const nodes = [...root.querySelectorAll<HTMLElement>('pre.mermaid:not([data-processed])')];
+    if (!nodes.length) return;
+    mermaid ??= import(/* @vite-ignore */ MERMAID).then(({ default: m }) => {
+      m.initialize({
+        startOnLoad: false,
+        securityLevel: 'strict',
+        theme: 'base',
+        fontFamily: 'JetBrains Mono, monospace',
+        themeVariables: {
+          darkMode: true,
+          background: '#0b0a10',
+          fontSize: '13px',
+          primaryColor: '#1a1822',
+          primaryTextColor: '#e6e6eb',
+          primaryBorderColor: '#ff6a3d',
+          secondaryColor: '#15141c',
+          tertiaryColor: '#13121a',
+          lineColor: '#8a8a9a',
+          textColor: '#c8c8d4',
+          mainBkg: '#1a1822',
+          nodeBorder: '#ff6a3d',
+          clusterBkg: '#111018',
+          clusterBorder: '#2e2c38',
+          edgeLabelBackground: '#0b0a10',
+          actorBkg: '#1a1822',
+          actorBorder: '#ff6a3d',
+          actorTextColor: '#e6e6eb',
+          actorLineColor: '#4a4858',
+          signalColor: '#c8c8d4',
+          signalTextColor: '#e6e6eb',
+          labelBoxBkgColor: '#1a1822',
+          labelBoxBorderColor: '#ff6a3d',
+          labelTextColor: '#e6e6eb',
+          loopTextColor: '#c8c8d4',
+          noteBkgColor: '#241a14',
+          noteBorderColor: '#ff6a3d',
+          noteTextColor: '#e6e6eb',
+          activationBkgColor: '#2a2230',
+          activationBorderColor: '#ff6a3d',
+        },
+      });
+      return m;
+    });
+    mermaid.then((m) => m.run({ nodes })).catch(() => {});
   }
+
+  // --- search: titles first, then page text ---
+  let query = $state('');
+  let searchEl: HTMLInputElement | undefined = $state();
+  let text: Record<string, string> = {};
   onMount(() => {
-    if (section) setTimeout(() => scrollToSection(section), 40);
-    else window.scrollTo({ top: 0 });
+    document.querySelectorAll('article[id]').forEach((el) => (text[el.id] = (el.textContent ?? '').toLowerCase()));
+    const key = (e: KeyboardEvent) => {
+      const typing = e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement;
+      if ((e.key === 'k' && (e.metaKey || e.ctrlKey)) || (e.key === '/' && !typing)) {
+        e.preventDefault();
+        menuOpen = true;
+        searchEl?.focus();
+      }
+    };
+    window.addEventListener('keydown', key);
+    return () => window.removeEventListener('keydown', key);
   });
-  $effect(() => { if (section) scrollToSection(section); });
+  const shown = $derived.by(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return nav;
+    return nav
+      .map((g) => ({ ...g, items: g.items.filter((it) => it.title.toLowerCase().includes(q) || text[it.id]?.includes(q)) }))
+      .filter((g) => g.items.length);
+  });
+  function pick(e: KeyboardEvent) {
+    if (e.key === 'Enter' && shown[0]) {
+      window.location.hash = `#/docs/${shown[0].items[0].id}`;
+      query = '';
+      menuOpen = false;
+      searchEl?.blur();
+    } else if (e.key === 'Escape') {
+      query = '';
+      searchEl?.blur();
+    }
+  }
 
   // --- mobile sidebar ---
   let menuOpen = $state(false);
@@ -132,6 +269,631 @@
   }
 
   // --- code samples (strings so braces stay literal) ---
+  const dWsUpgrade = `sequenceDiagram
+    participant C as Client
+    participant W as HTTP worker thread
+    participant R as WsRuntime
+    participant S as Reactor shard thread
+    C->>W: GET /ws with Upgrade: websocket
+    W->>W: check handshake, Origin, authorize, has_capacity
+    alt refused before the 101
+        W-->>C: 400, 403, 426 or 503
+    else accepted
+        W-->>C: 101 Switching Protocols
+        W->>R: takeover(socket, pipelined bytes)
+        R->>R: reserve slot (global and per-IP caps)
+        R->>S: inject Adopt (round-robin) and wake the shard
+        Note over W: worker goes back to serving HTTP
+        S->>S: non-blocking, register fd with kqueue or epoll
+        S->>S: on_open, then parse pipelined frames
+        C->>S: frames
+        S->>S: on_message inline, per-connection order
+        S-->>C: queued frames (dropped past max_buffered)
+    end`;
+
+  const dPubsubFanout = `flowchart LR
+    subgraph PodA["Pod A"]
+        P["publish(topic, msg)"] --> LA["local subscribers on A (synchronous)"]
+        P --> Q["bounded queue (full: dropped)"]
+        Q --> PUB["publisher thread"]
+        LSA["listener thread A"]
+    end
+    PUB -->|"pg_notify with envelope (instance, topic, msg)"| PG[("Postgres channel sutegi_pubsub")]
+    PG -->|"NOTIFY"| LSA
+    PG -->|"NOTIFY"| LSB
+    LSA --> SKIP["own instance id: echo skipped"]
+    subgraph PodB["Pod B"]
+        LSB["listener thread B"] --> LB["local subscribers on B"]
+    end`;
+
+  const dChannelsJoin = `sequenceDiagram
+    participant C as Client
+    participant H as ChannelHub on the shard
+    participant CB as Channel callbacks
+    participant B as Broker
+    participant O as Other members
+    C->>H: stg:join room:1 with payload
+    H->>CB: on_join(socket, payload)
+    CB-->>H: Ok(response)
+    H->>B: subscribe stg:chan:room:1 (first member on this pod)
+    H-->>C: stg:reply ok
+    H->>CB: after_join callbacks, e.g. Presence::track
+    CB->>B: presence join diff, for other pods
+    CB-->>O: presence_diff to local members
+    CB-->>C: presence_diff, then presence_state
+    C->>H: new_msg with payload
+    H->>CB: on("new_msg")
+    CB->>B: socket.broadcast publishes to stg:chan:room:1
+    B->>H: deliver on this pod and on every subscribed pod
+    H-->>C: new_msg frame
+    H-->>O: same shared frame, one inject per shard`;
+
+  const dQueueLifecycle = `stateDiagram-v2
+    [*] --> Ready: dispatch
+    [*] --> Scheduled: dispatch with delay
+    Scheduled --> Ready: run_at reached
+    Ready --> Running: claim sets attempts + 1 and locked_at
+    Running --> Running: heartbeat
+    Running --> [*]: Ok, row deleted
+    Running --> Scheduled: Err and attempts below max, run_at = now + backoff x attempts
+    Running --> Dead: Err or panic on the last attempt
+    Running --> LeaseExpired: no heartbeat within visibility_timeout
+    LeaseExpired --> Running: reclaimed by another worker
+    LeaseExpired --> Dead: next claim finds attempts at max, worker died
+    Dead --> Ready: retry(id) resets attempts
+    Dead --> [*]: purge_failed
+    Dead: Dead letter (failed_at set)
+    note right of LeaseExpired
+        heartbeat and settle are fenced on
+        attempts and locked_at: after a reclaim
+        the old worker matches no row and
+        its result is dropped.
+    end note`;
+
+  const dActorsSupervision = `flowchart TD
+    X["child thread exits: panic caught, or stopped"] --> E["Exit with id, generation, reason sent to the supervisor"]
+    E --> S{"stale generation?"}
+    S -->|yes| IG["ignored"]
+    S -->|no| P{"restart policy"}
+    P -->|"Temporary, or Transient after a clean stop"| DOWN["child stays down"]
+    P -->|"Permanent, or Transient after a crash"| I{"more than max restarts in window?"}
+    I -->|yes| FAIL["stop every child in reverse order, supervisor Failed"]
+    I -->|no| BO["sleep the child's backoff"]
+    BO --> ST{"strategy"}
+    ST -->|OneForOne| R1["the exited child"]
+    ST -->|RestForOne| R2["it and every later sibling"]
+    ST -->|OneForAll| R3["every child"]
+    R1 & R2 & R3 --> RS["stop the set in reverse order, restart in start order from the factory"]`;
+
+  const dEventsFlow = `sequenceDiagram
+    participant H as Command handler
+    participant S as EventStore
+    participant DB as sutegi_events
+    participant P as Projection worker
+    participant RM as Read model tables
+    H->>S: load(stream)
+    S->>DB: read the stream in version order
+    S-->>H: state folded by Aggregate::apply, and version v
+    H->>H: decide
+    H->>S: append(stream, Expected::Version(v), events)
+    S->>DB: one transaction: lock, check version, insert at head + 1
+    alt stream moved past v
+        S-->>H: EventError::Conflict, reload and re-decide
+    else another append took the position
+        S->>S: retry with quadratic backoff
+    end
+    S-->>H: new version
+    loop every poll_interval, or on wake()
+        P->>DB: lock checkpoint row, read events after it
+        P->>RM: handler(event, tx) for each event
+        P->>DB: advance checkpoint and commit, same transaction
+    end
+    Note over P,RM: a handler Err rolls back the batch and the checkpoint holds`;
+
+  const dStorageSeam = `flowchart TD
+    APP["your code"] --> ST{"Storage trait"}
+    ST --> FS["FsStorage: local directory"]
+    ST --> DBS["DbStorage: blobs in SQLite or Postgres"]
+    ST --> S3S["S3Storage"]
+    S3S -->|"sign with SigV4 and the real payload hash"| S3["S3Store"]
+    S3S -->|"signed HttpRequest"| HT{"HttpTransport trait"}
+    HT --> CURL["SystemCurl: https via the system curl"]
+    HT --> PH["PlainHttp: pure std, refuses https"]
+    HT --> OWN["your HTTP client"]
+    CURL & PH & OWN --> BUCKET[("bucket: S3, R2, MinIO, Garage")]
+    APP -->|"presign"| S3
+    CLIENT["browser or agent"] -->|"PUT or GET the presigned URL"| BUCKET`;
+
+  const dOpsGate = `flowchart TD
+    REQ["request"] --> H{"path is /__health?"}
+    H -->|yes| H200["200 ok"]
+    H -->|no| RD{"path is /__ready?"}
+    RD -->|yes| PR{"readiness probe passes, or none set?"}
+    PR -->|yes| R200["200 ready"]
+    PR -->|no| R503["503 not ready"]
+    RD -->|no| OPS{"first path segment starts with __?"}
+    OPS -->|no| MW["global middleware, then routes"]
+    OPS -->|yes| G{"ops_guard set?"}
+    G -->|yes| GR{"guard returns a response?"}
+    GR -->|yes| DENY["that response, e.g. 401"]
+    GR -->|no| MW2["global middleware, then /__metrics, /__introspect, /__ routes"]
+    G -->|no| PUBQ{"ops_public?"}
+    PUBQ -->|yes| MW2
+    PUBQ -->|no| F403["403 ops surface closed"]`;
+
+  const dDeployShape = `flowchart LR
+    subgraph Compose["ontzi up N: Docker Compose"]
+        LB["nginx lb on :8080"] -->|"/ with proxy_buffering off"| A1["app replica 1"]
+        LB -->|"/ with proxy_buffering off"| AN["app replica N"]
+        LB -->|"/__health and /__ready"| A1
+        LB --> NF["any other /__ path: 404 at the LB"]
+    end
+    subgraph K8s["ontzi k8s apply: deploy/k8s"]
+        SVC["Service :80"] --> POD["pod :8080, 3 replicas"]
+        KL["kubelet"] -->|"liveness /__health"| POD
+        KL -->|"readiness /__ready"| POD
+        KL -->|"SIGTERM, 30s grace: stop accepting, drain"| POD
+        PROM["Prometheus"] -->|"/__metrics with Bearer OPS_TOKEN"| POD
+    end
+    POD -.->|"shared state across pods"| PGDB[("Postgres")]`;
+
+  const dInternals = `flowchart TD
+  A["accept loop (non-blocking, honours shutdown flag)"] --> Q["bounded job queue (max_pending)"]
+  Q --> P["pool worker: parse request line, headers, body"]
+  P -->|"too large, bad framing or header_timeout"| REJ["413, 400, 408 or 501, then close"]
+  P --> S["App service runs under catch_unwind"]
+  S -->|"handler panicked"| E500["500 Internal Server Error"]
+  S --> B{"response body?"}
+  B -->|"Body::Upgrade"| UP["write 101 head, hand the socket to the ws reactor, worker freed"]
+  B -->|"Body::Stream"| ST["write head, run producer, close"]
+  B -->|"Body::Full"| W["write head and body"]
+  E500 --> W
+  W --> K{"keep-alive and under keep_alive_max?"}
+  K -->|"yes, wait up to keep_alive_idle"| P
+  K -->|"no"| X["close, worker takes the next connection"]
+  ST --> X`;
+
+  const dCrates = `flowchart TD
+  CLI["sutegi-cli"] --> REPL["sutegi-repl"]
+  REPL --> WEB["sutegi-web"]
+  REPL --> HTTP["sutegi-http"]
+  REPL -.-> ORM["sutegi-orm"]
+  AUTH["sutegi-auth"] --> SESSION["sutegi-session"]
+  AUTH --> WEB
+  AUTH --> ORM
+  AUTH -.-> MAIL["sutegi-mail"]
+  SESSION --> WEB
+  HEX["sutegi-hexagon"] --> WEB
+  WEB --> HTTP
+  WEB -.-> ORM
+  WEB -.-> VALIDATE["sutegi-validate"]
+  WEB -.-> ACTORS["sutegi-actors"]
+  WEB -.-> CHANNELS["sutegi-channels"]
+  WEB -.-> WS["sutegi-ws"]
+  CHANNELS --> WS
+  CHANNELS --> PUBSUB["sutegi-pubsub"]
+  CHANNELS --> HTTP
+  WS --> HTTP
+  MAIL --> TEMPLATE["sutegi-template"]
+  JOBS["sutegi-events, sutegi-queue"] --> ORM
+  STORAGE["sutegi-storage"] -.-> ORM
+  ORM -.-> PG["sutegi-pg"]
+  PUBSUB -.-> PG`;
+
+  const dMiddleware = `flowchart TD
+  IN["request"] --> PR{"path is /__health or /__ready?"}
+  PR -->|"yes"| PROBE["probe answers 200 or 503"]
+  PR -->|"no"| OPS{"first routed segment starts with __?"}
+  OPS -->|"yes"| G["ops_guard (403 when unset, unless ops_public)"]
+  OPS -->|"no"| GM["global middleware, in registration order"]
+  G -->|"passes"| GM
+  G -->|"rejects"| AFTER
+  GM -->|"Some(response)"| AFTER
+  GM -->|"None"| BI{"/__metrics, /__logs or /__introspect?"}
+  BI -->|"yes"| AFTER
+  BI -->|"no"| RM{"route match"}
+  RM -->|"no route"| NF["404, or 405 if another method matches"]
+  RM -->|"match"| GR["group middleware"]
+  GR -->|"Some(response)"| AFTER
+  GR -->|"None"| H["handler(ctx)"]
+  H --> AFTER["after-middleware, on every response"]
+  NF --> AFTER
+  PROBE --> AFTER
+  AFTER --> OUT["access log line and metrics, then write"]`;
+
+  const dHexagonal = `flowchart LR
+  HTTP["inbound adapter: HTTP route"] -->|"execute(input)"| UC["use case (impl UseCase)"]
+  TOOL["inbound adapter: AI tool"] -->|"execute(input)"| UC
+  UC -->|"uses"| DOM["domain: entities and rules, no framework"]
+  UC -->|"depends on"| PORT["outbound port: TodoRepository trait"]
+  MEM["outbound adapter: in-memory repo"] -.->|"implements"| PORT
+  SQL["outbound adapter: repo over a Backend"] -.->|"implements"| PORT
+  ROOT["composition root (main.rs)"] -->|"picks one repo, injects it"| UC`;
+
+  const dListeners = `sequenceDiagram
+  participant App as run_until or run_graceful
+  participant L as listener thread
+  participant S as HTTP server
+  participant F as shutdown flag
+  App->>L: spawn sutegi-listener-name, call the closure with ListenerCtx
+  App->>S: serve_until(addr, workers, flag)
+  loop each lap
+    L->>F: should_stop()?
+    F-->>L: false
+    L->>L: recv with a read timeout, handle the packet
+  end
+  Note over F: SIGTERM or SIGINT (or your code) sets the flag
+  par server drains
+    S->>S: stop accepting, finish in-flight requests
+  and listener notices
+    L->>F: should_stop()?
+    F-->>L: true
+    L->>L: leave the loop, return
+  end
+  S-->>App: serve_until returns
+  App->>L: join() waits until the closure has returned
+  Note over L: a panic is caught and logged once, the thread ends and is not restarted`;
+
+  const dSessions = `sequenceDiagram
+  participant B as Browser
+  participant E as GET endpoint (Auth::csrf)
+  participant G as require_csrf guard
+  participant S as Sessions
+  B->>E: GET with sutegi_session cookie, if any
+  E->>S: load(req): HMAC must verify, else an empty session
+  E->>S: csrf(session): reuse _csrf or mint 32 random bytes
+  E->>S: save(session, resp): re-sign the payload
+  E-->>B: token in the body, Set-Cookie sutegi_session=payload.signature
+  B->>G: POST with the cookie and X-CSRF-Token
+  G->>S: load(req), then verify_csrf in constant time
+  alt token matches
+    G->>G: pass, the handler runs
+  else missing or wrong
+    G-->>B: 419 csrf token mismatch
+  end`;
+
+  const dAuthLogin = `sequenceDiagram
+  participant C as Client
+  participant H as POST /login handler
+  participant T as Throttle
+  participant U as Users
+  participant A as Auth
+  C->>H: email and password
+  H->>T: too_many(login key)
+  alt over the limit
+    H-->>C: 429 with retry_after
+  else under the limit
+    H->>U: authenticate(email, password)
+    Note over U: PBKDF2 verify, a decoy hash for unknown emails, rehash if iterations are stale
+    alt no match
+      H->>T: hit(key)
+      H-->>C: 401 bad credentials
+    else match
+      H->>T: clear(key)
+      H->>A: login_remembered(req, user, resp)
+      Note over A: fresh session with uid, exp and a password-hash fingerprint, pre-login data and CSRF dropped
+      A-->>C: Set-Cookie session and Set-Cookie remember (selector.validator)
+    end
+  end`;
+
+  const dAuthIdentify = `flowchart TD
+  R["Auth::identify(req)"] --> S{"session HMAC valid and exp in the future?"}
+  S -->|"yes"| B{"fingerprint matches the current password hash?"}
+  B -->|"yes"| OK["user from the session, no new cookies"]
+  B -->|"no"| RC
+  S -->|"no"| RC{"remember store and remember cookie present?"}
+  RC -->|"no"| ANON["anonymous (None)"]
+  RC -->|"yes"| SEL{"selector row exists?"}
+  SEL -->|"no"| ANON
+  SEL -->|"yes"| VAL{"validator SHA-256 matches, unexpired, bound to the current password hash?"}
+  VAL -->|"no"| DEL["delete the row, anonymous"]
+  VAL -->|"yes"| ROT["rotate the validator, mint a fresh session"]
+  ROT --> ATT["Identified::attach sets both cookies"]`;
+
+  const dAgents = `sequenceDiagram
+  participant A as Agent
+  participant G as ops_guard
+  participant App as sutegi app
+  Note over G,App: every /__ path except /__health and /__ready passes the guard, 403 when none is set
+  A->>G: GET /__introspect with the credential
+  G->>App: pass
+  App-->>A: routes, models, tools, capabilities, listeners
+  A->>G: GET /__tools
+  G->>App: pass
+  App-->>A: name, description, input_schema, streaming for each tool
+  alt streaming is false
+    A->>G: POST /__tools/name with JSON arguments
+    G->>App: pass
+    App-->>A: 200 with the JSON result, or a JSON error
+  else streaming is true
+    A->>G: POST /__tools/name/stream with JSON arguments
+    G->>App: pass
+    App-->>A: text/event-stream frames until the server closes
+  end`;
+
+  const dTools = `flowchart TD
+  REQ["POST /__tools/name"] --> OG{"ops_guard passes?"}
+  OG -->|"no"| EG["the guard's 401 or 403 (403 when unset)"]
+  OG -->|"yes"| MW{"global middleware passes?"}
+  MW -->|"no"| EM["the middleware's response"]
+  MW -->|"yes"| CT{"content-type JSON, or no body?"}
+  CT -->|"no"| E415["415"]
+  CT -->|"yes"| PJ{"body parses as JSON?"}
+  PJ -->|"no"| E400["400"]
+  PJ -->|"yes"| FIND{"unary tool with this name?"}
+  FIND -->|"no, streaming tools included"| E404["404 unknown tool"]
+  FIND -->|"yes"| VAL{"args match input_schema?"}
+  VAL -->|"no"| E422["422 with errors by field path"]
+  VAL -->|"yes"| RUN["closure(ctx, args)"]
+  RUN -->|"Ok"| OK["200 JSON result"]
+  RUN -->|"Err"| ERR["the error's own status"]`;
+
+  const dStreaming = `sequenceDiagram
+  participant C as Client
+  participant W as pool worker
+  participant H as handler
+  participant P as SSE producer
+  C->>W: request to an sse() route or POST /__tools/name/stream
+  W->>H: run the handler
+  alt stream tool arguments rejected
+    H-->>C: 4xx JSON error, no stream opened
+  else accepted
+    H-->>W: 200 response wrapping the producer
+    W->>W: after-middleware, access log, metrics
+    W->>C: head with text/event-stream and connection close
+    W->>P: run the producer on the same thread
+    loop each chunk
+      P->>C: data frame, flushed at once
+    end
+    P->>C: event done (by convention)
+    W->>C: close the socket, worker freed
+  end
+  Note over P,C: once the head is out the status is fixed, a producer error or panic just closes the socket`;
+
+  const dModelDerive = `flowchart LR
+  S["derive(Model) on struct Todo"] --> M["impl Model: schema(), table(), primary_key()"]
+  S --> R["impl FromRow"]
+  S --> I["impl FromInput"]
+  S --> H["to_json(), to_values(), save()"]
+  S --> L["with_field() batch loader per relation"]
+  M --> IR["TableSchema: the schema IR"]
+  IR --> G["migrate:gen diff and migrate:drift"]
+  IR --> Y["Model::migrate: additive dev sync"]
+  R --> T["all_typed, find_typed, fetch"]
+  I --> C["from_input: lenient hydrate of a partial payload"]`;
+
+  const dRelationsEr = `erDiagram
+  users ||--o{ posts : "has_many posts / belongs_to author"
+  users {
+    i64 id PK
+    String name
+  }
+  posts {
+    i64 id PK
+    String title
+    i64 author_id FK "indexed, ON DELETE CASCADE"
+  }`;
+
+  const dRelationsLoad = `sequenceDiagram
+  participant App
+  participant Loader as User::with_posts
+  participant DB as Backend
+  App->>DB: User::all_typed - SELECT * FROM users
+  DB-->>App: users 1, 2, 3
+  App->>Loader: with_posts(db, users)
+  Loader->>DB: SELECT * FROM posts WHERE author_id IN (1, 2, 3)
+  DB-->>Loader: every child row, one round-trip
+  Loader->>Loader: group rows by author_id, hydrate Post via FromRow
+  Loader-->>App: users with posts attached (empty Vec when none)`;
+
+  const dQueryPipeline = `flowchart TD
+  Q["Model::query() or QueryBuilder::table()"] --> S["Backend::select(qb)"]
+  S --> G{"JSON used and caps.json_path off?"}
+  G -- yes --> E1["Err: unsupported json_path"]
+  G -- no --> B["qb.build_for(dialect)"]
+  B -- "bad identifier, operator or path" --> E2["Err from the builder"]
+  B -- ok --> P["SQL with ? placeholders + bound params"]
+  P --> L{"row lock requested?"}
+  L -- yes --> R["append FOR UPDATE / FOR SHARE per caps, or Err"]
+  L -- no --> X["Backend::query(sql, params)"]
+  R --> X
+  X --> D1["SQLite: ? bound natively"]
+  X --> D2["Postgres: ? rewritten to $1..$n"]`;
+
+  const dBackendTraits = `classDiagram
+  class Backend {
+    <<trait>>
+    +query(sql, params) rows
+    +execute(sql, params) usize
+    +insert(table, cols, pk) i64
+    +upsert(table, cols, conflict, pk) i64
+    +migrate(schema)
+    +capabilities() BackendCaps
+    +defaults: select, count, paginate, insert_many, try_lock, lock
+  }
+  class Transactional {
+    <<trait>>
+    +run_in_tx(f)
+    +run_in_tx_with(isolation, f)
+  }
+  class BackendCaps {
+    +advisory_locks CapScope
+    +live_queries CapScope
+    +row_locks, skip_locked, bulk_copy bool
+    +json_path, json_contains, fts, vector bool
+  }
+  class Db {
+    sqlite feature
+    +try_lock via a process-wide registry
+  }
+  class Pg {
+    postgres feature
+    +try_lock via a dedicated session
+    +insert_many via COPY FROM STDIN
+  }
+  class PgTx {
+    +try_lock via xact lock, freed at COMMIT
+  }
+  class SqliteTx {
+    caps: no locks, no isolation
+  }
+  Backend <|-- Transactional
+  Backend <|.. Db
+  Backend <|.. Pg
+  Backend <|.. PgTx
+  Backend <|.. SqliteTx
+  Transactional <|.. Db
+  Transactional <|.. Pg
+  Backend ..> BackendCaps : capabilities()`;
+
+  const dSerializableRetry = `sequenceDiagram
+  participant App as App retry loop
+  participant A as pg.transact_with
+  participant PG as Postgres
+  participant B as Other writer
+  App->>A: transact_with(Serializable, f)
+  A->>PG: BEGIN ISOLATION LEVEL SERIALIZABLE
+  A->>PG: SELECT n - reads 0
+  B->>PG: BEGIN ISOLATION LEVEL SERIALIZABLE
+  B->>PG: SELECT n - reads 0
+  B->>PG: UPDATE n = 1, COMMIT
+  A->>PG: UPDATE n = 1
+  PG-->>A: postgres error [40001] could not serialize
+  A->>PG: ROLLBACK
+  A-->>App: Err containing 40001
+  Note over App: sutegi does not retry - the loop is yours
+  App->>A: transact_with again
+  A->>PG: BEGIN, SELECT n - reads 1, UPDATE n = 2, COMMIT
+  A-->>App: Ok`;
+
+  const dSkipLockedClaim = `sequenceDiagram
+  participant A as Worker A
+  participant PG as Postgres
+  participant B as Worker B
+  A->>PG: BEGIN
+  A->>PG: SELECT * FROM jobs WHERE state = $1 ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED
+  PG-->>A: job 1, now row-locked by A
+  B->>PG: BEGIN
+  B->>PG: the same SELECT ... FOR UPDATE SKIP LOCKED
+  PG-->>B: job 2 - job 1 is skipped, not waited on
+  A->>PG: mark job 1 claimed, COMMIT (row lock released)
+  B->>PG: mark job 2 claimed, COMMIT`;
+
+  const dAdvisoryContend = `sequenceDiagram
+  participant A as Pod A
+  participant PG as Postgres
+  participant B as Pod B
+  A->>PG: open a dedicated session, not a pooled one
+  A->>PG: SELECT pg_try_advisory_lock(lock_key(janitor))
+  PG-->>A: true - guard owns the session
+  B->>PG: open a dedicated session
+  B->>PG: SELECT pg_try_advisory_lock(lock_key(janitor))
+  PG-->>B: false
+  B->>PG: close the session
+  Note over B: with_lock returns Ok(None) - another pod ran it
+  A->>A: run f() while the guard holds the session
+  A->>PG: guard drops, session closes
+  Note over PG: session gone = lock released, the same path as a crashed holder`;
+
+  const dJsonCompile = `flowchart TD
+  W["where_json(meta, $.stats.views, >, 50)"] --> P{"parse_json_path"}
+  P -- malformed --> E["builder error, returned at build"]
+  P -- ok --> S["segments: Key stats, Key views"]
+  S --> X{"executing backend dialect"}
+  X -- SQLite --> L["json_extract(meta, ?) > ? with $.stats.views and 50 bound"]
+  X -- Postgres --> G["(meta #>> ?)::numeric > ? with {stats,views} and 50 bound"]
+  C["where_json_contains(meta, doc)"] --> Y{"executing backend dialect"}
+  Y -- SQLite --> N["Err: unsupported json_contains"]
+  Y -- Postgres --> K["meta @> ?::jsonb"]`;
+
+  const dHybridRrf = `flowchart TD
+  Q["hybrid_search(query text, query vector, k)"] --> LX["lexical leg: search(), top n = max(4k, 50) by _rank"]
+  Q --> VQ{"capabilities().vector?"}
+  VQ -- yes --> VP["pushdown: ORDER BY col <=> ? LIMIT n"]
+  VQ -- no --> VB["brute force: embedding::nearest, cosine, in Rust"]
+  LX --> F["RRF in Rust: score += 1 / (60 + rank) per leg"]
+  VP --> F
+  VB --> F
+  F --> T["sort by fused score, keep top k"]
+  T --> R["SELECT rows WHERE pk IN (top k)"]
+  R --> O["re-order to fused rank, attach _score"]`;
+
+  const dVectorPaths = `flowchart LR
+  T["query vector + Metric"] --> BF["nearest / nearest_typed"]
+  T --> PD["nearest_pushdown_typed"]
+  BF --> S1["Backend::select(query): load candidate rows"]
+  S1 --> S2["decode each vector, Metric::distance in Rust"]
+  S2 --> S3["sort ascending, keep k"]
+  PD --> P1["SELECT *, (col op ?) AS _distance ORDER BY _distance LIMIT k"]
+  P1 --> P2["pgvector computes it, ANN index if one exists"]
+  S3 --> OUT["(row, distance), lower is closer"]
+  P2 --> OUT`;
+
+  const dReactiveFlow = `sequenceDiagram
+  participant W as Writer (any pod or psql)
+  participant PG as Postgres
+  participant L as LISTEN session
+  participant K as Watcher worker
+  participant S as Subscription
+  W->>PG: BEGIN, UPDATE todos
+  Note over PG: statement trigger _sutegi_watch_todos calls pg_notify(sutegi_changes, todos)
+  alt the write commits
+    W->>PG: COMMIT
+    PG-->>L: NOTIFY delivered, payload todos
+    L->>K: table todos changed
+    Note over K: debounce 25 ms, coalesce the burst
+    K->>PG: re-run every watched query on todos
+    PG-->>K: current rows
+    K->>K: diff by pk against the last snapshot
+    opt diff not empty
+      K->>S: Change with added, updated, removed
+    end
+  else the write rolls back
+    W->>PG: ROLLBACK
+    Note over PG,L: the queued notification is discarded, no watcher wakes
+  end`;
+
+  const dMigrateShadow = `flowchart LR
+  F["migration files: ops JSON"] --> SH["shadow schema: ops folded in memory"]
+  M["derive(Model) schemas"] --> GEN["migrate:gen = diff(shadow, models)"]
+  SH --> GEN
+  GEN --> NF["new timestamped migration file"]
+  SH --> D1["drift: diff(shadow, live DB)"]
+  DB["live database, introspected"] --> D1
+  SH --> D2["drift: diff(shadow, models)"]
+  M --> D2`;
+
+  const dMigrateRun = `flowchart TD
+  A["Migrator::run"] --> V{"versions well-formed and unique?"}
+  V -- no --> X1["Err, database untouched"]
+  V -- yes --> LK["poll try_lock(sutegi:migrations), up to 300 s"]
+  LK -- timeout --> X2["Err: another runner is active"]
+  LK -- held --> H["ensure _sutegi_migrations, read history"]
+  H --> C{"checksums, names and order OK?"}
+  C -- no --> X1
+  C -- yes --> N{"next pending migration?"}
+  N -- none --> DONE["drop lock, return applied versions"]
+  N -- yes --> T["write tx on one connection"]
+  T --> RC{"already in history? re-check"}
+  RC -- yes --> N
+  RC -- no --> UP["run up, insert history row"]
+  UP -- ok --> CM["COMMIT"] --> N
+  UP -- error --> RB["ROLLBACK: no schema change, no row; Err"]`;
+
+  const dMigrationLifecycle = `stateDiagram-v2
+  [*] --> Pending: file written by migrate:gen or by hand
+  Pending --> Applied: migrate - up + history row in one tx
+  Applied --> Pending: migrate:rollback - down + row delete in one tx
+  Applied --> Tampered: file edited or renamed
+  Tampered --> Applied: Migrator repair re-stamps the history
+  Applied --> Orphan: file deleted from code
+  note right of Tampered
+    the next migrate errors before touching anything
+  end note
+  note right of Orphan
+    a rollback batch containing it is refused whole
+  end note`;
+
   const cInstall = `# The defaults — derive + orm + validate — suit a typical app.
 cargo add sutegi
 
@@ -458,7 +1220,7 @@ App::new("api")
     .serve()
 
 // Gated features return one uniform error instead of leaking dialect SQL:
-// Err("unsupported: json_contains is not available on sqlite")`;
+// Err("unsupported: json_contains is not available on the sqlite backend")`;
 
   const cConcurrency = `// Row locks — the work-queue claim shape (Postgres; see the matrix above).
 db.transact(|tx| {
@@ -568,10 +1330,12 @@ let hits: Vec<(Doc, f32)> = embedding::nearest_typed::<Doc, _>(
     &db, &Doc::query(), "embedding", &query_vec, 10, Metric::Cosine,
 )?;
 
-// Pushdown — ORDER BY col <=> ? LIMIT k, straight to pgvector's ANN index.
-// Requires capabilities().vector (Postgres + the pgvector extension).
+// Pushdown — pgvector computes the distance and can use an ANN index:
+// SELECT *, (embedding <=> ?) AS _distance FROM docs ORDER BY _distance LIMIT k
+// Check capabilities().vector first (Postgres + the pgvector extension); the
+// call itself does not, and on SQLite fails with an engine error.
 let hits = embedding::nearest_pushdown_typed::<Doc, _>(
-    &pg, &Doc::query(), "embedding", &query_vec, 10, Metric::Cosine,
+    &pg, "docs", "embedding", &query_vec, 10, Metric::Cosine,
 )?;
 
 // Values travel in pgvector's canonical [1,2,3] text form, so the same row
@@ -773,7 +1537,7 @@ let hub = Channels::new()
             }),
     )
     // .broker(PgPubSub::connect(&pg_cfg)?)          // <- the only cross-pod change
-    .check_origin(["https://app.example.com"])       // MUST set if cookies auth the socket
+    .check_origin(["https://app.example.com"])       // page on another host; same-origin is the default
     .build();
 
 App::new("chat")
@@ -891,7 +1655,7 @@ App::new("app")
         }
         match auth.users.authenticate(email, password)? {
             Some(u) => { throttle.clear(&key)?;
-                         Ok::<_, Error>(auth.login_remembered(c.req, &u, remember, resp)) }
+                         Ok::<_, Error>(auth.login_remembered(c.req, &u, json(200, &u.to_json()))?) }
             None => { throttle.hit(&key)?; Err(Error::unauthorized("bad credentials")) }
         }
     })
@@ -921,8 +1685,9 @@ let mut s = sessions.load(c.req);
 let token = sessions.csrf(&mut s)?;              // 32 random bytes, stable per session
 let ok = sessions.verify_csrf(&s, presented);
 // Auth::csrf(req, resp) is the handler shape; the require_csrf guard enforces
-// X-CSRF-Token on mutating methods (419 on mismatch) and passes reads and
-// Authorization-header callers — a bearer client carries no ambient credential.
+// X-CSRF-Token on mutating methods (419 on mismatch). It passes reads, and a
+// Bearer stg_… API token sent with no session cookie — no ambient credential.
+// Basic auth, other bearers, or any session cookie keep the check on.
 
 // For callers that collect cookies before touching a response:
 let set_cookie = sessions.cookie_for(&s);`;
@@ -1227,6 +1992,23 @@ App::new("api")
 // GET /__metrics  Prometheus text             GET /__introspect  the full app surface
 // GET /__tools    the LLM manifest            GET /__channels    the channel manifest`;
 
+  const cLogging = `use sutegi::log;
+
+log::info!("billing", "invoice sent", invoice = id, cents = total, to = email);
+log::warn!("llm", "call failed", provider = "gemini", ms = elapsed, error = %err);
+// {"ts":"…","level":"warn","target":"llm","msg":"call failed","provider":"gemini",
+//  "ms":812,"error":"429 Too Many Requests","rid":"5f3a91c2000004d1"}
+
+// Context every line inside the scope inherits:
+let _scope = log::scope(&[("tenant", log::Value::Str(slug.into()))]);
+log::annotate("user", user_id);
+
+// One access line per request, a request id on every line it causes:
+App::new("shop").access_log(AccessLog::new())
+
+// In tests, collect instead of writing:
+let (result, records) = log::capture(|| svc(request));`;
+
   const cDeploy = `./ontzi up 3            # 3 replicas behind an nginx LB on http://localhost:8080
 ./ontzi curl /api/todos
 ./ontzi logs
@@ -1246,9 +2028,13 @@ App::new("api")
         <span class="text-lg font-bold text-white tracking-tight">sutegi</span>
         <span class="text-[#7a7a8a] text-sm font-mono hidden sm:inline">/ docs</span>
       </a>
+      <button onclick={() => { menuOpen = true; tick().then(() => searchEl?.focus()); }}
+        class="hidden md:flex items-center gap-2 ml-4 w-64 px-3 py-1.5 rounded-lg border border-white/10 bg-white/[0.03] text-sm text-[#7a7a8a] hover:border-white/20 transition-colors">
+        <Search size={14} /> Search docs <kbd class="ml-auto text-[10px] font-mono border border-white/10 rounded px-1.5 py-0.5">⌘K</kbd>
+      </button>
     </div>
     <div class="flex items-center gap-2 sm:gap-3">
-      <span class="hidden md:inline text-[11px] font-mono text-[#7a7a8a] border border-white/10 rounded-full px-2.5 py-1">v0.10</span>
+      <span class="hidden md:inline text-[11px] font-mono text-[#7a7a8a] border border-white/10 rounded-full px-2.5 py-1">v0.13</span>
       <a href="#/" class="hidden sm:inline-flex items-center gap-1.5 px-4 py-2 text-sm text-[#a0a0b0] hover:text-white transition-colors">
         <ArrowLeft size={14} /> Home
       </a>
@@ -1261,21 +2047,30 @@ App::new("api")
   <div class="max-w-7xl mx-auto flex">
     <!-- Sidebar -->
     <aside class="fixed lg:sticky top-[57px] z-20 h-[calc(100vh-57px)] w-72 shrink-0 overflow-y-auto custom-scrollbar bg-[#0d0c12] lg:bg-transparent border-r border-white/5 px-5 py-8 transition-transform duration-200 {menuOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'}">
+      <div class="relative mb-6">
+        <Search size={14} class="absolute left-3 top-1/2 -translate-y-1/2 text-[#7a7a8a]" />
+        <input bind:this={searchEl} bind:value={query} onkeydown={pick} type="search" placeholder="Search…"
+          aria-label="Search the docs"
+          class="w-full pl-8 pr-3 py-2 rounded-lg bg-white/[0.04] border border-white/10 text-sm text-white placeholder-[#7a7a8a] outline-none focus:border-[#ff6a3d]/60" />
+      </div>
       <nav class="space-y-7">
-        {#each nav as grp}
+        {#each shown as grp}
           <div>
             <div class="text-[11px] uppercase tracking-wider text-[#7a7a8a] font-semibold mb-2.5">{grp.group}</div>
             <ul class="border-l border-white/10">
               {#each grp.items as it}
                 <li>
-                  <a href="#/docs/{it.id}" onclick={() => (menuOpen = false)}
-                    class="block pl-4 -ml-px border-l py-1.5 text-sm transition-colors {active === it.id ? 'border-[#ff6a3d] text-white font-medium' : 'border-transparent text-[#9090a0] hover:text-white hover:border-white/30'}">
+                  <a href="#/docs/{it.id}" onclick={() => { menuOpen = false; query = ''; }}
+                    aria-current={current === it.id ? 'page' : undefined}
+                    class="block pl-4 -ml-px border-l py-1.5 text-sm transition-colors {current === it.id ? 'border-[#ff6a3d] text-white font-medium' : 'border-transparent text-[#9090a0] hover:text-white hover:border-white/30'}">
                     {it.title}
                   </a>
                 </li>
               {/each}
             </ul>
           </div>
+        {:else}
+          <p class="text-sm text-[#7a7a8a]">No page mentions &ldquo;{query}&rdquo;.</p>
         {/each}
       </nav>
     </aside>
@@ -1286,12 +2081,12 @@ App::new("api")
 
     <!-- Content -->
     <main class="flex-1 min-w-0 px-5 sm:px-8 md:px-12 py-10 sm:py-14 max-w-3xl mx-auto">
-      <div class="prose-doc space-y-16">
+      <div class="text-[#ff6a3d] text-[11px] font-mono font-semibold uppercase tracking-wider mb-2">{page.group}</div>
+      <div class="prose-doc">
 
         <!-- ===================== PROLOGUE ===================== -->
         <article id="introduction" class="scroll-mt-24">
-          <div class="text-[#ff6a3d] text-[11px] font-mono font-semibold uppercase tracking-wider mb-2">Prologue</div>
-          <h1 class="text-3xl sm:text-4xl font-bold text-white mb-5">Introduction</h1>
+          <h2 class="h2">Introduction</h2>
           <p>
             <strong class="text-white">sutegi</strong> — Basque for <em>forge</em> — is a batteries-included web
             framework for Rust with a single unusual constraint: it has
@@ -1315,12 +2110,14 @@ App::new("api")
             They are written to be read in order the first time and grepped after. The path is deliberate:
           </p>
           <ul class="list">
-            <li><strong class="text-white">Getting started</strong> — install, boot a first app, and learn how features, configuration and the CLI work.</li>
-            <li><strong class="text-white">The basics</strong> — routing, the request context, responses, middleware, and validation: the everyday request loop.</li>
-            <li><strong class="text-white">Database</strong> — models and relations, the query builder, the one <code>Backend</code> trait behind SQLite and Postgres, then the deeper seams: locks, JSON paths, search, embeddings, live queries, migrations, KV.</li>
-            <li><strong class="text-white">Agents &amp; realtime</strong> — the introspection surface, tools, streaming, WebSockets, pubsub, channels, the durable queue, and actors.</li>
-            <li><strong class="text-white">Framework services</strong> — auth, sessions, mail, storage, event sourcing, templates, collections, crypto: opt-in pillars you reach for as needed.</li>
-            <li><strong class="text-white">Architecture &amp; operations</strong> — hexagonal structure, testing, the REPL, what the server actually does per request, every tuning knob, the operational endpoints, deploying, and an honest security posture.</li>
+            <li><strong class="text-white">Getting Started</strong> — install, boot a first app, configure it, pick features, and ship it.</li>
+            <li><strong class="text-white">Architecture Concepts</strong> — what happens to a request, how the crates fit together, hexagonal structure, and non-HTTP listeners.</li>
+            <li><strong class="text-white">The Basics</strong> — routing, middleware, the request context, responses, templates, sessions, validation and logging: the everyday request loop.</li>
+            <li><strong class="text-white">Digging Deeper</strong> — the CLI and REPL, collections, event sourcing, mail, the durable queue, actors and file storage.</li>
+            <li><strong class="text-white">Security</strong> — authentication, the crypto primitives, and an honest security posture.</li>
+            <li><strong class="text-white">Database</strong> and <strong class="text-white">ORM</strong> — the one <code>Backend</code> trait behind SQLite and Postgres, the query builder, migrations, then the deeper seams: locks, JSON paths, search, embeddings, live queries, KV; models and relations on top.</li>
+            <li><strong class="text-white">AI Agents</strong> and <strong class="text-white">Realtime</strong> — the introspection surface and tools, then streaming, WebSockets, pubsub and channels.</li>
+            <li><strong class="text-white">Testing</strong> and <strong class="text-white">Operations</strong> — testing in-process, every tuning knob, and the operational endpoints.</li>
           </ul>
           <div class="callout note">
             <div class="callout-title">Start here</div>
@@ -1387,7 +2184,7 @@ App::new("api")
           <p>
             The concurrency claims are tested against real servers, not asserted: queue claim exclusivity under six
             concurrent workers, crash recovery through an expired lease, a lost-update race surfacing as
-            <code>40001</code> under <code>Serializable</code>, a rolled-back write never waking a watcher, and two OS
+            <code>40001</code> under <code>Serializable</code>, a rolled-back write never waking a Postgres watcher, and two OS
             processes chatting through one PostgreSQL over channels.
           </p>
 
@@ -1445,6 +2242,7 @@ App::new("api")
             features on; the table is here so you know what you are reading when you open the source, and so an
             error message from <code>sutegi_orm</code> or <code>sutegi_pg</code> tells you where to look.
           </p>
+          {@render diagram(dCrates, 'Internal dependencies between workspace crates; dotted edges are optional. sutegi-json, sutegi-crypto and sutegi-log, used almost everywhere, are left out.')}
           <div class="tbl-wrap">
             <table class="tbl">
               <thead><tr><th>Crate</th><th>Feature</th><th>Responsibility</th></tr></thead>
@@ -1478,7 +2276,6 @@ App::new("api")
 
         <!-- ===================== GETTING STARTED ===================== -->
         <article id="installation" class="scroll-mt-24">
-          <div class="text-[#ff6a3d] text-[11px] font-mono font-semibold uppercase tracking-wider mb-2">Getting started</div>
           <h2 class="h2">Installation</h2>
           <p>
             Every sutegi app is an ordinary Rust binary — <code>cargo new</code>, add the crate, write a
@@ -1619,7 +2416,6 @@ App::new("api")
 
         <!-- ===================== THE BASICS ===================== -->
         <article id="routing" class="scroll-mt-24">
-          <div class="text-[#ff6a3d] text-[11px] font-mono font-semibold uppercase tracking-wider mb-2">The basics</div>
           <h2 class="h2">Routing</h2>
           <p>
             Register routes with <code>.get</code>, <code>.post</code>, <code>.put</code>, <code>.delete</code> — or
@@ -1693,6 +2489,7 @@ App::new("api")
             work. Wrap a before-middleware function with <code>mw(&hellip;)</code> to attach it to a group.
           </p>
           {@render code(cMiddleware, 'middleware')}
+          {@render diagram(dMiddleware, 'Where a request can be answered early; every response, early or not, still passes through after-middleware.')}
           <p>
             The batteries are built in: <code>logger()</code>, <code>rate_limit(max, per)</code>, <code>bearer</code>,
             <code>basic</code>, <code>cors</code>, <code>cors_preflight</code>, <code>cors_credentialed</code>,
@@ -1773,9 +2570,30 @@ App::new("api")
           </p>
         </article>
 
+        <article id="logging" class="scroll-mt-24">
+          <h2 class="h2">Logging</h2>
+          <p>
+            <code>sutegi::log</code> is the log every sutegi crate writes through, and the one your app should use too.
+            One event is one line on stderr: JSON when stderr is not a terminal, aligned text when it is. Stdout stays
+            for command output. <code>key = value</code> keeps numbers and booleans typed in the JSON;
+            <code>key = %value</code> formats anything <code>Display</code>. A field whose name ends in
+            <code>password</code>, <code>secret</code>, <code>token</code>, <code>cookie</code>,
+            <code>api_key</code> and the like is written as <code>[redacted]</code>, wherever it came from.
+          </p>
+          {@render code(cLogging, 'logging')}
+          <p>
+            <code>SUTEGI_LOG</code> sets the level with per-target overrides
+            (<code>info,queue=debug,http=warn</code>) and <code>SUTEGI_LOG_FORMAT</code> picks
+            <code>json</code>, <code>text</code> or <code>auto</code>. <code>AccessLog</code> opens a scope with a
+            <code>rid</code> before the ops guard runs, reuses a safe inbound <code>x-request-id</code>, and returns
+            the id in the response. A queued job carries the dispatching request&rsquo;s context, so the request and
+            the job that later fails share one <code>rid</code>. With an <code>ops_guard</code> set,
+            <code>GET /__logs</code> returns the last 512 events, filterable by level and by any field.
+          </p>
+        </article>
+
         <!-- ===================== DATABASE ===================== -->
         <article id="models" class="scroll-mt-24">
-          <div class="text-[#ff6a3d] text-[11px] font-mono font-semibold uppercase tracking-wider mb-2">Database</div>
           <h2 class="h2">Models</h2>
           <p>
             Deriving <code>Model</code> on a plain struct makes it the single source of truth for a table: schema,
@@ -1783,6 +2601,7 @@ App::new("api")
             real bools and <code>Option&lt;T&gt;</code> becomes a nullable column.
           </p>
           {@render code(cModels, 'models')}
+          {@render diagram(dModelDerive, 'One derive on a plain struct generates the schema IR, the typed readers and writers, and a batch loader per relation.')}
           <p>
             The <code>#[model(&hellip;)]</code> attributes are the mapping controls, and everything except
             <code>skip</code> flows into the schema IR the migration diff reads:
@@ -1812,12 +2631,14 @@ App::new("api")
             the whole batch and attaches the typed children — the classic two-query strategy, so N+1 never arises.
           </p>
           {@render code(cRelations, 'relations')}
+          {@render diagram(dRelationsEr, 'The running example: posts.author_id is the indexed foreign key both relation fields join on.')}
           <p>
             <code>belongs_to</code> also carries the foreign key into the schema, including
             <code>on_delete = "cascade"</code>, so the migration diff sees it. Join keys are integers (the usual
             primary/foreign-key case), and loading is explicit rather than lazy: there is no hidden query behind a
             field access.
           </p>
+          {@render diagram(dRelationsLoad, 'with_posts loads every child in one IN (…) query and groups the rows in Rust: two queries, not N+1.')}
         </article>
 
         <article id="queries" class="scroll-mt-24">
@@ -1844,6 +2665,7 @@ App::new("api")
             <code>(sql, params)</code> pair — which is why the core ships no driver at all and the default binary stays
             tiny.
           </p>
+          {@render diagram(dQueryPipeline, 'The builder only stores the request; Backend::select gates on capabilities, compiles for its dialect, adds row locks, then binds the parameters.')}
         </article>
 
         <article id="backend" class="scroll-mt-24">
@@ -1863,12 +2685,13 @@ App::new("api")
             is a default method implemented once on top. It is object-safe, so <code>&amp;dyn Backend</code> works;
             the typed helpers are <code>Self: Sized</code>-gated.
           </p>
+          {@render diagram(dBackendTraits, 'Five required primitives plus capabilities(); each store, and each transaction handle, overrides only what it does differently.')}
           <h3 class="h3">Where the engines differ, a bit says so</h3>
           <p>
             Some things genuinely cannot be papered over. <code>Backend::capabilities()</code> returns a
             <code>BackendCaps</code> descriptor — the honest default is everything off, so a backend never advertises
             what it has not implemented — and a gated call returns
-            <code>unsupported: &lt;cap&gt; is not available on &lt;backend&gt;</code> before any SQL is sent.
+            <code>unsupported: &lt;cap&gt; is not available on the &lt;backend&gt; backend</code> before any SQL is sent.
             <code>App::register_capabilities(db.capabilities())</code> publishes the block in
             <code>/__introspect</code>, so an agent reads what the store can do instead of finding out from a dialect
             error.
@@ -1907,11 +2730,13 @@ App::new("api")
             on the capability bits above.
           </p>
           {@render code(cConcurrency, 'concurrency')}
+          {@render diagram(dSkipLockedClaim, 'With SKIP LOCKED, two workers running the same claim query take different rows instead of queueing behind each other.')}
+          {@render diagram(dSerializableRetry, 'A serializable lost-update race fails with 40001 and transact_with rolls back; the retry loop is yours, not the framework\'s.')}
           <ul class="list">
             <li><strong class="text-white">Row locks.</strong> The builder stores the request; the executing backend emits it. Postgres emits <code>FOR UPDATE [SKIP LOCKED|NOWAIT]</code>. SQLite treats plain <code>for_update</code>/<code>for_share</code> as a no-op — its write transaction already holds the whole database, strictly coarser — but <code>skip_locked</code>/<code>nowait</code> <em>error</em>: altered contention semantics are the point, and SQLite cannot express them.</li>
             <li><strong class="text-white">Isolation.</strong> Postgres gets <code>BEGIN ISOLATION LEVEL &hellip;</code>. SQLite is always serializable, so levels map to when the write lock is taken (<code>Serializable</code> → <code>BEGIN EXCLUSIVE</code>, <code>RepeatableRead</code> → <code>BEGIN IMMEDIATE</code>, <code>ReadCommitted</code> → <code>BEGIN</code>) — stronger than asked is honest, weaker would not be.</li>
             <li><strong class="text-white">RETURNING on DML.</strong> Same syntax on both engines (SQLite ≥ 3.35; the bundled build is newer), routed through <code>query</code> so the rows come back.</li>
-            <li><strong class="text-white">Bulk insert.</strong> The default batches multi-row <code>INSERT … VALUES</code> under the placeholder budget on any backend; Postgres overrides it with wire-native <code>COPY FROM STDIN</code>, with tabs, newlines, backslashes and NULLs escaped correctly (hostile content round-trips in the tests).</li>
+            <li><strong class="text-white">Bulk insert.</strong> The default batches multi-row <code>INSERT … VALUES</code> under the placeholder budget on any backend; outside a transaction, Postgres overrides it with wire-native <code>COPY FROM STDIN</code>, with tabs, newlines, backslashes and NULLs escaped correctly (hostile content round-trips in the tests).</li>
           </ul>
         </article>
 
@@ -1923,6 +2748,7 @@ App::new("api")
             <code>with_lock</code> is the singleton-job shape, where <code>Ok(None)</code> means another pod ran it.
           </p>
           {@render code(cAdvisory, 'advisory')}
+          {@render diagram(dAdvisoryContend, 'Two pods race with_lock("janitor", Duration::ZERO, …): one wins and holds the lock on its own session; the loser gets Ok(None).')}
           <ul class="list">
             <li><strong class="text-white">Postgres is cluster-scoped</strong> via <code>pg_try_advisory_lock</code> on a <em>dedicated</em> session — never a pooled connection, so a leader lock held for the process lifetime cannot starve request traffic. Release is closing that session, which is exactly what the server does when a holder crashes, so crash-release needs no cleanup path.</li>
             <li><strong class="text-white">SQLite is process-scoped</strong>: a named-mutex registry keyed per database file. Two OS processes on the same file do <em>not</em> contend — believe the capability.</li>
@@ -1947,6 +2773,7 @@ App::new("api")
             Postgres (<code>::numeric</code> so <code>9 &lt; 10</code> compares as numbers). Containment is Postgres
             only; SQLite errors honestly rather than emulating subset semantics with <code>json_each</code> walks.
           </p>
+          {@render diagram(dJsonCompile, 'The path is parsed once into segments; the executing backend compiles them for its dialect, always binding the path as a parameter.')}
           <div class="callout note">
             <div class="callout-title">Indexing</div>
             <p>
@@ -1987,6 +2814,7 @@ App::new("api")
             brute-force cosine otherwise. A document ranked well in <em>both</em> legs beats one ranked first in a
             single leg and absent from the other.
           </p>
+          {@render diagram(dHybridRrf, 'Each leg returns ranked primary keys; reciprocal-rank fusion merges them in Rust, then the winners are fetched in one query.')}
         </article>
 
         <article id="vectors" class="scroll-mt-24">
@@ -2005,6 +2833,7 @@ App::new("api")
             covers cosine, L2 and inner product. sutegi does not compute embeddings — call whatever model you use and
             store the vector.
           </p>
+          {@render diagram(dVectorPaths, 'Brute force ranks candidates in Rust on any backend; pushdown has pgvector compute the distance and can use an ANN index.')}
           <div class="callout warn">
             <div class="callout-title">Dimension changes are invisible to drift</div>
             <p>
@@ -2032,6 +2861,7 @@ App::new("api")
             <strong class="text-white">nothing</strong> (the requery runs, the diff is empty, nothing is sent). Twenty
             writes in one window typically become one <code>Change</code> carrying twenty rows.
           </p>
+          {@render diagram(dReactiveFlow, 'On Postgres a committed write wakes every watcher through NOTIFY, then a requery and a pk diff; a rolled-back write wakes no one.')}
           <p>
             Guardrails: 1024 live subscriptions per watcher, dropping a subscription unregisters it, and dropping the
             watcher shuts the worker down — interrupting the blocked LISTEN session on Postgres. One watcher per
@@ -2052,6 +2882,7 @@ App::new("api")
           </p>
           {@render code(cMigrations, 'migrations')}
           {@render code(cMigrateCli, 'migratecli')}
+          {@render diagram(dMigrationLifecycle, 'A migration\'s life as _sutegi_migrations sees it, including the edited-file and deleted-file states the guards catch.')}
           <h3 class="h3">Diff against history, not the live database</h3>
           <p>
             <code>migrate:gen</code> computes changes by diffing your models against the <em>shadow schema</em> — the
@@ -2064,6 +2895,7 @@ App::new("api")
             <code>sutegi::migrate::report_json</code> is the same report as JSON, ready to mount at
             <code>/__migrations</code> for agents and dashboards.
           </p>
+          {@render diagram(dMigrateShadow, 'migrate:gen diffs models against the folded history; the live database is read only for the two drift comparisons.')}
           <h3 class="h3">Safety classes</h3>
           <ul class="list">
             <li><strong class="text-white">Safe</strong> — create a table, add a nullable or defaulted column, create an index, add a foreign key, widen a column.</li>
@@ -2079,6 +2911,7 @@ App::new("api")
             Postgres, <code>run</code>/<code>rollback</code> take a session advisory lock, so many pods booting at
             once serialize instead of racing.
           </p>
+          {@render diagram(dMigrateRun, 'Migrator::run validates before touching anything, serializes runners on a lock, and applies each migration atomically with its history row.')}
           <div class="callout tip">
             <div class="callout-title">Dev-mode sync</div>
             <p>
@@ -2117,7 +2950,6 @@ App::new("api")
 
         <!-- ===================== AGENTS & REALTIME ===================== -->
         <article id="agents" class="scroll-mt-24">
-          <div class="text-[#ff6a3d] text-[11px] font-mono font-semibold uppercase tracking-wider mb-2">Agents &amp; realtime</div>
           <h2 class="h2">The agent surface</h2>
           <p>
             Because every route, model, tool, capability and searchable table registers its own metadata, sutegi
@@ -2134,6 +2966,7 @@ App::new("api")
             status. Everything under <code>/__</code> except the two probes sits behind
             <a href="#/docs/middleware" class="lnk"><code>ops_guard</code></a>.
           </p>
+          {@render diagram(dAgents, 'The agent contract: discover, read the manifest, then invoke the unary or the streaming endpoint, all behind ops_guard.')}
           <div class="callout note">
             <div class="callout-title">The full contract</div>
             <p>
@@ -2155,6 +2988,7 @@ App::new("api")
             manifest marks it <code>"streaming": true</code> so an agent knows to hit the SSE endpoint.
           </p>
           {@render code(cTools, 'tools')}
+          {@render diagram(dTools, 'Each check a unary tool call passes, and the status it returns when it fails (the 422 schema check needs the validate feature).')}
           <p>
             A tool and an HTTP route can — and usually should — be two adapters over one
             <a href="#/docs/hexagonal" class="lnk">use case</a>. Write the logic once; expose it to both audiences.
@@ -2171,6 +3005,7 @@ App::new("api")
             NDJSON and large exports.
           </p>
           {@render code(cStreaming, 'streaming')}
+          {@render diagram(dStreaming, 'A stream fixes its 200 status before the producer runs; frames are then flushed one by one on the same worker until the socket closes.')}
           <p>
             It is the same transport that carries live LLM tokens back to a UI and the one
             <code>.stream_tool</code> rides on. Regular responses use keep-alive; streams are close-framed by design,
@@ -2188,6 +3023,7 @@ App::new("api")
             connection costs ~340&nbsp;bytes of user-space RSS and <strong class="text-white">zero threads</strong>.
           </p>
           {@render code(cWs, 'ws')}
+          {@render diagram(dWsUpgrade, 'The HTTP worker checks the handshake, writes the 101 and hands the raw socket to a reactor shard, then goes back to serving HTTP.')}
           <p>
             Measured on a dev laptop: 80,000 live sockets at 0.0% idle CPU, a broadcast enqueue of 80k shared-<code>Arc</code>
             frames in ~1.5&nbsp;ms, and 5k-fleet delivery at p50 15&nbsp;ms / max 30&nbsp;ms end-to-end. The codec is
@@ -2201,12 +3037,14 @@ App::new("api")
             <li>Every knob lives in <a href="#/docs/options" class="lnk"><code>WsConfig</code></a>, and <code>ws_config</code> must come <em>before</em> the first <code>.ws(&hellip;)</code> — that call starts the reactor.</li>
           </ul>
           <div class="callout warn">
-            <div class="callout-title">Cookie-authenticated sockets must pin their origins</div>
+            <div class="callout-title">Cookie-authenticated sockets and origins</div>
             <p>
               A browser sends cookies on a cross-origin WebSocket handshake and the same-origin policy does not stop
-              it. If your socket is authenticated by a cookie, call <code>check_origin([&hellip;])</code> — otherwise
-              any page on the internet can open an authenticated socket as your user (CSWSH). Bearer-token clients are
-              unaffected: they carry no ambient credential.
+              it, so sutegi does: by default an upgrade whose <code>Origin</code> names a different host than
+              <code>Host</code> gets a <code>403</code>. Call <code>check_origin([&hellip;])</code> when the page is
+              served from another host or a proxy rewrites <code>Host</code>. <code>allow_any_origin()</code> turns
+              the check off — only for public sockets that do not authenticate by cookie, or any page on the internet
+              can open one as your user (CSWSH).
             </p>
           </div>
         </article>
@@ -2220,6 +3058,7 @@ App::new("api")
             <code>LISTEN</code>/<code>NOTIFY</code>.
           </p>
           {@render code(cPubsub, 'pubsub')}
+          {@render diagram(dPubsubFanout, 'PgPubSub delivers to local subscribers synchronously, then one NOTIFY reaches every other pod; the in-process PubSub has only the local branch.')}
           <p>
             <code>PgPubSub</code> uses one shared PG channel with topics inside a JSON envelope — immune to the 63-byte
             identifier truncation trap — plus a lazy publisher with one transparent retry and a listener that
@@ -2261,6 +3100,7 @@ App::new("api")
             <code>/__introspect</code> and <code>/__tools</code>.
           </p>
           {@render code(cChannelsJs, 'chjs')}
+          {@render diagram(dChannelsJoin, 'A join, a tracked presence and a broadcast. Every broadcast goes through the broker, so one path serves one pod or many.')}
           <h3 class="h3">Join lifecycle notes</h3>
           <ul class="list">
             <li>Inside <code>on_join</code> the member is <strong class="text-white">not admitted yet</strong>: a broadcast there reaches the room but not the joiner, and a push lands before the join reply. Use <code>socket.after_join(&hellip;)</code> for welcome pushes — it runs after the ok reply is on the wire, and never runs if the join is refused.</li>
@@ -2296,6 +3136,7 @@ App::new("api")
             delays, priorities and dedupe keys are columns, so a restart forgets nothing.
           </p>
           {@render code(cQueues, 'queues')}
+          {@render diagram(dQueueLifecycle, 'A job row\'s lifecycle: the claim takes a lease, heartbeats and results are fenced on it, and failures retry with linear backoff until the row is a dead letter.')}
           <p>
             Claims are exclusive on both backends: <code>FOR UPDATE SKIP LOCKED</code> wherever
             <code>capabilities().skip_locked</code> says it exists, and on SQLite the serialized writer already
@@ -2326,6 +3167,7 @@ App::new("api")
             through an <code>ActorRef</code>.
           </p>
           {@render code(cActors, 'actors')}
+          {@render diagram(dActorsSupervision, 'What the supervisor does with each child exit: restart policy, then the intensity cap, then the strategy picks which children restart.')}
           <ul class="list">
             <li><strong class="text-white">Bounded mailbox</strong> (default 1024): a full mailbox fails <code>tell</code> fast with <code>TellError::Full</code>, so backpressure is explicit rather than a hidden unbounded queue.</li>
             <li><strong class="text-white">Let it crash.</strong> A panic in <code>handle</code> kills only that actor and is reported as <code>ExitReason::Crashed</code>. Lifecycle hooks <code>started()</code> / <code>stopped(&amp;reason)</code> run on every (re)start and exit. <code>stop()</code> is queued behind pending messages, so the mailbox drains first.</li>
@@ -2347,7 +3189,6 @@ App::new("api")
 
         <!-- ===================== FRAMEWORK SERVICES ===================== -->
         <article id="auth" class="scroll-mt-24">
-          <div class="text-[#ff6a3d] text-[11px] font-mono font-semibold uppercase tracking-wider mb-2">Framework services</div>
           <h2 class="h2">Authentication</h2>
           <p>
             The <code>auth</code> feature is a complete user system over either backend — everything Laravel&rsquo;s
@@ -2357,6 +3198,7 @@ App::new("api")
             <code>stg_</code> bearer tokens for agents. The guards are just middleware you attach to a group.
           </p>
           {@render code(cAuth, 'auth')}
+          {@render diagram(dAuthLogin, 'Login: throttle, verify the password, then mint a fresh session and a remember cookie.')}
           <h3 class="h3">What the production pieces do</h3>
           <ul class="list">
             <li><strong class="text-white">Remember me</strong> — selector/validator cookies where only the validator&rsquo;s SHA-256 is stored, the validator <em>rotates on every use</em> (a stolen-then-replayed copy revokes the row, surfacing the theft), tokens are bound to the password hash at mint, and server-side expiry (default 30 days) ignores whatever the client claims.</li>
@@ -2372,6 +3214,7 @@ App::new("api")
             Unknown emails burn the same PBKDF2 time as wrong passwords, so the endpoint does not become a user
             enumeration oracle.
           </p>
+          {@render diagram(dAuthIdentify, 'How Auth::identify resolves a request: a live session, else a remember-me revival that rotates the token, else anonymous.')}
           <div class="callout tip">
             <div class="callout-title">Verification &amp; reset</div>
             <p>
@@ -2389,12 +3232,15 @@ App::new("api")
           <p>
             The <code>session</code> feature provides signed-cookie sessions (HMAC-SHA256) with no server-side store:
             <code>Sessions::new(secret)</code>, then <code>load</code> a session off the request, <code>set</code>/
-            <code>get</code>/<code>remove</code> values, and <code>save</code> it onto the response. The expiry is
-            stamped <em>inside</em> the signed payload, so a stolen cookie dies on schedule no matter what the client
-            claims. Call <code>.insecure()</code> in local <code>http://</code> development to drop the
+            <code>get</code>/<code>remove</code> values, and <code>save</code> it onto the response. A bare session
+            expires only through the cookie&rsquo;s <code>Max-Age</code> (24&nbsp;hours by default,
+            <code>.max_age(&hellip;)</code>), which the client controls: a stolen cookie stays valid. For logins, use
+            <a href="#/docs/auth" class="lnk">Auth</a>, which stamps an <code>exp</code> inside the signed payload
+            (<code>Auth::ttl</code>) so a stolen session dies on schedule no matter what the client claims. Call <code>.insecure()</code> in local <code>http://</code> development to drop the
             cookie&rsquo;s <code>Secure</code> flag.
           </p>
           {@render code(cSessions, 'sessions')}
+          {@render diagram(dSessions, 'The CSRF token lives inside the signed cookie, so issuing and checking it needs no server-side store.')}
           <p>
             This is the machinery <a href="#/docs/auth" class="lnk"><code>Auth</code></a> is built on; use it directly
             for lightweight per-visitor state like a cart or a wizard step.
@@ -2443,6 +3289,7 @@ App::new("api")
           </p>
           {@render code(cStorage, 'storage')}
           <h3 class="h3">The transport seam (how S3 works with no TLS in the tree)</h3>
+          {@render diagram(dStorageSeam, 'S3Storage signs through S3Store and moves bytes through a one-method HttpTransport; a presigned URL skips your server entirely.')}
           <p>
             <code>S3Storage</code> never opens a socket itself. It hands a signed request to an
             <code>HttpTransport</code> — one method — and two implementations ship with it. <code>SystemCurl</code>
@@ -2479,6 +3326,7 @@ App::new("api")
             back on demand by implementing <code>Aggregate::apply</code>. Global log positions are gap-free.
           </p>
           {@render code(cEvents, 'events')}
+          {@render diagram(dEventsFlow, 'Load, decide, append with an expected version; projections advance their checkpoint in the same transaction as their read-model writes.')}
           <p>
             <code>Projections</code> are checkpointed consumers: the handler&rsquo;s writes and its checkpoint bump
             commit in one transaction, giving exactly-once read models that you can <code>reset</code> and rebuild
@@ -2544,7 +3392,6 @@ App::new("api")
 
         <!-- ===================== ARCHITECTURE & OPERATIONS ===================== -->
         <article id="hexagonal" class="scroll-mt-24">
-          <div class="text-[#ff6a3d] text-[11px] font-mono font-semibold uppercase tracking-wider mb-2">Architecture &amp; operations</div>
           <h2 class="h2">Hexagonal architecture</h2>
           <p>
             As an app grows, the <code>hexagon</code> toolkit keeps it honest. Your domain stays pure; the application
@@ -2555,6 +3402,7 @@ App::new("api")
             the glue that turns an <code>AppResult</code> into a <code>Response</code>.
           </p>
           {@render code(cHex, 'hex')}
+          {@render diagram(dHexagonal, 'Every dependency points inward: two inbound adapters share one use case, and the composition root picks which outbound repo fills the port.')}
           <p>
             One use case can back both a route and a tool, over whichever store the composition root injects — and it
             is fully testable without starting a server. <code>Command</code>, <code>Query</code>, <code>Event</code>
@@ -2615,6 +3463,7 @@ App::new("api")
             backpressure is free, and a stack trace points at your handler rather than at a runtime.
           </p>
           {@render code(cInternals, 'internals')}
+          {@render diagram(dInternals, 'One connection on one pool worker: parse, run the app under catch_unwind, then keep-alive, stream-and-close or hand the socket to the ws reactor.')}
           <p>
             The consequences are worth internalising, because they are what you tune:
           </p>
@@ -2644,6 +3493,7 @@ App::new("api")
             discover it. This closes those three gaps and nothing more.
           </p>
           {@render code(cListeners, 'listeners')}
+          {@render diagram(dListeners, 'Listeners and the HTTP server share one shutdown flag; the server drains, then joins each listener once its closure returns.')}
           <p>
             <code>ListenerCtx</code> is deliberately tiny: <code>should_stop()</code> (true once shutdown has begun),
             <code>state::&lt;T&gt;()</code> / <code>try_state::&lt;T&gt;()</code> — the same typed state handlers and
@@ -2718,6 +3568,7 @@ App::new("api")
             a read-only <code>/__migrations</code>.
           </p>
           {@render code(cOps, 'ops')}
+          {@render diagram(dOpsGate, 'Probes answer before any guard; every other /__ path passes the ops_guard before global middleware and routing.')}
           <p>
             Because <code>Db</code> is <code>Clone</code>, clone a handle for the readiness probe before you hand
             ownership to <code>.state()</code>. The probes are intentionally credential-free and disclose nothing;
@@ -2729,7 +3580,7 @@ App::new("api")
         <article id="deploying" class="scroll-mt-24">
           <h2 class="h2">Deploying</h2>
           <p>
-            <code>.serve()</code> already does the right thing for a rolling update: it traps SIGTERM/SIGINT, stops
+            With the <code>graceful</code> feature, <code>.serve()</code> does the right thing for a rolling update: it traps SIGTERM/SIGINT, stops
             accepting new connections, and drains in-flight requests before exiting. (<code>run(addr)</code> serves
             forever and <code>run_until(addr, flag)</code> gives manual control without the signal feature.)
             <code>ontzi</code> (Basque: <em>vessel</em>) wraps Docker Compose to run the horizontally-scaled shape
@@ -2739,6 +3590,7 @@ App::new("api")
             binary as a hardened systemd unit behind nginx instead.
           </p>
           {@render code(cDeploy, 'deploy')}
+          {@render diagram(dDeployShape, 'The same shape locally under ontzi (replicas behind nginx) and on Kubernetes (probes, SIGTERM drain, authenticated metrics scrape).')}
           <p>
             Pick the backend for the deployment, not the code: one instance runs on SQLite (embedded, zero-ops); many
             pods run on Postgres, which is also what turns the queue&rsquo;s exclusivity, the advisory locks, the
@@ -2773,8 +3625,9 @@ App::new("api")
               not being. <code>^/+__</code> is free.)
             </li>
             <li>
-              <strong class="text-white">A credentialed WebSocket needs <code>check_origin</code>.</strong> The
-              same-origin policy does not stop a cross-origin handshake from carrying cookies. See
+              <strong class="text-white">A credentialed WebSocket must not <code>allow_any_origin</code>.</strong> The
+              same-origin policy does not stop a cross-origin handshake from carrying cookies; sutegi&rsquo;s
+              same-origin default does, and <code>check_origin</code> widens it to an allowlist. See
               <a href="#/docs/websockets" class="lnk">WebSockets</a>.
             </li>
           </ul>
@@ -2797,19 +3650,60 @@ App::new("api")
           </div>
         </article>
 
-        <!-- Footer nav -->
-        <div class="flex items-center justify-between pt-8 border-t border-white/10">
-          <a href="#/" class="inline-flex items-center gap-2 text-sm text-[#a0a0b0] hover:text-white transition-colors">
-            <ArrowLeft size={15} /> Back to home
+      </div>
+
+      {#if page.deep}
+        <a href="{ghBlob}docs/{page.deep}" target="_blank" rel="noopener"
+          class="mt-10 flex items-center gap-3 rounded-xl border border-white/10 bg-white/[0.03] px-5 py-4 hover:border-[#ff6a3d]/50 transition-colors">
+          <BookOpen size={18} class="text-[#ff6a3d] shrink-0" />
+          <span class="text-sm text-[#b4b4c2]"><span class="text-white font-medium">Deep dive</span> — the long-form guide, with every option and edge case.</span>
+          <ArrowRight size={15} class="ml-auto text-[#7a7a8a]" />
+        </a>
+      {/if}
+
+      <!-- Prev / next -->
+      <div class="mt-12 grid grid-cols-2 gap-4 pt-8 border-t border-white/10">
+        {#if prev}
+          <a href="#/docs/{prev.id}" class="group rounded-xl border border-white/10 px-4 py-3 hover:border-[#ff6a3d]/50 transition-colors">
+            <div class="text-[11px] uppercase tracking-wider text-[#7a7a8a] flex items-center gap-1"><ArrowLeft size={12} /> Previous</div>
+            <div class="text-sm text-white mt-1">{prev.title}</div>
           </a>
-          <a href="#/docs/introduction" class="inline-flex items-center gap-2 text-sm text-[#ff6a3d] hover:text-[#ffaa33] transition-colors">
-            Top of docs <ArrowRight size={15} />
+        {:else}<span></span>{/if}
+        {#if next}
+          <a href="#/docs/{next.id}" class="group rounded-xl border border-white/10 px-4 py-3 text-right hover:border-[#ff6a3d]/50 transition-colors">
+            <div class="text-[11px] uppercase tracking-wider text-[#7a7a8a] flex items-center justify-end gap-1">Next <ArrowRight size={12} /></div>
+            <div class="text-sm text-white mt-1">{next.title}</div>
           </a>
-        </div>
+        {/if}
       </div>
     </main>
+
+    <!-- On this page -->
+    <aside class="hidden xl:block sticky top-[57px] h-[calc(100vh-57px)] w-60 shrink-0 overflow-y-auto custom-scrollbar py-14 pr-6">
+      {#if toc.length}
+        <div class="text-[11px] uppercase tracking-wider text-[#7a7a8a] font-semibold mb-3">On this page</div>
+        <ul class="space-y-2 text-[13px]">
+          {#each toc as h}
+            <li>
+              <a href="#/docs/{current}/{h.id}" class="block leading-snug transition-colors {activeHeading === h.id ? 'text-[#ff6a3d]' : 'text-[#9090a0] hover:text-white'}">{h.text}</a>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+      <a href="{ghBlob}docs/reference/{current}.md" target="_blank" rel="noopener"
+        class="mt-8 inline-flex items-center gap-1.5 text-[12px] text-[#7a7a8a] hover:text-white transition-colors">
+        <FileText size={13} /> View as Markdown
+      </a>
+    </aside>
   </div>
 </div>
+
+{#snippet diagram(src: string, caption: string)}
+  <figure class="diagram">
+    <pre class="mermaid">{src}</pre>
+    <figcaption>{caption}</figcaption>
+  </figure>
+{/snippet}
 
 {#snippet code(text: string, key: string)}
   <div class="relative my-4">
@@ -2821,6 +3715,36 @@ App::new("api")
 {/snippet}
 
 <style>
+  .prose-doc :global(article:not(.is-active)) { display: none; }
+  .prose-doc :global(article > .h2:first-child) {
+    font-size: 2.1rem;
+    letter-spacing: -0.01em;
+    margin-bottom: 1.25rem;
+  }
+  .prose-doc :global(.diagram) {
+    margin: 1.5rem 0;
+    padding: 1.25rem 1rem 0.9rem;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 0.75rem;
+    background: rgba(255, 255, 255, 0.02);
+    overflow-x: auto;
+  }
+  .prose-doc :global(.diagram pre.mermaid) {
+    display: flex;
+    justify-content: center;
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: #7a7a8a;
+    white-space: pre;
+  }
+  .prose-doc :global(.diagram pre.mermaid:not([data-processed])) { justify-content: flex-start; }
+  .prose-doc :global(.diagram figcaption) {
+    margin-top: 0.75rem;
+    text-align: center;
+    font-size: 12.5px;
+    color: #7a7a8a;
+  }
   .prose-doc :global(p) {
     color: #b4b4c2;
     font-size: 15px;

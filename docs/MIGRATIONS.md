@@ -26,6 +26,18 @@ migrations depend on machine state and can silently emit `DROP COLUMN`.)
 
 The live database is consulted for exactly one thing: **drift detection**.
 
+```mermaid
+flowchart LR
+  F["migration files: ops JSON"] --> SH["shadow schema: ops folded in memory"]
+  M["derive(Model) schemas"] --> GEN["migrate:gen = diff(shadow, models)"]
+  SH --> GEN
+  GEN --> NF["new timestamped migration file"]
+  SH --> D1["drift: diff(shadow, live DB)"]
+  DB["live database, introspected"] --> D1
+  SH --> D2["drift: diff(shadow, models)"]
+  M --> D2
+```
+
 ## The workflow
 
 ```rust
@@ -187,6 +199,41 @@ for**:
   longer defined in code, the rollback errors with nothing undone — never a
   half-rolled-back batch. Each `down` then runs atomically with its history
   delete.
+
+```mermaid
+flowchart TD
+  A["Migrator::run"] --> V{"versions well-formed and unique?"}
+  V -- no --> X1["Err, database untouched"]
+  V -- yes --> LK["poll try_lock(sutegi:migrations), up to 300 s"]
+  LK -- timeout --> X2["Err: another runner is active"]
+  LK -- held --> H["ensure _sutegi_migrations, read history"]
+  H --> C{"checksums, names and order OK?"}
+  C -- no --> X1
+  C -- yes --> N{"next pending migration?"}
+  N -- none --> DONE["drop lock, return applied versions"]
+  N -- yes --> T["write tx on one connection"]
+  T --> RC{"already in history? re-check"}
+  RC -- yes --> N
+  RC -- no --> UP["run up, insert history row"]
+  UP -- ok --> CM["COMMIT"] --> N
+  UP -- error --> RB["ROLLBACK: no schema change, no row; Err"]
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Pending: file written by migrate:gen or by hand
+  Pending --> Applied: migrate - up + history row in one tx
+  Applied --> Pending: migrate:rollback - down + row delete in one tx
+  Applied --> Tampered: file edited or renamed
+  Tampered --> Applied: Migrator repair re-stamps the history
+  Applied --> Orphan: file deleted from code
+  note right of Tampered
+    the next migrate errors before touching anything
+  end note
+  note right of Orphan
+    a rollback batch containing it is refused whole
+  end note
+```
 
 ### Dry runs
 

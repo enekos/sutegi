@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← The REPL](repl.md) · [Documentation index](../README.md) · [Listeners →](listeners.md)
+[← Deployment](deploying.md) · [Documentation index](../README.md) · [The workspace map →](crates.md)
 
 # Inside the server
 
@@ -33,6 +33,26 @@ accept()  ->  a fixed thread pool (WORKERS, default 8)
 // /__metrics counts requests total, in-flight, and by status class.
 ```
 
+```mermaid
+flowchart TD
+  A["accept loop (non-blocking, honours shutdown flag)"] --> Q["bounded job queue (max_pending)"]
+  Q --> P["pool worker: parse request line, headers, body"]
+  P -->|"too large, bad framing or header_timeout"| REJ["413, 400, 408 or 501, then close"]
+  P --> S["App service runs under catch_unwind"]
+  S -->|"handler panicked"| E500["500 Internal Server Error"]
+  S --> B{"response body?"}
+  B -->|"Body::Upgrade"| UP["write 101 head, hand the socket to the ws reactor, worker freed"]
+  B -->|"Body::Stream"| ST["write head, run producer, close"]
+  B -->|"Body::Full"| W["write head and body"]
+  E500 --> W
+  W --> K{"keep-alive and under keep_alive_max?"}
+  K -->|"yes, wait up to keep_alive_idle"| P
+  K -->|"no"| X["close, worker takes the next connection"]
+  ST --> X
+```
+
+*One connection on one pool worker: parse, run the app under catch\_unwind, then keep-alive, stream-and-close or hand the socket to the ws reactor.*
+
 The consequences are worth internalising, because they are what you tune:
 
 - **A connection costs a thread while it is open.** Keep-alive is therefore capped twice — `keep_alive_idle` (default 5 s, deliberately much shorter than the socket timeout) and `keep_alive_max` (default 100 requests) — so an idle client cannot pin a worker indefinitely.
@@ -45,4 +65,4 @@ Ordering is fixed and worth knowing when you place a guard: ops guard → global
 
 ---
 
-[← The REPL](repl.md) · [Documentation index](../README.md) · [Listeners →](listeners.md)
+[← Deployment](deploying.md) · [Documentation index](../README.md) · [The workspace map →](crates.md)

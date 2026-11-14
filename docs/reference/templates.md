@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Event sourcing](events.md) · [Documentation index](../README.md) · [Collections →](collections.md)
+[← Responses & errors](responses.md) · [Documentation index](../README.md) · [Sessions & CSRF →](sessions.md)
 
 # Templates
 
@@ -27,4 +27,4 @@ Templates compile once to an AST and report line-numbered errors. It also powers
 
 ---
 
-[← Event sourcing](events.md) · [Documentation index](../README.md) · [Collections →](collections.md)
+[← Responses & errors](responses.md) · [Documentation index](../README.md) · [Sessions & CSRF →](sessions.md)

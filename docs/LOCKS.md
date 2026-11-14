@@ -50,6 +50,24 @@ operator can inspect or take the same lock from psql:
   SQLite file do not contend — the capability says `process`, believe it. For
   cross-process coordination use the Postgres backend.
 
+```mermaid
+sequenceDiagram
+  participant A as Pod A
+  participant PG as Postgres
+  participant B as Pod B
+  A->>PG: open a dedicated session, not a pooled one
+  A->>PG: SELECT pg_try_advisory_lock(lock_key(janitor))
+  PG-->>A: true - guard owns the session
+  B->>PG: open a dedicated session
+  B->>PG: SELECT pg_try_advisory_lock(lock_key(janitor))
+  PG-->>B: false
+  B->>PG: close the session
+  Note over B: with_lock returns Ok(None) - another pod ran it
+  A->>A: run f() while the guard holds the session
+  A->>PG: guard drops, session closes
+  Note over PG: session gone = lock released, the same path as a crashed holder
+```
+
 ## Patterns
 
 **Leader election** — hold the lock for the process lifetime; followers retry:

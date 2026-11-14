@@ -54,6 +54,32 @@ the socket and poll `should_stop()` each lap, as above. A listener that never
 polls holds the process until the orchestrator's grace period expires and
 SIGKILL lands — honest, but avoidable.
 
+```mermaid
+sequenceDiagram
+  participant App as run_until or run_graceful
+  participant L as listener thread
+  participant S as HTTP server
+  participant F as shutdown flag
+  App->>L: spawn sutegi-listener-name, call the closure with ListenerCtx
+  App->>S: serve_until(addr, workers, flag)
+  loop each lap
+    L->>F: should_stop()?
+    F-->>L: false
+    L->>L: recv with a read timeout, handle the packet
+  end
+  Note over F: SIGTERM or SIGINT (or your code) sets the flag
+  par server drains
+    S->>S: stop accepting, finish in-flight requests
+  and listener notices
+    L->>F: should_stop()?
+    F-->>L: true
+    L->>L: leave the loop, return
+  end
+  S-->>App: serve_until returns
+  App->>L: join() waits until the closure has returned
+  Note over L: a panic is caught and logged once, the thread ends and is not restarted
+```
+
 ## Failure semantics
 
 A panicking listener does not restart and does not take the server down: the

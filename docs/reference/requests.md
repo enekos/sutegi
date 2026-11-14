@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Routing](routing.md) · [Documentation index](../README.md) · [Responses & errors →](responses.md)
+[← Middleware, CORS & guards](middleware.md) · [Documentation index](../README.md) · [Responses & errors →](responses.md)
 
 # Requests & the Ctx
 
@@ -34,4 +34,4 @@ State is keyed by type, one value per type: registering the same type twice repl
 
 ---
 
-[← Routing](routing.md) · [Documentation index](../README.md) · [Responses & errors →](responses.md)
+[← Middleware, CORS & guards](middleware.md) · [Documentation index](../README.md) · [Responses & errors →](responses.md)

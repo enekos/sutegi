@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Your first app](first-app.md) · [Documentation index](../README.md) · [Configuration →](configuration.md)
+[← Configuration](configuration.md) · [Documentation index](../README.md) · [Directory structure →](layout.md)
 
 # Feature flags
 
@@ -35,4 +35,4 @@ Features compose the obvious way: `auth` implies `session` + `orm`, `channels` i
 
 ---
 
-[← Your first app](first-app.md) · [Documentation index](../README.md) · [Configuration →](configuration.md)
+[← Configuration](configuration.md) · [Documentation index](../README.md) · [Directory structure →](layout.md)

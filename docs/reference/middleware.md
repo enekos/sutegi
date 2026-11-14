@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Responses & errors](responses.md) · [Documentation index](../README.md) · [Validation →](validation.md)
+[← Routing](routing.md) · [Documentation index](../README.md) · [Requests & the Ctx →](requests.md)
 
 # Middleware, CORS & guards
 
@@ -38,6 +38,31 @@ App::new("api")
     .serve()
 ```
 
+```mermaid
+flowchart TD
+  IN["request"] --> PR{"path is /__health or /__ready?"}
+  PR -->|"yes"| PROBE["probe answers 200 or 503"]
+  PR -->|"no"| OPS{"first routed segment starts with __?"}
+  OPS -->|"yes"| G["ops_guard (403 when unset, unless ops_public)"]
+  OPS -->|"no"| GM["global middleware, in registration order"]
+  G -->|"passes"| GM
+  G -->|"rejects"| AFTER
+  GM -->|"Some(response)"| AFTER
+  GM -->|"None"| BI{"/__metrics, /__logs or /__introspect?"}
+  BI -->|"yes"| AFTER
+  BI -->|"no"| RM{"route match"}
+  RM -->|"no route"| NF["404, or 405 if another method matches"]
+  RM -->|"match"| GR["group middleware"]
+  GR -->|"Some(response)"| AFTER
+  GR -->|"None"| H["handler(ctx)"]
+  H --> AFTER["after-middleware, on every response"]
+  NF --> AFTER
+  PROBE --> AFTER
+  AFTER --> OUT["access log line and metrics, then write"]
+```
+
+*Where a request can be answered early; every response, early or not, still passes through after-middleware.*
+
 The batteries are built in: `logger()`, `rate_limit(max, per)`, `bearer`, `basic`, `cors`, `cors_preflight`, `cors_credentialed`, `cors_preflight_credentialed`, and `secure_headers`.
 
 > [!WARNING]
@@ -52,4 +77,4 @@ The batteries are built in: `logger()`, `rate_limit(max, per)`, `bearer`, `basic
 
 ---
 
-[← Responses & errors](responses.md) · [Documentation index](../README.md) · [Validation →](validation.md)
+[← Routing](routing.md) · [Documentation index](../README.md) · [Requests & the Ctx →](requests.md)

@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Feature flags](features.md) · [Documentation index](../README.md) · [Directory & conventions →](layout.md)
+[← Your first app](first-app.md) · [Documentation index](../README.md) · [Feature flags →](features.md)
 
 # Configuration
 
@@ -41,4 +41,4 @@ MAIL_HOST=… MAIL_PORT=… MAIL_USERNAME=… MAIL_PASSWORD=…
 
 ---
 
-[← Feature flags](features.md) · [Documentation index](../README.md) · [Directory & conventions →](layout.md)
+[← Your first app](first-app.md) · [Documentation index](../README.md) · [Feature flags →](features.md)

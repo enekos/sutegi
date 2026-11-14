@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← The key/value store](kv.md) · [Documentation index](../README.md) · [Defining tools →](tools.md)
+[← Relations](relations.md) · [Documentation index](../README.md) · [Defining tools →](tools.md)
 
 # The agent surface
 
@@ -31,6 +31,31 @@ curl -H "$AUTH" -H 'Content-Type: application/json' -X POST localhost:8080/__too
 
 The contract is three steps — discover (`/__introspect`), read the manifest (`/__tools`), invoke (`POST /__tools/:name`, or `/__tools/:name/stream` for SSE) — and it is extended, not replaced, by the realtime surfaces: `/__channels` teaches an agent the channel protocol, `/__actors` shows live process status. Everything under `/__` except the two probes sits behind [`ops_guard`](middleware.md).
 
+```mermaid
+sequenceDiagram
+  participant A as Agent
+  participant G as ops_guard
+  participant App as sutegi app
+  Note over G,App: every /__ path except /__health and /__ready passes the guard, 403 when none is set
+  A->>G: GET /__introspect with the credential
+  G->>App: pass
+  App-->>A: routes, models, tools, capabilities, listeners
+  A->>G: GET /__tools
+  G->>App: pass
+  App-->>A: name, description, input_schema, streaming for each tool
+  alt streaming is false
+    A->>G: POST /__tools/name with JSON arguments
+    G->>App: pass
+    App-->>A: 200 with the JSON result, or a JSON error
+  else streaming is true
+    A->>G: POST /__tools/name/stream with JSON arguments
+    G->>App: pass
+    App-->>A: text/event-stream frames until the server closes
+  end
+```
+
+*The agent contract: discover, read the manifest, then invoke the unary or the streaming endpoint, all behind ops\_guard.*
+
 > [!NOTE]
 > **The full contract**
 >
@@ -38,4 +63,4 @@ The contract is three steps — discover (`/__introspect`), read the manifest (`
 
 ---
 
-[← The key/value store](kv.md) · [Documentation index](../README.md) · [Defining tools →](tools.md)
+[← Relations](relations.md) · [Documentation index](../README.md) · [Defining tools →](tools.md)

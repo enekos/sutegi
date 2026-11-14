@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Mail](mail.md) · [Documentation index](../README.md) · [Event sourcing →](events.md)
+[← Actors & supervision](actors.md) · [Documentation index](../README.md) · [Authentication →](auth.md)
 
 # File storage
 
@@ -36,6 +36,24 @@ let url = s3.presign_put("reports/q2.pdf", 900)?;            // seconds
 
 ## The transport seam (how S3 works with no TLS in the tree)
 
+```mermaid
+flowchart TD
+    APP["your code"] --> ST{"Storage trait"}
+    ST --> FS["FsStorage: local directory"]
+    ST --> DBS["DbStorage: blobs in SQLite or Postgres"]
+    ST --> S3S["S3Storage"]
+    S3S -->|"sign with SigV4 and the real payload hash"| S3["S3Store"]
+    S3S -->|"signed HttpRequest"| HT{"HttpTransport trait"}
+    HT --> CURL["SystemCurl: https via the system curl"]
+    HT --> PH["PlainHttp: pure std, refuses https"]
+    HT --> OWN["your HTTP client"]
+    CURL & PH & OWN --> BUCKET[("bucket: S3, R2, MinIO, Garage")]
+    APP -->|"presign"| S3
+    CLIENT["browser or agent"] -->|"PUT or GET the presigned URL"| BUCKET
+```
+
+*S3Storage signs through S3Store and moves bytes through a one-method HttpTransport; a presigned URL skips your server entirely.*
+
 `S3Storage` never opens a socket itself. It hands a signed request to an `HttpTransport` — one method — and two implementations ship with it. `SystemCurl` delegates the `https` handshake and certificate verification to the system `curl`, so the crypto that must not be hand-rolled isn’t and the dependency count stays at zero. `PlainHttp` is pure `std` and **refuses `https`** rather than pretending — for a store on a trusted path: in-cluster MinIO, a sidecar Garage, a dev container. Your own client is `impl HttpTransport for MyClient`.
 
 Every request is signed with the **real payload hash** (`x-amz-content-sha256`, never `UNSIGNED-PAYLOAD`), so a body altered in flight is refused by the store — integrity that holds even over `PlainHttp`. Uploads and downloads are `ETag`-verified when the store reports a plain MD5 (multipart and encrypted ETags are skipped, not faked; `verify_etag(false)` opts out). `list` follows continuation tokens and is bounded by `max_list_keys` (default 100,000), so a ten-million-object bucket **errors instead of silently truncating**. Signing is verified against AWS’s published known-answer vectors, for presigned URLs and signed headers alike.
@@ -44,4 +62,4 @@ Every request is signed with the **real payload hash** (`x-amz-content-sha256`, 
 
 ---
 
-[← Mail](mail.md) · [Documentation index](../README.md) · [Event sourcing →](events.md)
+[← Actors & supervision](actors.md) · [Documentation index](../README.md) · [Authentication →](auth.md)

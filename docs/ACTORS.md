@@ -79,6 +79,28 @@ let sup = Supervisor::new("pipeline")
 - `Supervisor::start()` returns only after every child's first generation is
   up, so `child_ref` works immediately.
 
+What the supervisor thread does with each child exit:
+
+```mermaid
+flowchart TD
+    X["child thread exits: panic caught, or stopped"] --> E["Exit with id, generation, reason sent to the supervisor"]
+    E --> S{"stale generation?"}
+    S -->|yes| IG["ignored"]
+    S -->|no| P{"restart policy"}
+    P -->|"Temporary, or Transient after a clean stop"| DOWN["child stays down"]
+    P -->|"Permanent, or Transient after a crash"| I{"more than max restarts in window?"}
+    I -->|yes| FAIL["stop every child in reverse order, supervisor Failed"]
+    I -->|no| BO["sleep the child's backoff"]
+    BO --> ST{"strategy"}
+    ST -->|OneForOne| R1["the exited child"]
+    ST -->|RestForOne| R2["it and every later sibling"]
+    ST -->|OneForAll| R3["every child"]
+    R1 & R2 & R3 --> RS["stop the set in reverse order, restart in start order from the factory"]
+```
+
+Supervisors do not nest: a `ChildSpec` builds an `Actor`, so the tree is one
+supervisor deep.
+
 Stopping is cooperative (OTP's infinite shutdown timeout): `sup.stop()`
 stops children in reverse order and waits for their threads.
 

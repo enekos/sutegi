@@ -58,6 +58,20 @@ in Rust — one code path on both engines — and the top-k rows come back in
 fused order. A doc ranked well in *both* legs beats a doc ranked first in one
 and absent from the other.
 
+```mermaid
+flowchart TD
+  Q["hybrid_search(query text, query vector, k)"] --> LX["lexical leg: search(), top n = max(4k, 50) by _rank"]
+  Q --> VQ{"capabilities().vector?"}
+  VQ -- yes --> VP["pushdown: ORDER BY col <=> ? LIMIT n"]
+  VQ -- no --> VB["brute force: embedding::nearest, cosine, in Rust"]
+  LX --> F["RRF in Rust: score += 1 / (60 + rank) per leg"]
+  VP --> F
+  VB --> F
+  F --> T["sort by fused score, keep top k"]
+  T --> R["SELECT rows WHERE pk IN (top k)"]
+  R --> O["re-order to fused rank, attach _score"]
+```
+
 ## Agent surface
 
 - `capabilities().fts` — true on both bundled backends.

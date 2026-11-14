@@ -40,6 +40,19 @@ the first builder feature whose SQL *shape* differs per engine
 (`build_for(dialect)` exists for direct callers; `build()` stays the
 canonical SQLite form).
 
+```mermaid
+flowchart TD
+  W["where_json(meta, $.stats.views, >, 50)"] --> P{"parse_json_path"}
+  P -- malformed --> E["builder error, returned at build"]
+  P -- ok --> S["segments: Key stats, Key views"]
+  S --> X{"executing backend dialect"}
+  X -- SQLite --> L["json_extract(meta, ?) > ? with $.stats.views and 50 bound"]
+  X -- Postgres --> G["(meta #>> ?)::numeric > ? with {stats,views} and 50 bound"]
+  C["where_json_contains(meta, doc)"] --> Y{"executing backend dialect"}
+  Y -- SQLite --> N["Err: unsupported json_contains"]
+  Y -- Postgres --> K["meta @> ?::jsonb"]
+```
+
 | | SQLite (JSON1) | Postgres (jsonb) |
 |---|---|---|
 | extract | `json_extract(col, ?)` — typed values | `col #>> ?` — text, cast by the value's type (`::numeric` for Int/Real so `9 < 10` compares as numbers, `::boolean` for Bool) |

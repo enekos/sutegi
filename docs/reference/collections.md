@@ -1,6 +1,6 @@
 <!-- Generated from landing/src/Docs.svelte. Run: cd landing && pnpm docs:export -->
 
-[← Templates](templates.md) · [Documentation index](../README.md) · [Crypto primitives →](crypto.md)
+[← The REPL](repl.md) · [Documentation index](../README.md) · [Event sourcing →](events.md)
 
 # Collections
 
@@ -29,4 +29,4 @@ It is a thin layer over `Vec<T>`: it `Deref`s to `[T]` and round-trips through `
 
 ---
 
-[← Templates](templates.md) · [Documentation index](../README.md) · [Crypto primitives →](crypto.md)
+[← The REPL](repl.md) · [Documentation index](../README.md) · [Event sourcing →](events.md)

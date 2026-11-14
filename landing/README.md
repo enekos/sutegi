@@ -49,7 +49,9 @@ src/main.ts         mounts the app
 src/App.svelte      routes between <Landing/> and <Docs/>
 src/app.css         Tailwind import + theme tokens + animations
 src/Landing.svelte  hero, features, use-cases, quickstart, tutorial, live introspect
-src/Docs.svelte     grouped documentation reference
+src/Docs.svelte     the docs (#/docs/<topic>): grouped sidebar + search, one page
+                    per topic, "On this page" TOC, prev/next, Mermaid diagrams
+                    (lazy-loaded from jsDelivr, only on pages that have one)
 scripts/export-docs.mjs  exports both pages to ../docs/ as Markdown
 ```
 

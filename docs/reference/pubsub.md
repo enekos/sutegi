@@ -27,12 +27,34 @@ broker.unsubscribe("orders", id);
 // dropping it silently. Ship ids, not blobs; delivery is at-most-once.
 ```
 
+```mermaid
+flowchart LR
+    subgraph PodA["Pod A"]
+        P["publish(topic, msg)"] --> LA["local subscribers on A (synchronous)"]
+        P --> Q["bounded queue (full: dropped)"]
+        Q --> PUB["publisher thread"]
+        LSA["listener thread A"]
+    end
+    PUB -->|"pg_notify with envelope (instance, topic, msg)"| PG[("Postgres channel sutegi_pubsub")]
+    PG -->|"NOTIFY"| LSA
+    PG -->|"NOTIFY"| LSB
+    LSA --> SKIP["own instance id: echo skipped"]
+    subgraph PodB["Pod B"]
+        LSB["listener thread B"] --> LB["local subscribers on B"]
+    end
+```
+
+*PgPubSub delivers to local subscribers synchronously, then one NOTIFY reaches every other pod; the in-process PubSub has only the local branch.*
+
 `PgPubSub` uses one shared PG channel with topics inside a JSON envelope — immune to the 63-byte identifier truncation trap — plus a lazy publisher with one transparent retry and a listener that reconnects with capped backoff. Fan-out cost on the database is per *message*, not per subscriber: one connection per pod for listening, one for publishing.
 
 > [!WARNING]
 > **At-most-once, by design**
 >
 > Delivery is fire-and-forget (Phoenix’s contract too): a pod that is reconnecting misses messages sent meanwhile, and `NOTIFY` payloads cap at ~8 KB. If a message must survive, put it in a table (or the [event store](events.md)) and broadcast *that there is news*.
+
+> [!TIP]
+> **Deep dive:** [the long-form guide](../REALTIME.md), with every option and edge case.
 
 ---
 
