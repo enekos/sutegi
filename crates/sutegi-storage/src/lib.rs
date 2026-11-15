@@ -37,7 +37,7 @@
 //! # let _ = bytes;
 //! ```
 
-use std::io::Read;
+use std::io::{Read, Seek};
 use sutegi_json::Json;
 
 pub mod fs;
@@ -81,10 +81,58 @@ impl ObjectMeta {
     }
 }
 
+/// Large-object operations explicitly supported without buffering the object.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StorageCaps {
+    pub streaming_write: bool,
+    pub seekable_read: bool,
+}
+impl StorageCaps {
+    pub fn to_json(self) -> Json {
+        Json::obj(vec![
+            ("streaming_write", Json::Bool(self.streaming_write)),
+            ("seekable_read", Json::Bool(self.seekable_read)),
+        ])
+    }
+}
+
+pub trait ReadSeek: Read + Seek {}
+impl<T: Read + Seek> ReadSeek for T {}
+
+/// One open object and its metadata. Replacement of a filesystem key does
+/// not change this handle, so range lengths describe the bytes actually read.
+pub struct OpenObject {
+    pub meta: ObjectMeta,
+    pub reader: Box<dyn ReadSeek + Send>,
+}
+
 /// A byte-level object store. Implemented by [`FsStorage`], [`DbStorage`] and
 /// [`S3Storage`]; app code holds `impl Storage` (or a concrete type) and swaps
 /// backends by changing the type it constructs, not the call sites.
 pub trait Storage {
+    fn capabilities(&self) -> StorageCaps {
+        StorageCaps::default()
+    }
+
+    /// Read exactly `length` bytes with bounded memory and atomically publish
+    /// the completed object. A short/erroring source must not replace a key.
+    /// Unsupported backends return an error without reading the source.
+    fn put_reader(
+        &self,
+        _key: &str,
+        _source: &mut dyn Read,
+        _length: u64,
+        _content_type: &str,
+    ) -> Result<(), String> {
+        Err("streaming writes are unsupported by this storage backend".into())
+    }
+
+    /// Open a seekable object without buffering it. Used for HTTP ranges.
+    /// The existing `get_reader` fallback is deliberately not used here.
+    fn open(&self, _key: &str) -> Result<Option<OpenObject>, String> {
+        Err("seekable reads are unsupported by this storage backend".into())
+    }
+
     /// Store `bytes` at `key` (create or overwrite), recording `content_type`.
     fn put(&self, key: &str, bytes: &[u8], content_type: &str) -> Result<(), String>;
 
@@ -175,6 +223,9 @@ pub fn content_type_of(key: &str) -> &'static str {
         "wasm" => "application/wasm",
         "mp3" => "audio/mpeg",
         "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "ogg" => "audio/ogg",
+        "wav" => "audio/wav",
         "zip" => "application/zip",
         "gz" => "application/gzip",
         _ => "application/octet-stream",

@@ -34,3 +34,34 @@ Global draining closes a stalled upload at the shutdown deadline.
 routes require a real HTTP connection; test them as in `tests/uploads.rs`.
 The route manifest marks `streaming_upload`, and the app capability map
 advertises `streaming_uploads` when such routes are mounted.
+
+## Recording storage and playback
+
+`Storage::capabilities()` reports `streaming_write` and `seekable_read`.
+`FsStorage` supports both. `put_reader(key, reader, length, content_type)`
+uses constant memory, private unique temporary files, and publishes complete
+bytes by atomic rename. Short/erroring reads leave existing bytes intact.
+Use immutable recording keys: object bytes and the content-type sidecar are
+separate files, not a transaction. Manage retention and disk quotas in the app.
+
+`Storage::open(key)` returns metadata and a seekable reader over one opened
+object. Pass that reader to `web::download(&ctx.req, object.reader,
+&object.meta.content_type)` after authorization. The helper derives length
+from the open reader, supports GET and HEAD, and advertises `Accept-Ranges`.
+Single byte ranges return 206; unsatisfiable ranges return 416 with
+`Content-Range: bytes */length`. Invalid/multiple ranges are ignored. HEAD
+ignores Range and sends no bytes. If-Range falls back to a full response
+because this helper does not supply a validator. These semantics follow
+[RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html#name-range).
+
+`Response::with_reader(reader, length)` is the lower-level primitive. The
+server owns Content-Length, copies only that many bytes, and closes on a
+short reader or write failure. HEAD does not invoke the reader.
+
+S3 and database storage explicitly return unsupported for `put_reader` and
+`open`; they do not silently collect a recording into memory. Existing
+`get_reader` can still buffer on these backends. For large S3 recordings,
+authorize the recording/key in Sutegi, issue a short-lived `presign_put`,
+then verify the stored object's size/type before marking it complete. Use
+`presign_get` for playback; the object store handles ranges. Configure bucket
+CORS for the app's origin and keep tokens scoped to an immutable object key.

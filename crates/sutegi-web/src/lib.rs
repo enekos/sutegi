@@ -19,8 +19,10 @@ pub use sutegi_http::{
 use sutegi_json::Json;
 
 mod access;
+mod download;
 mod files;
 pub use access::{AccessLog, REQUEST_ID_HEADER};
+pub use download::download;
 mod respond;
 pub use respond::{Error, IntoResponse};
 

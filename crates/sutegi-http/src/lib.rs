@@ -146,6 +146,11 @@ pub type UpgradeTakeover = Box<dyn FnOnce(TcpStream, Vec<u8>) + Send + 'static>;
 pub enum Body {
     Full(Vec<u8>),
     Stream(StreamProducer),
+    /// A streaming body with an authoritative length, including for HEAD.
+    Reader {
+        reader: Box<dyn Read + Send>,
+        length: u64,
+    },
     Upgrade(UpgradeTakeover),
 }
 
@@ -191,6 +196,16 @@ impl Response {
         producer: impl FnOnce(&mut dyn Write) -> io::Result<()> + Send + 'static,
     ) -> Response {
         self.body = Body::Stream(Box::new(producer));
+        self
+    }
+
+    /// Stream exactly `length` bytes without buffering. A short reader or
+    /// write failure closes the connection; excess bytes are never written.
+    pub fn with_reader(mut self, reader: impl Read + Send + 'static, length: u64) -> Response {
+        self.body = Body::Reader {
+            reader: Box::new(reader),
+            length,
+        };
         self
     }
 
@@ -713,6 +728,29 @@ fn write_head_and_body<W: Write>(
             }
             w.flush()
         }
+        Body::Reader { reader, length } => {
+            let _ = write!(head, "content-length: {length}\r\n");
+            head.push_str(if keep_alive {
+                "connection: keep-alive\r\n\r\n"
+            } else {
+                "connection: close\r\n\r\n"
+            });
+            w.write_all(head.as_bytes())?;
+            if !head_only {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let copied = io::copy(&mut reader.take(length), w)?;
+                    if copied != length {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "short response body",
+                        ));
+                    }
+                    Ok(())
+                }))
+                .unwrap_or_else(|_| Err(io::Error::other("response reader panicked")))?;
+            }
+            w.flush()
+        }
         Body::Stream(producer) => {
             // No content-length: framing is "read until close".
             head.push_str("connection: close\r\n\r\n");
@@ -803,6 +841,7 @@ pub fn status_reason(status: u16) -> &'static str {
         101 => "Switching Protocols",
         200 => "OK",
         201 => "Created",
+        206 => "Partial Content",
         202 => "Accepted",
         204 => "No Content",
         301 => "Moved Permanently",
@@ -1240,6 +1279,28 @@ impl Drop for ThreadPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sized_readers_frame_head_and_reject_truncation() {
+        let mut wire = Vec::new();
+        let response = Response::new(200).with_reader(std::io::empty(), 200_000_000);
+        write_head_and_body(&mut wire, response, false, true).unwrap();
+        let wire = String::from_utf8(wire).unwrap();
+        assert!(wire.contains("content-length: 200000000\r\n"));
+        assert!(wire.ends_with("\r\n\r\n"));
+        let mut wire = Vec::new();
+        let response = Response::new(200).with_reader(std::io::Cursor::new(b"abc"), 4);
+        assert_eq!(
+            write_response(&mut wire, response, true)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        let mut wire = Vec::new();
+        let response = Response::new(200).with_reader(std::io::Cursor::new(b"abc"), 2);
+        write_response(&mut wire, response, true).unwrap();
+        assert!(wire.ends_with(b"\r\n\r\nab"));
+    }
 
     #[test]
     fn parses_request_with_body() {

@@ -274,6 +274,10 @@ impl Repl {
                 let ct = header(&resp.headers, "content-type").unwrap_or_default();
                 match resp.body {
                     Body::Full(bytes) => print_body(out, &ct, &bytes),
+                    Body::Reader { reader, length } => {
+                        std::io::copy(&mut std::io::Read::take(reader, length), out)?;
+                        writeln!(out)
+                    }
                     Body::Stream(producer) => {
                         // The producer flushes per frame; `out` sees them live.
                         if let Err(e) = producer(out) {
@@ -387,7 +391,9 @@ impl Repl {
                 }
                 match resp.body {
                     Body::Full(bytes) => Json::parse(&String::from_utf8_lossy(&bytes)),
-                    Body::Stream(_) => Err(format!("GET {target} unexpectedly streams")),
+                    Body::Stream(_) | Body::Reader { .. } => {
+                        Err(format!("GET {target} unexpectedly streams"))
+                    }
                     Body::Upgrade(_) => Err(format!("GET {target} unexpectedly upgrades")),
                 }
             }

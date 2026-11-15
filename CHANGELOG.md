@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Storage/playback: explicit streaming capabilities, atomic filesystem `put_reader`, seekable object handles, and length-delimited HTTP readers with GET byte ranges and HEAD support.
+
 - HTTP/web: opt-in streaming upload routes with header authorization, per-route byte/deadline limits, sticky read failures, and unchanged buffered-route size limits. Content-Length is required; chunked requests remain rejected.
 
 - HTTP/web/ws: shared Running/Draining/Stopped lifecycle, readiness during drain, authorized reconnect hooks, bounded transport shutdown and listener cancellation. `App::run_until` now starts a configurable grace period (default 5s).
