@@ -901,14 +901,14 @@ cargo add sutegi
 # tool surface are always present; there is no "ai" feature to enable.
 [dependencies]
 # Single-node app: bundled SQLite + graceful shutdown.
-sutegi = { version = "0.13", features = ["sqlite", "graceful"] }
+sutegi = { version = "0.14", features = ["sqlite", "graceful"] }
 
 # Multi-pod app: Postgres, the durable queue, cross-pod realtime.
-# sutegi = { version = "0.13", features = [
+# sutegi = { version = "0.14", features = [
 #     "postgres", "queue", "channels", "pubsub-postgres", "graceful" ] }
 
 # Nothing but the HTTP core — ~480 KB, no ORM, no derives:
-# sutegi = { version = "0.13", default-features = false }`;
+# sutegi = { version = "0.14", default-features = false }`;
 
   const cFirstApp = `use sutegi::prelude::*;
 
@@ -1417,7 +1417,7 @@ App::new("settings")
 AUTH="Authorization: Bearer dev-token"
 curl -H "$AUTH" localhost:8080/__introspect
 # {
-#   "framework": "sutegi", "version": "0.13.0", "name": "todo",
+#   "framework": "sutegi", "version": "0.14.0", "name": "todo",
 #   "routes": [ { "method": "GET", "pattern": "/todos/:id", "doc": "…" } ],
 #   "models": [ … ], "tools": [ … ],
 #   "capabilities": { "backend": "postgres", "skip_locked": true, … },
@@ -2034,7 +2034,7 @@ let (result, records) = log::capture(|| svc(request));`;
       </button>
     </div>
     <div class="flex items-center gap-2 sm:gap-3">
-      <span class="hidden md:inline text-[11px] font-mono text-[#7a7a8a] border border-white/10 rounded-full px-2.5 py-1">v0.13</span>
+      <span class="hidden md:inline text-[11px] font-mono text-[#7a7a8a] border border-white/10 rounded-full px-2.5 py-1">v0.14</span>
       <a href="#/" class="hidden sm:inline-flex items-center gap-1.5 px-4 py-2 text-sm text-[#a0a0b0] hover:text-white transition-colors">
         <ArrowLeft size={14} /> Home
       </a>

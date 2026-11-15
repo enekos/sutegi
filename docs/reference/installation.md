@@ -14,14 +14,14 @@ cargo add sutegi
 # tool surface are always present; there is no "ai" feature to enable.
 [dependencies]
 # Single-node app: bundled SQLite + graceful shutdown.
-sutegi = { version = "0.13", features = ["sqlite", "graceful"] }
+sutegi = { version = "0.14", features = ["sqlite", "graceful"] }
 
 # Multi-pod app: Postgres, the durable queue, cross-pod realtime.
-# sutegi = { version = "0.13", features = [
+# sutegi = { version = "0.14", features = [
 #     "postgres", "queue", "channels", "pubsub-postgres", "graceful" ] }
 
 # Nothing but the HTTP core — ~480 KB, no ORM, no derives:
-# sutegi = { version = "0.13", default-features = false }
+# sutegi = { version = "0.14", default-features = false }
 ```
 
 > [!TIP]
