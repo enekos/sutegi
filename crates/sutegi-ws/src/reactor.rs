@@ -383,9 +383,9 @@ impl std::fmt::Debug for Conn {
     }
 }
 
-/// Fan one pre-encoded frame out to many connections, grouping targets by
-/// shard so each shard's inbox lock is taken **once** — the difference
-/// between `shards` lock cycles and one-per-connection at a million sockets.
+/// Fan one pre-encoded frame out to many connections. Each target reserves
+/// its own queue budget; overloaded targets close with 1013. Frame bytes are
+/// shared across targets, while admission takes one inbox lock per target.
 /// Encode the frame once with [`text_frame`]/[`binary_frame`] and pass it here.
 ///
 /// ```ignore
