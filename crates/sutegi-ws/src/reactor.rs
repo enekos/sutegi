@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use sutegi_http::Request;
+use sutegi_http::{Lifecycle, Phase, Request};
 
 use crate::poller::{raise_nofile_limit, Poller, WakePipe};
 use crate::protocol::{
@@ -151,6 +151,8 @@ pub struct Handlers {
     /// If set, the handshake is refused with `403` unless this returns `true`.
     /// Checked before the 101 so a rejected client never becomes a socket.
     pub authorize: Option<Authorize>,
+    /// Explicit app authorization for reconnecting an existing session during drain.
+    pub admit_during_drain: Option<Authorize>,
     /// If set, the `Origin` header must be present and exactly match one of
     /// these — the built-in defense against Cross-Site WebSocket Hijacking
     /// (a cookie-authenticated socket opened by an attacker's page). Checked
@@ -247,6 +249,7 @@ struct ShardShared {
     max_bytes: usize,
     max_buffered: usize,
     rejected: AtomicUsize,
+    lifecycle: Lifecycle,
 }
 
 impl ShardShared {
@@ -280,7 +283,7 @@ impl Conn {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.budget.closed.load(Ordering::Acquire)
+        self.budget.closed.load(Ordering::Acquire) || self.shard.lifecycle.phase() == Phase::Stopped
     }
 
     pub fn buffered_bytes(&self) -> usize {
@@ -473,6 +476,7 @@ impl Admission {
 /// The process-wide WebSocket engine. Start once, adopt every upgraded
 /// socket into it.
 pub struct WsRuntime {
+    lifecycle: Lifecycle,
     shards: Vec<Arc<ShardShared>>,
     next_shard: AtomicUsize,
     admission: Arc<Admission>,
@@ -481,6 +485,10 @@ pub struct WsRuntime {
 impl WsRuntime {
     /// Spawn the reactor threads and return the shared runtime handle.
     pub fn start(cfg: WsConfig) -> io::Result<Arc<WsRuntime>> {
+        Self::start_with_lifecycle(cfg, Lifecycle::new())
+    }
+
+    pub fn start_with_lifecycle(cfg: WsConfig, lifecycle: Lifecycle) -> io::Result<Arc<WsRuntime>> {
         if cfg.raise_nofile {
             raise_nofile_limit();
         }
@@ -505,8 +513,15 @@ impl WsRuntime {
                 max_bytes: cfg.max_pending_bytes,
                 max_buffered: cfg.max_buffered,
                 rejected: AtomicUsize::new(0),
+                lifecycle: lifecycle.clone(),
                 pipe: WakePipe::new()?,
                 wake_pending: AtomicBool::new(false),
+            });
+            let weak = Arc::downgrade(&shared);
+            lifecycle.on_change(move || {
+                if let Some(shared) = weak.upgrade() {
+                    shared.wake();
+                }
             });
             let poller = Poller::new()?;
             poller.add(shared.pipe.read_fd(), WAKE_TOKEN, false)?;
@@ -527,6 +542,7 @@ impl WsRuntime {
             shards.push(shared);
         }
         Ok(Arc::new(WsRuntime {
+            lifecycle,
             shards,
             next_shard: AtomicUsize::new(0),
             admission,
@@ -548,6 +564,23 @@ impl WsRuntime {
         handlers: Arc<Handlers>,
         req: Request,
     ) -> io::Result<()> {
+        self.adopt_with_policy(stream, leftover, handlers, req, false)
+    }
+
+    /// `existing` is an app-authorized reconnect to an already running session.
+    pub fn adopt_with_policy(
+        &self,
+        stream: TcpStream,
+        leftover: Vec<u8>,
+        handlers: Arc<Handlers>,
+        req: Request,
+        existing: bool,
+    ) -> io::Result<()> {
+        match self.lifecycle.phase() {
+            Phase::Stopped => return Err(io::Error::other("runtime stopped")),
+            Phase::Draining if !existing => return Err(io::Error::other("runtime draining")),
+            _ => {}
+        }
         let ip = req.peer_ip();
         if !self.admission.reserve(ip.as_deref()) {
             return Err(io::Error::other("connection cap reached"));
@@ -576,6 +609,15 @@ impl WsRuntime {
             stats.rejected_sends += shard.rejected.load(Ordering::Relaxed);
         }
         stats
+    }
+
+    pub fn lifecycle(&self) -> &Lifecycle {
+        &self.lifecycle
+    }
+
+    /// Stop the runtime; reactor threads close their sockets and exit.
+    pub fn shutdown(&self) {
+        self.lifecycle.stop();
     }
 
     /// Live connection count (admitted, not yet released) across all shards.
@@ -651,6 +693,17 @@ impl Shard {
     fn run(mut self) {
         let mut events = Vec::with_capacity(1024);
         loop {
+            if self.shared.lifecycle.phase() == Phase::Stopped {
+                // Release pending upgrade reservations too.
+                self.drain_inbox();
+                for token in 0..self.slab.len() {
+                    if self.slab[token].is_some() {
+                        self.begin_close(token as u32, 1001, "server stopped");
+                        self.remove(token as u32, 1001);
+                    }
+                }
+                return;
+            }
             // Don't block for a second when connections are mid-parse waiting
             // to resume (frame-cap fairness) — poll and come straight back.
             let timeout = if self.pending_parse.is_empty() {
@@ -658,6 +711,12 @@ impl Shard {
             } else {
                 Duration::ZERO
             };
+            let timeout = self
+                .shared
+                .lifecycle
+                .deadline()
+                .map(|d| timeout.min(d.saturating_duration_since(Instant::now())))
+                .unwrap_or(timeout);
             if let Err(e) = self.poller.wait(&mut events, timeout) {
                 // A failing poller is unrecoverable for this shard; don't
                 // spin at 100% CPU on a persistent error.
@@ -759,6 +818,10 @@ impl Shard {
             req,
             ip,
         } = data;
+        if self.shared.lifecycle.phase() == Phase::Stopped {
+            self.admission.release(ip.as_deref());
+            return;
+        }
         // The slot was already reserved by `WsRuntime::adopt`; any early
         // return here must release it or the count leaks.
         if stream.set_nonblocking(true).is_err() {
@@ -1205,4 +1268,10 @@ pub struct WsStats {
     pub pending_commands: usize,
     pub pending_bytes: usize,
     pub rejected_sends: usize,
+}
+
+impl Drop for WsRuntime {
+    fn drop(&mut self) {
+        self.lifecycle.stop();
+    }
 }

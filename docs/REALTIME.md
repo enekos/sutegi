@@ -275,3 +275,21 @@ open/close ordering and cleanup. Running callbacks must check
 pushes from a retired channel membership are discarded, even without a
 client-supplied join reference. A panic closes the connection with 1011 and
 the worker continues. Configure `.dispatch()` last on a raw `Ws` builder.
+
+## Rolling shutdown
+
+Keep `let lifecycle = app.lifecycle()` before starting the server. Calling
+`lifecycle.drain(grace)` makes `/__ready` return 503 and refuses new WebSocket
+sessions, while established sockets and HTTP uploads continue. The lifecycle
+moves from Running to Draining to Stopped; repeated drain requests do not
+extend the deadline. `stop()` stops immediately. SIGTERM / `run_until` starts
+the app's `drain_timeout` (five seconds by default).
+
+A raw `Ws::admit_during_drain` callback may authorize reconnects to sessions
+the application already owns. It does not replace normal authorization or
+origin checking. At the deadline sockets close with 1001, reactor threads
+exit and queued HTTP work is cancelled. Listeners observe
+`ctx.lifecycle().phase()` during drain and `ctx.should_stop()` at stop.
+Running user callbacks cannot be forcibly killed: check the lifecycle or
+`Conn::is_closed()` during long work. Shutdown detaches uncooperative threads;
+process termination remains the final bound on those threads and their effects.

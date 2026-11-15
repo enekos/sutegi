@@ -5,6 +5,9 @@
 //! and the request lifecycle trivial to reason about — for a human reading
 //! the source, or an agent reasoning about the running app.
 
+mod lifecycle;
+pub use lifecycle::{Lifecycle, Phase};
+
 use std::borrow::Cow;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -887,6 +890,70 @@ where
     Ok(())
 }
 
+/// Serve probes and requests during draining; stop at the lifecycle deadline.
+/// Closes active HTTP sockets and cancels queued work on stop. Arbitrary user
+/// callbacks cannot be forcibly killed and must observe the same lifecycle.
+pub fn serve_lifecycle<H>(
+    addr: &str,
+    workers: usize,
+    limits: Limits,
+    handler: H,
+    lifecycle: Lifecycle,
+) -> io::Result<()>
+where
+    H: Fn(Request) -> Response + Send + Sync + 'static,
+{
+    let listener = TcpListener::bind(addr)?;
+    listener.set_nonblocking(true)?;
+    let handler = Arc::new(handler);
+    let pool = ThreadPool::with_queue(workers.max(1), limits.max_pending);
+    let sockets = Arc::new(Mutex::new(
+        std::collections::HashMap::<u64, TcpStream>::new(),
+    ));
+    let mut id = 0u64;
+    let mut idle = Duration::from_micros(250);
+    while lifecycle.phase() != Phase::Stopped {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                idle = Duration::from_micros(250);
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_nodelay(true);
+                let copy = stream.try_clone()?;
+                id += 1;
+                sockets.lock().unwrap().insert(id, copy);
+                let guard = SocketGuard {
+                    id,
+                    sockets: Arc::clone(&sockets),
+                };
+                let handler = Arc::clone(&handler);
+                pool.try_execute(move || {
+                    let _guard = guard;
+                    let _ = handle_connection(stream, &*handler, &limits);
+                });
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(idle);
+                idle = (idle * 2).min(Duration::from_millis(10));
+            }
+            Err(e) => accept_error_backoff(&e),
+        }
+    }
+    for socket in sockets.lock().unwrap().values() {
+        let _ = socket.shutdown(std::net::Shutdown::Both);
+    }
+    pool.cancel_pending();
+    Ok(())
+}
+struct SocketGuard {
+    id: u64,
+    sockets: Arc<Mutex<std::collections::HashMap<u64, TcpStream>>>,
+}
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        self.sockets.lock().unwrap().remove(&self.id);
+    }
+}
+
 fn handle_connection<H>(stream: TcpStream, handler: &H, limits: &Limits) -> io::Result<()>
 where
     H: Fn(Request) -> Response,
@@ -1021,6 +1088,7 @@ const DEFAULT_MAX_PENDING: usize = 1024;
 pub struct ThreadPool {
     sender: Option<mpsc::SyncSender<Job>>,
     workers: Vec<thread::JoinHandle<()>>,
+    cancel: Arc<AtomicBool>,
 }
 
 impl ThreadPool {
@@ -1035,8 +1103,10 @@ impl ThreadPool {
         let (sender, receiver) = mpsc::sync_channel::<Job>(max_pending);
         let receiver = Arc::new(Mutex::new(receiver));
         let mut workers = Vec::with_capacity(size);
+        let cancel = Arc::new(AtomicBool::new(false));
         for i in 0..size {
             let receiver = Arc::clone(&receiver);
+            let cancel = Arc::clone(&cancel);
             let worker = thread::Builder::new()
                 .name(format!("sutegi-http-{i}"))
                 .spawn(move || loop {
@@ -1046,6 +1116,9 @@ impl ThreadPool {
                         .recv();
                     match job {
                         Ok(job) => {
+                            if cancel.load(Ordering::Acquire) {
+                                continue;
+                            }
                             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
                         }
                         Err(_) => break,
@@ -1057,6 +1130,26 @@ impl ThreadPool {
         ThreadPool {
             sender: Some(sender),
             workers,
+            cancel,
+        }
+    }
+
+    /// Nonblocking admission. A rejected closure is dropped immediately.
+    pub fn try_execute(&self, f: impl FnOnce() + Send + 'static) -> bool {
+        self.sender
+            .as_ref()
+            .is_some_and(|s| s.try_send(Box::new(f)).is_ok())
+    }
+
+    /// Stop pending work and join only completed workers. In-flight callbacks
+    /// must cooperate; their threads are detached if they have not returned.
+    pub fn cancel_pending(mut self) {
+        self.cancel.store(true, Ordering::Release);
+        self.sender.take();
+        for worker in self.workers.drain(..) {
+            if worker.is_finished() {
+                let _ = worker.join();
+            }
         }
     }
 

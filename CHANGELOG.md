@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- HTTP/web/ws: shared Running/Draining/Stopped lifecycle, readiness during drain, authorized reconnect hooks, bounded transport shutdown and listener cancellation. `App::run_until` now starts a configurable grace period (default 5s).
+
 - ws/channels: opt-in bounded callback pools with per-connection ordering, cancellation of queued messages on disconnect, and generation-fenced channel pushes.
 
 - WebSockets: bounded shard inboxes, fallible sends and queue statistics. Legacy send helpers close overloaded connections with 1013. `WsConfig` gains pending command/byte limits.

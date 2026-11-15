@@ -763,3 +763,37 @@ fn dispatch_overload_closes_and_cleans_up_once() {
     }
     wait_for("cleanup", || closed.load(Ordering::SeqCst) == 1);
 }
+
+#[test]
+fn draining_preserves_existing_socket_until_deadline_then_cleans_up() {
+    let closed = Arc::new(AtomicUsize::new(0));
+    let handlers = Handlers {
+        on_message: Some(Arc::new(|conn, msg| {
+            if let Msg::Text(text) = msg {
+                conn.send_text(&text);
+            }
+        })),
+        on_close: Some(Arc::new({
+            let closed = closed.clone();
+            move |_, _| {
+                closed.fetch_add(1, Ordering::SeqCst);
+            }
+        })),
+        ..Handlers::default()
+    };
+    let (rt, mut client) = connect_pair(handlers, test_config());
+    wait_for("adoption", || rt.connections() == 1);
+    rt.lifecycle().drain(Duration::from_millis(150));
+    assert_eq!(rt.lifecycle().phase(), sutegi_http::Phase::Draining);
+    client
+        .write_all(&client_frame(1, b"still live", true))
+        .unwrap();
+    assert_eq!(read_frame(&mut client).1, b"still live");
+    let (op, payload) = read_frame(&mut client);
+    assert_eq!(op, 8);
+    assert_eq!(&payload[..2], &1001u16.to_be_bytes());
+    wait_for("runtime stopped", || {
+        rt.connections() == 0 && closed.load(Ordering::SeqCst) == 1
+    });
+    assert_eq!(rt.lifecycle().phase(), sutegi_http::Phase::Stopped);
+}

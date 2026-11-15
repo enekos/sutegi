@@ -248,13 +248,20 @@ impl ToolCtx {
     }
 }
 
+pub use sutegi_http::{Lifecycle, Phase};
+
 pub struct ListenerCtx {
+    lifecycle: Lifecycle,
     name: String,
     state: Arc<StateMap>,
     shutdown: Arc<AtomicBool>,
 }
 
 impl ListenerCtx {
+    pub fn lifecycle(&self) -> &Lifecycle {
+        &self.lifecycle
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -374,6 +381,8 @@ struct Route {
 /// The application: a builder you configure with routes, state, tools, and
 /// middleware, then `serve()` (or `run()`).
 pub struct App {
+    lifecycle: Lifecycle,
+    drain_timeout: std::time::Duration,
     name: String,
     routes: Vec<Route>,
     middleware: Vec<Middleware>,
@@ -451,6 +460,8 @@ impl Metrics {
 impl App {
     pub fn new(name: &str) -> App {
         App {
+            lifecycle: Lifecycle::new(),
+            drain_timeout: std::time::Duration::from_secs(5),
             name: name.to_string(),
             routes: Vec::new(),
             middleware: Vec::new(),
@@ -577,8 +588,11 @@ impl App {
         let runtime = match &self.ws_runtime {
             Some(rt) => Arc::clone(rt),
             None => {
-                let rt = sutegi_ws::WsRuntime::start(self.ws_config.clone())
-                    .expect("sutegi-ws: failed to start reactor (kqueue/epoll/pipe unavailable)");
+                let rt = sutegi_ws::WsRuntime::start_with_lifecycle(
+                    self.ws_config.clone(),
+                    self.lifecycle.clone(),
+                )
+                .expect("sutegi-ws: failed to start reactor (kqueue/epoll/pipe unavailable)");
                 self.ws_runtime = Some(Arc::clone(&rt));
                 let monitor = Arc::clone(&rt);
                 self = self.get(
@@ -904,6 +918,7 @@ impl App {
             if let Json::Obj(ref mut values) = caps {
                 values.insert("ws_backpressure".into(), Json::Bool(true));
                 values.insert("ws_handler_dispatch".into(), Json::str("opt-in"));
+                values.insert("ws_draining".into(), Json::Bool(true));
             }
         }
         if caps.as_object().is_some_and(|values| !values.is_empty()) {
@@ -960,6 +975,7 @@ impl App {
         let ops_public = self.ops_public;
         let ops_guard = Arc::new(self.ops_guard);
         let readiness = Arc::new(self.readiness);
+        let lifecycle = self.lifecycle.clone();
         let state = Arc::new(self.state);
         let listener_state = Arc::clone(&state);
         let metrics = Arc::new(Metrics::default());
@@ -988,7 +1004,8 @@ impl App {
                 match req.path.as_str() {
                     "/__health" => return json(200, &Json::obj(vec![("status", Json::str("ok"))])),
                     "/__ready" => {
-                        let ready = readiness.as_ref().as_ref().map(|f| f()).unwrap_or(true);
+                        let ready = lifecycle.phase() == Phase::Running
+                            && readiness.as_ref().as_ref().map(|f| f()).unwrap_or(true);
                         let body = Json::obj(vec![(
                             "status",
                             Json::str(if ready { "ready" } else { "not ready" }),
@@ -1097,30 +1114,53 @@ impl App {
         service
     }
 
-    /// Bind to `addr` and serve forever.
-    pub fn run(self, addr: &str) -> std::io::Result<()> {
-        let (workers, limits, listeners, state, service) = self.into_service();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let handles = spawn_listeners(listeners, &state, &shutdown);
-        let result = sutegi_http::serve(addr, workers, limits, service);
-        shutdown.store(true, Ordering::SeqCst);
-        for handle in handles {
-            let _ = handle.join();
-        }
-        result
+    /// Shared lifecycle for admission, listeners and cooperative request cancellation.
+    pub fn lifecycle(&self) -> Lifecycle {
+        self.lifecycle.clone()
     }
 
-    /// Serve until `shutdown` is set, then drain in-flight requests and return.
-    /// Flip the flag from a signal handler (see [`App::run_graceful`]) or your
-    /// own logic for zero-drop rolling deploys.
+    /// Grace after SIGTERM or the `run_until` flag is set. Default five seconds.
+    pub fn drain_timeout(mut self, grace: std::time::Duration) -> Self {
+        self.drain_timeout = grace;
+        self
+    }
+
+    /// Bind to `addr` and serve forever.
+    pub fn run(self, addr: &str) -> std::io::Result<()> {
+        self.run_until(addr, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// The flag starts draining. Readiness fails immediately, existing sockets
+    /// keep running until the configured deadline, then transports are stopped.
+    /// Uncooperative callbacks are detached; they cannot be killed by Rust.
     pub fn run_until(self, addr: &str, shutdown: Arc<AtomicBool>) -> std::io::Result<()> {
+        let lifecycle = self.lifecycle.clone();
+        let grace = self.drain_timeout;
         let (workers, limits, listeners, state, service) = self.into_service();
-        let handles = spawn_listeners(listeners, &state, &shutdown);
+        let listener_stop = Arc::new(AtomicBool::new(false));
+        let handles = spawn_listeners(listeners, &state, &listener_stop, &lifecycle);
+        let control = lifecycle.clone();
+        let monitor = std::thread::spawn(move || {
+            while control.phase() != Phase::Stopped {
+                if shutdown.load(Ordering::Acquire) {
+                    control.drain(grace);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
         let result =
-            sutegi_http::serve_until(addr, workers, limits, service, Arc::clone(&shutdown));
-        shutdown.store(true, Ordering::SeqCst);
+            sutegi_http::serve_lifecycle(addr, workers, limits, service, lifecycle.clone());
+        lifecycle.stop();
+        listener_stop.store(true, Ordering::Release);
+        let _ = monitor.join();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
         for handle in handles {
-            let _ = handle.join();
+            while !handle.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
         }
         result
     }
@@ -1214,11 +1254,13 @@ fn spawn_listeners(
     listeners: Vec<ListenerDef>,
     state: &Arc<StateMap>,
     shutdown: &Arc<AtomicBool>,
+    lifecycle: &Lifecycle,
 ) -> Vec<std::thread::JoinHandle<()>> {
     listeners
         .into_iter()
         .map(|def| {
             let ctx = ListenerCtx {
+                lifecycle: lifecycle.clone(),
                 name: def.name.clone(),
                 state: Arc::clone(state),
                 shutdown: Arc::clone(shutdown),
