@@ -317,18 +317,18 @@ impl Conn {
         let bytes = frame.len();
         if inbox.data.len() >= self.shard.max_commands
             || bytes > self.shard.max_bytes.saturating_sub(inbox.bytes)
-            || self
-                .budget
-                .bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                    n.checked_add(bytes)
-                        .filter(|v| *v <= self.shard.max_buffered)
-                })
-                .is_err()
+            || bytes
+                > self
+                    .shard
+                    .max_buffered
+                    .saturating_sub(self.budget.bytes.load(Ordering::Acquire))
         {
             self.shard.rejected.fetch_add(1, Ordering::Relaxed);
             return SendStatus::Full;
         }
+        // This inbox lock serializes all reservations for the connection;
+        // socket flushes can only decrease its outstanding byte count.
+        self.budget.bytes.fetch_add(bytes, Ordering::AcqRel);
         inbox.bytes += bytes;
         inbox.data.push(Cmd::Send {
             token: self.token,
