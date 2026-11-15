@@ -5,11 +5,13 @@
 //! and the request lifecycle trivial to reason about — for a human reading
 //! the source, or an agent reasoning about the running app.
 
+mod upload;
+pub use upload::{RequestBody, Service, UploadLimits};
 mod lifecycle;
 pub use lifecycle::{Lifecycle, Phase};
 
 use std::borrow::Cow;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -461,7 +463,7 @@ pub fn parse_request_deadline<R: BufRead>(
 /// beforehand (`parse_request`, `handle_connection`) reach it directly, skipping
 /// the redundant up-front deadline check. The clock is read once per request /
 /// header line (see [`read_line_capped`]) and once per partial body read.
-fn parse_request_impl<R: BufRead>(
+fn parse_head_impl<R: BufRead>(
     reader: &mut R,
     limits: &Limits,
     deadline: Instant,
@@ -553,42 +555,65 @@ fn parse_request_impl<R: BufRead>(
         headers.push((k.to_string(), v.to_string()));
     }
 
-    // Refuse oversized bodies before allocating an attacker-controlled buffer.
-    let content_length = content_length.unwrap_or(0);
-    if content_length > limits.max_body {
-        return Ok(Some(Incoming::TooLarge));
-    }
-    // Read the body in chunks, re-checking the deadline each iteration so a
-    // slow body drip is bounded exactly like the header phase — a single
-    // `read_exact` has no total-time bound.
-    let mut body = vec![0u8; content_length];
-    let mut filled = 0;
-    while filled < content_length {
-        match reader.read(&mut body[filled..]) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "connection closed before the request body was fully read",
-                ));
-            }
-            Ok(n) => filled += n,
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-        if filled < content_length && Instant::now() > deadline {
-            return Ok(Some(Incoming::Reject { status: 408 }));
-        }
-    }
-
     Ok(Some(Incoming::Request(Request {
         method,
         path,
         query,
         version,
         headers,
-        body,
+        body: Vec::new(),
         peer: None,
     })))
+}
+
+fn parse_request_impl<R: BufRead>(
+    reader: &mut R,
+    limits: &Limits,
+    deadline: Instant,
+) -> io::Result<Option<Incoming>> {
+    match parse_head_impl(reader, limits, deadline)? {
+        Some(Incoming::Request(mut req)) => {
+            match read_buffered_body(reader, &mut req, limits, deadline)? {
+                Some(reject) => Ok(Some(reject)),
+                None => Ok(Some(Incoming::Request(req))),
+            }
+        }
+        other => Ok(other),
+    }
+}
+
+fn read_buffered_body<R: Read>(
+    reader: &mut R,
+    req: &mut Request,
+    limits: &Limits,
+    deadline: Instant,
+) -> io::Result<Option<Incoming>> {
+    let content_length = req
+        .header("content-length")
+        .and_then(parse_content_length)
+        .unwrap_or(0);
+    if content_length > limits.max_body {
+        return Ok(Some(Incoming::TooLarge));
+    }
+    req.body = vec![0u8; content_length];
+    let mut filled = 0;
+    while filled < content_length {
+        match reader.read(&mut req.body[filled..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "incomplete request body",
+                ))
+            }
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+        if filled < content_length && Instant::now() > deadline {
+            return Ok(Some(Incoming::Reject { status: 408 }));
+        }
+    }
+    Ok(None)
 }
 
 /// RFC 9110 `tchar`: the bytes allowed in a header field name (`token`).
@@ -901,7 +926,7 @@ pub fn serve_lifecycle<H>(
     lifecycle: Lifecycle,
 ) -> io::Result<()>
 where
-    H: Fn(Request) -> Response + Send + Sync + 'static,
+    H: Service + Send + Sync + 'static,
 {
     let listener = TcpListener::bind(addr)?;
     listener.set_nonblocking(true)?;
@@ -956,7 +981,7 @@ impl Drop for SocketGuard {
 
 fn handle_connection<H>(stream: TcpStream, handler: &H, limits: &Limits) -> io::Result<()>
 where
-    H: Fn(Request) -> Response,
+    H: Service,
 {
     // Slowloris protection: bound how long a slow client can hold this worker.
     if let Some(t) = limits.timeout {
@@ -982,17 +1007,54 @@ where
         // forever (slowloris, CWE-400). Recomputed per request.
         let deadline = Instant::now() + limits.header_timeout;
         // Deadline is fresh from `now`, so skip the redundant up-front guard.
-        match parse_request_impl(&mut reader, limits, deadline) {
+        match parse_head_impl(&mut reader, limits, deadline) {
             Ok(Some(Incoming::Request(mut req))) => {
                 req.peer = peer.clone();
+                if let Some(upload) = handler.upload_limits(&req) {
+                    let Some(length) = req.header("content-length").and_then(parse_content_length)
+                    else {
+                        return write_response(&mut writer, Response::new(411), false);
+                    };
+                    if length > upload.max_bytes {
+                        return write_response(&mut writer, Response::new(413), false);
+                    }
+                    if req.header("expect").is_some() {
+                        return write_response(&mut writer, Response::new(417), false);
+                    }
+                    let mut body =
+                        RequestBody::new(&mut reader, writer.try_clone()?, length, upload);
+                    let mut response =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            handler.handle_upload(req, &mut body)
+                        }))
+                        .unwrap_or_else(|_| Response::new(500));
+                    if let Some(status) = body.failure() {
+                        if response.status != status {
+                            response = Response::new(status);
+                        }
+                    } else if (200..300).contains(&response.status) && body.remaining() != 0 {
+                        response = Response::new(400);
+                    }
+                    // Always close: a refusal may leave unread body/pipeline bytes.
+                    return write_response(&mut writer, response, false);
+                }
+                if let Some(reject) = read_buffered_body(&mut reader, &mut req, limits, deadline)? {
+                    let status = match reject {
+                        Incoming::TooLarge => 413,
+                        Incoming::Reject { status } => status,
+                        _ => unreachable!(),
+                    };
+                    return write_response(&mut writer, Response::new(status), false);
+                }
                 let keep = wants_keep_alive(&req);
                 let is_head = req.method == Method::Head;
                 // Panic isolation: a panicking handler returns 500 instead of
                 // silently killing this worker thread.
-                let resp = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(req)))
-                    .unwrap_or_else(|_| {
-                        Response::new(500).with_body(&b"500 Internal Server Error"[..])
-                    });
+                let resp =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler.handle(req)))
+                        .unwrap_or_else(|_| {
+                            Response::new(500).with_body(&b"500 Internal Server Error"[..])
+                        });
                 if let Body::Upgrade(takeover) = resp.body {
                     // Protocol upgrade: write the 101 head, then detach. Any
                     // bytes the client pipelined after its request (e.g. the

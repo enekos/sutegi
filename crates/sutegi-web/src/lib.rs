@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use std::time::Duration;
-pub use sutegi_http::{Body, Limits, Method, Request, Response, SseSink, StreamSink};
+pub use sutegi_http::{
+    Body, Limits, Method, Request, RequestBody, Response, SseSink, StreamSink, UploadLimits,
+};
 use sutegi_json::Json;
 
 mod access;
@@ -367,7 +369,27 @@ fn compile_pattern(pattern: &str) -> Vec<Seg> {
         .collect()
 }
 
+type UploadHandler = dyn Fn(&Ctx, &mut RequestBody<'_>) -> Response + Send + Sync;
+type ServiceCall = dyn Fn(Request, Option<&mut RequestBody<'_>>) -> Response + Send + Sync;
+struct BuiltService {
+    call: Box<ServiceCall>,
+    routes: Arc<Vec<Route>>,
+}
+impl sutegi_http::Service for BuiltService {
+    fn handle(&self, req: Request) -> Response {
+        (self.call)(req, None)
+    }
+    fn upload_limits(&self, req: &Request) -> Option<UploadLimits> {
+        match_route(&self.routes, req.method, &split_segments(&req.path))
+            .and_then(|(r, _)| r.upload.as_ref().map(|(limits, _)| *limits))
+    }
+    fn handle_upload(&self, req: Request, body: &mut RequestBody<'_>) -> Response {
+        (self.call)(req, Some(body))
+    }
+}
+
 struct Route {
+    upload: Option<(UploadLimits, Arc<UploadHandler>)>,
     method: Method,
     pattern: String,
     /// `pattern`, compiled by [`compile_pattern`].
@@ -535,6 +557,32 @@ impl App {
         self
     }
 
+    /// A streamed request route. Header middleware and `authorize` run before
+    /// the handler reads any body bytes. Uploads always close their HTTP connection.
+    pub fn upload<R: IntoResponse>(
+        mut self,
+        method: Method,
+        pattern: &str,
+        doc: &str,
+        limits: UploadLimits,
+        authorize: impl Fn(&Request) -> Option<Response> + Send + Sync + 'static,
+        handler: impl Fn(&Ctx, &mut RequestBody<'_>) -> R + Send + Sync + 'static,
+    ) -> App {
+        self.routes.push(Route {
+            method,
+            pattern: pattern.to_owned(),
+            segs: compile_pattern(pattern),
+            doc: doc.to_owned(),
+            middleware: vec![Arc::new(authorize)],
+            handler: Box::new(|_| text(400, "this route requires a streaming HTTP body")),
+            upload: Some((
+                limits,
+                Arc::new(move |ctx, body| handler(ctx, body).into_response()),
+            )),
+        });
+        self
+    }
+
     /// Register a readiness probe used by `GET /__ready` (returns 503 when it
     /// yields `false`). Use it to gate traffic on dependencies — e.g. a live DB
     /// connection — so Kubernetes won't route to a pod that isn't ready.
@@ -554,6 +602,7 @@ impl App {
         handler: impl Fn(&Ctx) -> R + Send + Sync + 'static,
     ) -> App {
         self.routes.push(Route {
+            upload: None,
             method,
             pattern: pattern.to_string(),
             segs: compile_pattern(pattern),
@@ -888,6 +937,7 @@ impl App {
                     ("method", Json::str(r.method.as_str())),
                     ("pattern", Json::str(r.pattern.clone())),
                     ("doc", Json::str(r.doc.clone())),
+                    ("streaming_upload", Json::Bool(r.upload.is_some())),
                 ])
             })
             .collect();
@@ -921,6 +971,11 @@ impl App {
                 values.insert("ws_draining".into(), Json::Bool(true));
             }
         }
+        if self.routes.iter().any(|r| r.upload.is_some()) {
+            if let Json::Obj(ref mut values) = caps {
+                values.insert("streaming_uploads".into(), Json::Bool(true));
+            }
+        }
         if caps.as_object().is_some_and(|values| !values.is_empty()) {
             doc.push(("capabilities", caps));
         }
@@ -944,15 +999,7 @@ impl App {
     }
 
     /// Build the request service closure (shared by every `run*` variant).
-    fn into_service(
-        mut self,
-    ) -> (
-        usize,
-        Limits,
-        Vec<ListenerDef>,
-        Arc<StateMap>,
-        impl Fn(Request) -> Response + Send + Sync + 'static,
-    ) {
+    fn into_service(mut self) -> (usize, Limits, Vec<ListenerDef>, Arc<StateMap>, BuiltService) {
         // Mount any registered AI tools as routes + introspection entries.
         if !self.tool_defs.is_empty() {
             self = self.mount_tools();
@@ -981,7 +1028,8 @@ impl App {
         let metrics = Arc::new(Metrics::default());
         let workers = self.workers;
 
-        let service = move |req: Request| -> Response {
+        let streaming_routes = Arc::clone(&routes);
+        let service = move |req: Request, mut body: Option<&mut RequestBody<'_>>| -> Response {
             metrics.in_flight.fetch_add(1, Ordering::Relaxed);
             let flight = access_log.as_ref().as_ref().map(|log| log.begin(&req));
 
@@ -1080,6 +1128,9 @@ impl App {
                         params,
                         state: Arc::clone(&state),
                     };
+                    if let (Some((_, upload)), Some(body)) = (&route.upload, body.as_deref_mut()) {
+                        return upload(&ctx, body);
+                    }
                     return (route.handler)(&ctx);
                 }
 
@@ -1090,6 +1141,13 @@ impl App {
                 not_found()
             })();
 
+            let resp = match body {
+                Some(body) if body.failure().is_some() => Response::new(body.failure().unwrap()),
+                Some(body) if (200..300).contains(&resp.status) && body.remaining() != 0 => {
+                    Response::new(400)
+                }
+                _ => resp,
+            };
             // After-middleware: transform the outgoing response (CORS, etc.).
             let resp = after.iter().fold(resp, |r, hook| hook(&req, r));
             let resp = match (flight, access_log.as_ref()) {
@@ -1102,7 +1160,16 @@ impl App {
             resp
         };
 
-        (workers, limits, listeners, listener_state, service)
+        (
+            workers,
+            limits,
+            listeners,
+            listener_state,
+            BuiltService {
+                call: Box::new(service),
+                routes: streaming_routes,
+            },
+        )
     }
 
     /// The app as its bare request-service closure — the same function every
@@ -1111,7 +1178,7 @@ impl App {
     /// binding a port. Registered listeners are not spawned.
     pub fn service(self) -> impl Fn(Request) -> Response + Send + Sync + 'static {
         let (_, _, _, _, service) = self.into_service();
-        service
+        move |req| sutegi_http::Service::handle(&service, req)
     }
 
     /// Shared lifecycle for admission, listeners and cooperative request cancellation.
@@ -1410,6 +1477,7 @@ impl Group {
     ) -> Group {
         let pattern = join_prefix(&self.prefix, pattern);
         self.routes.push(Route {
+            upload: None,
             method,
             segs: compile_pattern(&pattern),
             pattern,

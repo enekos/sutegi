@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- HTTP/web: opt-in streaming upload routes with header authorization, per-route byte/deadline limits, sticky read failures, and unchanged buffered-route size limits. Content-Length is required; chunked requests remain rejected.
+
 - HTTP/web/ws: shared Running/Draining/Stopped lifecycle, readiness during drain, authorized reconnect hooks, bounded transport shutdown and listener cancellation. `App::run_until` now starts a configurable grace period (default 5s).
 
 - ws/channels: opt-in bounded callback pools with per-connection ordering, cancellation of queued messages on disconnect, and generation-fenced channel pushes.

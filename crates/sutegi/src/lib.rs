@@ -461,7 +461,7 @@ pub mod prelude {
         Ctx, Error, Group, IntoResponse, Limits, ListenerCtx, Method, Mw, Params, Request,
         Response, SseSink, StreamSink, ToolCtx,
     };
-    pub use sutegi_web::{Lifecycle, Phase};
+    pub use sutegi_web::{Lifecycle, Phase, RequestBody, UploadLimits};
 
     #[cfg(feature = "events")]
     pub use sutegi_events::{
