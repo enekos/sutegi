@@ -60,9 +60,7 @@ impl<'a> RequestBody<'a> {
             reader,
             socket: Some(socket),
             remaining: length,
-            deadline: Instant::now()
-                .checked_add(limits.timeout)
-                .unwrap_or_else(Instant::now),
+            deadline: crate::lifecycle::deadline_after(limits.timeout),
             idle_timeout: limits.idle_timeout,
             failure: None,
         }

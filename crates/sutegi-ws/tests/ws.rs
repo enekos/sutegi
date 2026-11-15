@@ -620,15 +620,15 @@ fn fallible_sends_bound_inbox_and_release_reservations() {
 }
 
 #[test]
-fn close_bypasses_a_full_data_inbox() {
+fn graceful_close_is_accepted_by_a_full_inbox_and_follows_queued_frames() {
     use sutegi_ws::SendStatus;
     let (tx, rx) = std::sync::mpsc::channel();
     let handlers = Handlers {
         on_open: Some(Arc::new(move |conn, _| {
             let first = conn.try_send_text("123456"); // eight encoded bytes
             let second = conn.try_send_text("x");
-            conn.close(1013, "overloaded");
-            conn.close(1013, "duplicate");
+            conn.close(1000, "bye");
+            conn.close(1000, "duplicate");
             tx.send((conn.clone(), first, second)).unwrap();
         })),
         ..Handlers::default()
@@ -642,6 +642,36 @@ fn close_bypasses_a_full_data_inbox() {
     );
     let (conn, first, second) = rx.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_eq!((first, second), (SendStatus::Queued, SendStatus::Full));
+    assert_eq!(read_frame(&mut client), (1, b"123456".to_vec()));
+    let (opcode, payload) = read_frame(&mut client);
+    assert_eq!(opcode, 8);
+    assert_eq!(&payload[..2], &1000u16.to_be_bytes());
+    client
+        .write_all(&client_frame(8, &1000u16.to_be_bytes(), true))
+        .unwrap();
+    wait_for("close", || rt.connections() == 0);
+    wait_for("released reservation", || conn.buffered_bytes() == 0);
+}
+
+#[test]
+fn overload_close_jumps_ahead_of_the_backlog_it_caused() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handlers = Handlers {
+        on_open: Some(Arc::new(move |conn, _| {
+            conn.send_text("123456"); // fills the eight-byte inbox
+            conn.send_text("x"); // overload: 1013
+            tx.send(conn.clone()).unwrap();
+        })),
+        ..Handlers::default()
+    };
+    let (rt, mut client) = connect_pair(
+        handlers,
+        WsConfig {
+            max_pending_bytes: 8,
+            ..test_config()
+        },
+    );
+    let conn = rx.recv_timeout(Duration::from_secs(2)).unwrap();
     let (opcode, payload) = read_frame(&mut client);
     assert_eq!(opcode, 8);
     assert_eq!(&payload[..2], &1013u16.to_be_bytes());

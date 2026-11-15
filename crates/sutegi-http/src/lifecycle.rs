@@ -50,11 +50,7 @@ impl Lifecycle {
         if self.0.phase.load(Ordering::Acquire) != 0 {
             return;
         }
-        *deadline = Some(
-            Instant::now()
-                .checked_add(grace)
-                .unwrap_or_else(Instant::now),
-        );
+        *deadline = Some(deadline_after(grace));
         // stop() can race with this request. Never resurrect a stopped
         // lifecycle after publishing the deadline.
         let changed = self
@@ -88,6 +84,15 @@ impl Lifecycle {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wake()));
         }
     }
+}
+
+/// `now + d`, saturating at a far-future instant: `Duration::MAX` means "no
+/// limit", never "already expired".
+pub(crate) fn deadline_after(d: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(d)
+        .or_else(|| now.checked_add(Duration::from_secs(100 * 365 * 24 * 3600)))
+        .unwrap_or(now)
 }
 
 #[cfg(test)]
@@ -129,5 +134,11 @@ mod tests {
         assert_eq!(state.phase(), Phase::Stopped);
         state.drain(Duration::from_secs(1));
         assert_eq!(state.phase(), Phase::Stopped);
+    }
+
+    #[test]
+    fn an_unbounded_grace_is_far_future_not_expired() {
+        let deadline = super::deadline_after(Duration::MAX);
+        assert!(deadline > Instant::now() + Duration::from_secs(3600));
     }
 }

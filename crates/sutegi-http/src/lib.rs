@@ -13,7 +13,7 @@ pub use lifecycle::{Lifecycle, Phase};
 use std::borrow::Cow;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -968,21 +968,35 @@ where
     H: Service + Send + Sync + 'static,
 {
     let listener = TcpListener::bind(addr)?;
-    listener.set_nonblocking(true)?;
+    // Blocking accept: a polled listener adds its sleep to every new
+    // connection. Stop (or the drain deadline) wakes it with a self-connect.
+    spawn_accept_waker(listener.local_addr()?, lifecycle.clone());
     let handler = Arc::new(handler);
     let pool = ThreadPool::with_queue(workers.max(1), limits.max_pending);
     let sockets = Arc::new(Mutex::new(
         std::collections::HashMap::<u64, TcpStream>::new(),
     ));
     let mut id = 0u64;
-    let mut idle = Duration::from_micros(250);
     while lifecycle.phase() != Phase::Stopped {
         match listener.accept() {
             Ok((stream, _)) => {
-                idle = Duration::from_micros(250);
-                let _ = stream.set_nonblocking(false);
+                if lifecycle.phase() == Phase::Stopped {
+                    break;
+                }
                 let _ = stream.set_nodelay(true);
-                let copy = stream.try_clone()?;
+                // Out of descriptors (EMFILE) shows up here as often as in
+                // accept: shed this one connection and ride it out.
+                let copy = match stream.try_clone() {
+                    Ok(copy) => copy,
+                    Err(e) => {
+                        accept_error_backoff(&e);
+                        continue;
+                    }
+                };
+                if pool.is_saturated() {
+                    reject_overloaded(stream);
+                    continue;
+                }
                 id += 1;
                 sockets.lock().unwrap().insert(id, copy);
                 let guard = SocketGuard {
@@ -995,10 +1009,6 @@ where
                     let _ = handle_connection(stream, &*handler, &limits);
                 });
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(idle);
-                idle = (idle * 2).min(Duration::from_millis(10));
-            }
             Err(e) => accept_error_backoff(&e),
         }
     }
@@ -1008,6 +1018,43 @@ where
     pool.cancel_pending();
     Ok(())
 }
+/// Wakes a blocking `accept` once the lifecycle stops: on `stop()`, or when a
+/// drain deadline passes with no request around to observe it.
+fn spawn_accept_waker(local: std::net::SocketAddr, lifecycle: Lifecycle) {
+    let (tx, rx) = mpsc::channel::<()>();
+    lifecycle.on_change(move || {
+        let _ = tx.send(());
+    });
+    let mut target = local;
+    if target.ip().is_unspecified() {
+        target.set_ip(match target {
+            std::net::SocketAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+            std::net::SocketAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+        });
+    }
+    let _ = thread::Builder::new()
+        .name("sutegi-http-accept-waker".into())
+        .spawn(move || loop {
+            match lifecycle.phase() {
+                Phase::Stopped => {
+                    let _ = TcpStream::connect_timeout(&target, Duration::from_secs(1));
+                    return;
+                }
+                Phase::Draining => {
+                    let left = lifecycle.deadline().map_or(Duration::ZERO, |d| {
+                        d.saturating_duration_since(Instant::now())
+                    });
+                    let _ = rx.recv_timeout(left.max(Duration::from_millis(1)));
+                }
+                Phase::Running => {
+                    if rx.recv().is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+}
+
 struct SocketGuard {
     id: u64,
     sockets: Arc<Mutex<std::collections::HashMap<u64, TcpStream>>>,
@@ -1173,6 +1220,15 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 /// Back off after an accept error. Out of file descriptors (`EMFILE`) fails
 /// every call immediately, so retrying at once would spin a core at 100%;
 /// a client aborting mid-handshake or a signal is transient and retried now.
+/// Best effort `503` for a connection the worker queue has no room for: the
+/// client learns to back off instead of seeing a bare reset.
+fn reject_overloaded(mut stream: TcpStream) {
+    let _ = stream.set_nonblocking(true);
+    let _ = stream.write_all(
+        b"HTTP/1.1 503 Service Unavailable\r\nretry-after: 1\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+    );
+}
+
 fn accept_error_backoff(e: &io::Error) {
     if !matches!(
         e.kind(),
@@ -1191,6 +1247,8 @@ pub struct ThreadPool {
     sender: Option<mpsc::SyncSender<Job>>,
     workers: Vec<thread::JoinHandle<()>>,
     cancel: Arc<AtomicBool>,
+    queued: Arc<AtomicUsize>,
+    max_pending: usize,
 }
 
 impl ThreadPool {
@@ -1206,9 +1264,11 @@ impl ThreadPool {
         let receiver = Arc::new(Mutex::new(receiver));
         let mut workers = Vec::with_capacity(size);
         let cancel = Arc::new(AtomicBool::new(false));
+        let queued = Arc::new(AtomicUsize::new(0));
         for i in 0..size {
             let receiver = Arc::clone(&receiver);
             let cancel = Arc::clone(&cancel);
+            let queued = Arc::clone(&queued);
             let worker = thread::Builder::new()
                 .name(format!("sutegi-http-{i}"))
                 .spawn(move || loop {
@@ -1218,6 +1278,7 @@ impl ThreadPool {
                         .recv();
                     match job {
                         Ok(job) => {
+                            queued.fetch_sub(1, Ordering::AcqRel);
                             if cancel.load(Ordering::Acquire) {
                                 continue;
                             }
@@ -1233,14 +1294,30 @@ impl ThreadPool {
             sender: Some(sender),
             workers,
             cancel,
+            queued,
+            max_pending,
         }
+    }
+
+    /// True when the queue is full. Exact for a single submitting thread
+    /// (workers only ever shrink the queue); advisory with several.
+    pub fn is_saturated(&self) -> bool {
+        self.queued.load(Ordering::Acquire) >= self.max_pending
     }
 
     /// Nonblocking admission. A rejected closure is dropped immediately.
     pub fn try_execute(&self, f: impl FnOnce() + Send + 'static) -> bool {
-        self.sender
+        // Count before sending: a worker may dequeue (and decrement) before
+        // `try_send` returns.
+        self.queued.fetch_add(1, Ordering::AcqRel);
+        let sent = self
+            .sender
             .as_ref()
-            .is_some_and(|s| s.try_send(Box::new(f)).is_ok())
+            .is_some_and(|s| s.try_send(Box::new(f)).is_ok());
+        if !sent {
+            self.queued.fetch_sub(1, Ordering::AcqRel);
+        }
+        sent
     }
 
     /// Stop pending work and join only completed workers. In-flight callbacks
@@ -1261,7 +1338,10 @@ impl ThreadPool {
         F: FnOnce() + Send + 'static,
     {
         if let Some(sender) = &self.sender {
-            let _ = sender.send(Box::new(f));
+            self.queued.fetch_add(1, Ordering::AcqRel);
+            if sender.send(Box::new(f)).is_err() {
+                self.queued.fetch_sub(1, Ordering::AcqRel);
+            }
         }
     }
 }
@@ -1759,6 +1839,28 @@ mod tests {
         release_tx.send(()).unwrap();
         done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         producer.join().unwrap();
+    }
+
+    #[test]
+    fn thread_pool_reports_saturation_without_counting_rejects() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let pool = ThreadPool::with_queue(1, 1);
+        assert!(pool.try_execute(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }));
+        started_rx.recv().unwrap();
+        assert!(!pool.is_saturated());
+        assert!(pool.try_execute(|| {}));
+        assert!(pool.is_saturated());
+        assert!(!pool.try_execute(|| {}));
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pool.is_saturated() {
+            assert!(Instant::now() < deadline, "queue never drained");
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     // ---- security regressions -------------------------------------------

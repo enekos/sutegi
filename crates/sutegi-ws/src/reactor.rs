@@ -265,6 +265,14 @@ impl ShardShared {
         self.inbox.lock().unwrap().control.push(cmd);
         self.wake();
     }
+
+    // A graceful close queues behind the connection's accepted frames, so
+    // `send(..); close(..)` delivers the frame first. It skips the command cap
+    // for the same reason as `control`: one close per connection.
+    fn ordered(&self, cmd: Cmd) {
+        self.inbox.lock().unwrap().data.push(cmd);
+        self.wake();
+    }
 }
 
 /// A cheap, cloneable handle. Fallible sends reserve both shard capacity and
@@ -350,20 +358,31 @@ impl Conn {
     /// Compatibility helper: an overloaded connection is closed with 1013.
     pub fn send_text(&self, text: &str) {
         if self.try_send_text(text) == SendStatus::Full {
-            self.close(1013, "send queue full");
+            self.overload();
         }
     }
     pub fn send_binary(&self, data: &[u8]) {
         if self.try_send_binary(data) == SendStatus::Full {
-            self.close(1013, "send queue full");
+            self.overload();
         }
     }
     pub fn send_shared(&self, frame: &Arc<Vec<u8>>) {
         if self.try_send_shared(frame) == SendStatus::Full {
-            self.close(1013, "send queue full");
+            self.overload();
         }
     }
+    /// Close after every frame already accepted for this connection.
     pub fn close(&self, code: u16, reason: &str) {
+        self.close_with(code, reason, false);
+    }
+
+    // An overloaded connection is closed ahead of its backlog: that backlog is
+    // the reason it is being closed.
+    fn overload(&self) {
+        self.close_with(1013, "send queue full", true);
+    }
+
+    fn close_with(&self, code: u16, reason: &str, jump: bool) {
         if self.budget.closed.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -371,12 +390,17 @@ impl Conn {
         while !reason.is_char_boundary(end) {
             end -= 1;
         }
-        self.shard.control(Cmd::Close {
+        let cmd = Cmd::Close {
             token: self.token,
             id: self.id,
             code,
             reason: reason[..end].to_owned(),
-        });
+        };
+        if jump {
+            self.shard.control(cmd);
+        } else {
+            self.shard.ordered(cmd);
+        }
     }
 }
 
@@ -761,7 +785,8 @@ impl Shard {
             }
             std::mem::take(&mut *inbox)
         };
-        // Close commands take priority when a producer has filled the data queue.
+        // Overload closes (control) jump ahead of the backlog they were caused
+        // by; graceful closes sit in `data`, behind their connection's frames.
         for cmd in cmds.control.into_iter().chain(cmds.data) {
             match cmd {
                 Cmd::Adopt(data) => self.adopt(*data),
