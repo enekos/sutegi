@@ -28,10 +28,15 @@
 //! This crate is transport only. Topics/rooms, presence, and rejoin
 //! semantics are the channels layer built on top of it.
 
+mod dispatch;
+pub use dispatch::DispatchConfig;
 mod poller;
 pub mod protocol;
 mod reactor;
 
 pub use poller::raise_nofile_limit;
 pub use protocol::accept_key;
-pub use reactor::{binary_frame, broadcast, text_frame, Conn, Handlers, Msg, WsConfig, WsRuntime};
+pub use reactor::{
+    binary_frame, broadcast, text_frame, Conn, Handlers, Msg, SendStatus, WsConfig, WsRuntime,
+    WsStats,
+};

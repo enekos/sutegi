@@ -4,8 +4,7 @@ on:
   push:
     branches: [master]
     tags: ["v*"]
-  pull_request:
-    branches: [master]
+  pull_request: # Includes dependent PRs whose base is another stack branch.
 
 env:
   CARGO_TERM_COLOR: always

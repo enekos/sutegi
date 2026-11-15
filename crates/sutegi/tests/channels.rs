@@ -501,3 +501,29 @@ fn inbound_messages_are_rate_limited_per_connection() {
     let reply = c.recv();
     assert_eq!(str_at(&reply, "/ref"), Some("after"));
 }
+
+#[test]
+fn dispatched_rejoin_retires_old_socket_pushes() {
+    use std::sync::{Arc, Mutex};
+    let saved = Arc::new(Mutex::new(Vec::<Socket>::new()));
+    let capture = saved.clone();
+    let hub = Channels::new()
+        .dispatch(sutegi::web::ws::DispatchConfig::default())
+        .channel(Channel::new("call:*").on_join(move |socket, _| {
+            capture.lock().unwrap().push(socket.clone());
+            Ok(Json::Null)
+        }))
+        .build();
+    boot("127.0.0.1:18503", move || {
+        App::new("dispatched").channels("/socket", "test", hub)
+    });
+    let mut client = WsClient::connect("127.0.0.1:18503", "/socket");
+    client.join("call:1", Json::Null, "first");
+    client.join("call:1", Json::Null, "second");
+    let sockets = saved.lock().unwrap();
+    assert!(!sockets[0].is_current());
+    assert!(sockets[1].is_current());
+    sockets[0].push("stale", &Json::Null);
+    sockets[1].push("current", &Json::Null);
+    assert_eq!(str_at(&client.recv(), "/event"), Some("current"));
+}

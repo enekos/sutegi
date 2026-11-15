@@ -217,7 +217,7 @@ keep anything stronger in a table.
 ## Scaling notes
 
 - Broadcast to a large room encodes the frame **once** (`Arc`-shared) and
-  takes each reactor shard's lock once — the 80k-socket transport numbers
+  reserves queue capacity for every recipient — the 80k-socket transport numbers
   in the ws docs apply to channel broadcasts unchanged.
 - Per-connection ordering is guaranteed (callbacks inline on the shard).
   Cross-connection ordering within a topic follows broker order: in-process
@@ -243,3 +243,53 @@ DATABASE_URL=postgres://… cargo run -p chat-example -- 127.0.0.1:8080 &
 DATABASE_URL=postgres://… cargo run -p chat-example -- 127.0.0.1:8081 &
 # open a room on each port; messages and the online list cross pods
 ```
+
+## Bounded sends
+
+`Conn::try_send_text`, `try_send_binary` and `try_send_shared` return
+`SendStatus::{Queued, Full, Closed}`. Queued means accepted locally, never a
+remote delivery acknowledgement. Retry or close explicitly on Full; do not
+busy-loop on the reactor thread. The older `send_*` helpers close with 1013
+on overload instead of silently dropping an application message.
+
+`WsConfig::max_pending_commands` (4096) and `max_pending_bytes` (16 MiB) bound
+each shard inbox. A shard can also hold one bounded batch while processing.
+`max_buffered` bounds each connection's application frames across the inbox
+and socket output together. Close commands have separate capacity, at most
+one per connection; admission bounds pending upgrades. `WsRuntime::stats()`
+reports connections, pending commands/bytes and rejected sends. The same
+snapshot is available at the ops-guarded `GET /__ws` endpoint.
+
+## Blocking handlers
+
+Configure callbacks, then call `Ws::dispatch(DispatchConfig::default())?`,
+or use `Channels::dispatch(config)`. The pool has a fixed worker count,
+connection cap, per-connection queue limit and total pending-byte limit.
+Open, messages and close execute serially for each connection. Other
+connections can use other workers; a pool with every worker blocked is full
+capacity, not an unlimited executor. Ping/pong stays on the reactor.
+
+Overload closes with 1013. Disconnect discards queued messages but preserves
+open/close ordering and cleanup. Running callbacks must check
+`Conn::is_closed()` cooperatively. `Socket::is_current()` also detects rejoin;
+pushes from a retired channel membership are discarded, even without a
+client-supplied join reference. A panic closes the connection with 1011 and
+the worker continues. Configure `.dispatch()` last on a raw `Ws` builder.
+
+## Rolling shutdown
+
+Keep `let lifecycle = app.lifecycle()` before starting the server. Calling
+`lifecycle.drain(grace)` makes `/__ready` return 503 and refuses new WebSocket
+sessions, while established sockets and HTTP uploads continue. The lifecycle
+moves from Running to Draining to Stopped; repeated drain requests do not
+extend the deadline. `stop()` stops immediately. SIGTERM / `run_until` starts
+the app's `drain_timeout` (five seconds by default).
+
+A raw `Ws::admit_during_drain` callback may authorize reconnects to sessions
+the application already owns. It does not replace normal authorization or
+origin checking. At the deadline sockets close with 1001, reactor threads
+exit and queued HTTP work is cancelled. Listeners observe
+`ctx.lifecycle().phase()` during drain and `ctx.should_stop()` at stop.
+Running user callbacks cannot be forcibly killed: check the lifecycle or
+`Conn::is_closed()` during long work. Shutdown detaches uncooperative threads;
+process termination remains the final bound on those threads and their effects.

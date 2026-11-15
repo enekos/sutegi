@@ -13,12 +13,16 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use std::time::Duration;
-pub use sutegi_http::{Body, Limits, Method, Request, Response, SseSink, StreamSink};
+pub use sutegi_http::{
+    Body, Limits, Method, Request, RequestBody, Response, SseSink, StreamSink, UploadLimits,
+};
 use sutegi_json::Json;
 
 mod access;
+mod download;
 mod files;
 pub use access::{AccessLog, REQUEST_ID_HEADER};
+pub use download::download;
 mod respond;
 pub use respond::{Error, IntoResponse};
 
@@ -248,13 +252,20 @@ impl ToolCtx {
     }
 }
 
+pub use sutegi_http::{Lifecycle, Phase};
+
 pub struct ListenerCtx {
+    lifecycle: Lifecycle,
     name: String,
     state: Arc<StateMap>,
     shutdown: Arc<AtomicBool>,
 }
 
 impl ListenerCtx {
+    pub fn lifecycle(&self) -> &Lifecycle {
+        &self.lifecycle
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -360,7 +371,27 @@ fn compile_pattern(pattern: &str) -> Vec<Seg> {
         .collect()
 }
 
+type UploadHandler = dyn Fn(&Ctx, &mut RequestBody<'_>) -> Response + Send + Sync;
+type ServiceCall = dyn Fn(Request, Option<&mut RequestBody<'_>>) -> Response + Send + Sync;
+struct BuiltService {
+    call: Box<ServiceCall>,
+    routes: Arc<Vec<Route>>,
+}
+impl sutegi_http::Service for BuiltService {
+    fn handle(&self, req: Request) -> Response {
+        (self.call)(req, None)
+    }
+    fn upload_limits(&self, req: &Request) -> Option<UploadLimits> {
+        match_route(&self.routes, req.method, &split_segments(&req.path))
+            .and_then(|(r, _)| r.upload.as_ref().map(|(limits, _)| *limits))
+    }
+    fn handle_upload(&self, req: Request, body: &mut RequestBody<'_>) -> Response {
+        (self.call)(req, Some(body))
+    }
+}
+
 struct Route {
+    upload: Option<(UploadLimits, Arc<UploadHandler>)>,
     method: Method,
     pattern: String,
     /// `pattern`, compiled by [`compile_pattern`].
@@ -374,6 +405,8 @@ struct Route {
 /// The application: a builder you configure with routes, state, tools, and
 /// middleware, then `serve()` (or `run()`).
 pub struct App {
+    lifecycle: Lifecycle,
+    drain_timeout: std::time::Duration,
     name: String,
     routes: Vec<Route>,
     middleware: Vec<Middleware>,
@@ -451,6 +484,8 @@ impl Metrics {
 impl App {
     pub fn new(name: &str) -> App {
         App {
+            lifecycle: Lifecycle::new(),
+            drain_timeout: std::time::Duration::from_secs(5),
             name: name.to_string(),
             routes: Vec::new(),
             middleware: Vec::new(),
@@ -524,6 +559,32 @@ impl App {
         self
     }
 
+    /// A streamed request route. Header middleware and `authorize` run before
+    /// the handler reads any body bytes. Uploads always close their HTTP connection.
+    pub fn upload<R: IntoResponse>(
+        mut self,
+        method: Method,
+        pattern: &str,
+        doc: &str,
+        limits: UploadLimits,
+        authorize: impl Fn(&Request) -> Option<Response> + Send + Sync + 'static,
+        handler: impl Fn(&Ctx, &mut RequestBody<'_>) -> R + Send + Sync + 'static,
+    ) -> App {
+        self.routes.push(Route {
+            method,
+            pattern: pattern.to_owned(),
+            segs: compile_pattern(pattern),
+            doc: doc.to_owned(),
+            middleware: vec![Arc::new(authorize)],
+            handler: Box::new(|_| text(400, "this route requires a streaming HTTP body")),
+            upload: Some((
+                limits,
+                Arc::new(move |ctx, body| handler(ctx, body).into_response()),
+            )),
+        });
+        self
+    }
+
     /// Register a readiness probe used by `GET /__ready` (returns 503 when it
     /// yields `false`). Use it to gate traffic on dependencies — e.g. a live DB
     /// connection — so Kubernetes won't route to a pod that isn't ready.
@@ -543,6 +604,7 @@ impl App {
         handler: impl Fn(&Ctx) -> R + Send + Sync + 'static,
     ) -> App {
         self.routes.push(Route {
+            upload: None,
             method,
             pattern: pattern.to_string(),
             segs: compile_pattern(pattern),
@@ -577,9 +639,29 @@ impl App {
         let runtime = match &self.ws_runtime {
             Some(rt) => Arc::clone(rt),
             None => {
-                let rt = sutegi_ws::WsRuntime::start(self.ws_config.clone())
-                    .expect("sutegi-ws: failed to start reactor (kqueue/epoll/pipe unavailable)");
+                let rt = sutegi_ws::WsRuntime::start_with_lifecycle(
+                    self.ws_config.clone(),
+                    self.lifecycle.clone(),
+                )
+                .expect("sutegi-ws: failed to start reactor (kqueue/epoll/pipe unavailable)");
                 self.ws_runtime = Some(Arc::clone(&rt));
+                let monitor = Arc::clone(&rt);
+                self = self.get(
+                    "/__ws",
+                    "WebSocket queue and connection statistics.",
+                    move |_| {
+                        let stats = monitor.stats();
+                        json(
+                            200,
+                            &Json::obj(vec![
+                                ("connections", Json::int(stats.connections as i64)),
+                                ("pending_commands", Json::int(stats.pending_commands as i64)),
+                                ("pending_bytes", Json::int(stats.pending_bytes as i64)),
+                                ("rejected_sends", Json::int(stats.rejected_sends as i64)),
+                            ]),
+                        )
+                    },
+                );
                 rt
             }
         };
@@ -619,14 +701,18 @@ impl App {
         if let Some(gate) = authorize {
             ws = ws.authorize(move |req: &Request| gate(req));
         }
+        let dispatch = hub.dispatch_config();
         let (open, message, close) = (hub.clone(), hub.clone(), hub);
-        self.ws(
-            pattern,
-            doc,
-            ws.on_open(move |conn, req| open.on_open(conn, req))
-                .on_message(move |conn, msg| message.on_message(conn, msg))
-                .on_close(move |conn, code| close.on_close(conn, code)),
-        )
+        ws = ws
+            .on_open(move |conn, req| open.on_open(conn, req))
+            .on_message(move |conn, msg| message.on_message(conn, msg))
+            .on_close(move |conn, code| close.on_close(conn, code));
+        if let Some(config) = dispatch {
+            ws = ws
+                .dispatch(config)
+                .expect("invalid channel dispatch configuration");
+        }
+        self.ws(pattern, doc, ws)
     }
 
     /// Mount an actor registry at `GET /__actors`: live state, mailbox
@@ -853,6 +939,7 @@ impl App {
                     ("method", Json::str(r.method.as_str())),
                     ("pattern", Json::str(r.pattern.clone())),
                     ("doc", Json::str(r.doc.clone())),
+                    ("streaming_upload", Json::Bool(r.upload.is_some())),
                 ])
             })
             .collect();
@@ -873,8 +960,26 @@ impl App {
                 ]),
             ),
         ];
-        if let Some(caps) = &self.capabilities {
-            doc.push(("capabilities", caps.clone()));
+        #[allow(unused_mut)]
+        let mut caps = self
+            .capabilities
+            .clone()
+            .unwrap_or_else(|| Json::obj(vec![]));
+        #[cfg(feature = "ws")]
+        if self.ws_runtime.is_some() {
+            if let Json::Obj(ref mut values) = caps {
+                values.insert("ws_backpressure".into(), Json::Bool(true));
+                values.insert("ws_handler_dispatch".into(), Json::str("opt-in"));
+                values.insert("ws_draining".into(), Json::Bool(true));
+            }
+        }
+        if self.routes.iter().any(|r| r.upload.is_some()) {
+            if let Json::Obj(ref mut values) = caps {
+                values.insert("streaming_uploads".into(), Json::Bool(true));
+            }
+        }
+        if caps.as_object().is_some_and(|values| !values.is_empty()) {
+            doc.push(("capabilities", caps));
         }
         if !self.search.is_empty() {
             doc.push(("search", Json::arr(self.search.clone())));
@@ -896,15 +1001,7 @@ impl App {
     }
 
     /// Build the request service closure (shared by every `run*` variant).
-    fn into_service(
-        mut self,
-    ) -> (
-        usize,
-        Limits,
-        Vec<ListenerDef>,
-        Arc<StateMap>,
-        impl Fn(Request) -> Response + Send + Sync + 'static,
-    ) {
+    fn into_service(mut self) -> (usize, Limits, Vec<ListenerDef>, Arc<StateMap>, BuiltService) {
         // Mount any registered AI tools as routes + introspection entries.
         if !self.tool_defs.is_empty() {
             self = self.mount_tools();
@@ -927,12 +1024,14 @@ impl App {
         let ops_public = self.ops_public;
         let ops_guard = Arc::new(self.ops_guard);
         let readiness = Arc::new(self.readiness);
+        let lifecycle = self.lifecycle.clone();
         let state = Arc::new(self.state);
         let listener_state = Arc::clone(&state);
         let metrics = Arc::new(Metrics::default());
         let workers = self.workers;
 
-        let service = move |req: Request| -> Response {
+        let streaming_routes = Arc::clone(&routes);
+        let service = move |req: Request, mut body: Option<&mut RequestBody<'_>>| -> Response {
             metrics.in_flight.fetch_add(1, Ordering::Relaxed);
             let flight = access_log.as_ref().as_ref().map(|log| log.begin(&req));
 
@@ -955,7 +1054,8 @@ impl App {
                 match req.path.as_str() {
                     "/__health" => return json(200, &Json::obj(vec![("status", Json::str("ok"))])),
                     "/__ready" => {
-                        let ready = readiness.as_ref().as_ref().map(|f| f()).unwrap_or(true);
+                        let ready = lifecycle.phase() == Phase::Running
+                            && readiness.as_ref().as_ref().map(|f| f()).unwrap_or(true);
                         let body = Json::obj(vec![(
                             "status",
                             Json::str(if ready { "ready" } else { "not ready" }),
@@ -1030,6 +1130,9 @@ impl App {
                         params,
                         state: Arc::clone(&state),
                     };
+                    if let (Some((_, upload)), Some(body)) = (&route.upload, body.as_deref_mut()) {
+                        return upload(&ctx, body);
+                    }
                     return (route.handler)(&ctx);
                 }
 
@@ -1040,6 +1143,13 @@ impl App {
                 not_found()
             })();
 
+            let resp = match body {
+                Some(body) if body.failure().is_some() => Response::new(body.failure().unwrap()),
+                Some(body) if (200..300).contains(&resp.status) && body.remaining() != 0 => {
+                    Response::new(400)
+                }
+                _ => resp,
+            };
             // After-middleware: transform the outgoing response (CORS, etc.).
             let resp = after.iter().fold(resp, |r, hook| hook(&req, r));
             let resp = match (flight, access_log.as_ref()) {
@@ -1052,7 +1162,16 @@ impl App {
             resp
         };
 
-        (workers, limits, listeners, listener_state, service)
+        (
+            workers,
+            limits,
+            listeners,
+            listener_state,
+            BuiltService {
+                call: Box::new(service),
+                routes: streaming_routes,
+            },
+        )
     }
 
     /// The app as its bare request-service closure — the same function every
@@ -1061,33 +1180,56 @@ impl App {
     /// binding a port. Registered listeners are not spawned.
     pub fn service(self) -> impl Fn(Request) -> Response + Send + Sync + 'static {
         let (_, _, _, _, service) = self.into_service();
-        service
+        move |req| sutegi_http::Service::handle(&service, req)
+    }
+
+    /// Shared lifecycle for admission, listeners and cooperative request cancellation.
+    pub fn lifecycle(&self) -> Lifecycle {
+        self.lifecycle.clone()
+    }
+
+    /// Grace after SIGTERM or the `run_until` flag is set. Default five seconds.
+    pub fn drain_timeout(mut self, grace: std::time::Duration) -> Self {
+        self.drain_timeout = grace;
+        self
     }
 
     /// Bind to `addr` and serve forever.
     pub fn run(self, addr: &str) -> std::io::Result<()> {
-        let (workers, limits, listeners, state, service) = self.into_service();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let handles = spawn_listeners(listeners, &state, &shutdown);
-        let result = sutegi_http::serve(addr, workers, limits, service);
-        shutdown.store(true, Ordering::SeqCst);
-        for handle in handles {
-            let _ = handle.join();
-        }
-        result
+        self.run_until(addr, Arc::new(AtomicBool::new(false)))
     }
 
-    /// Serve until `shutdown` is set, then drain in-flight requests and return.
-    /// Flip the flag from a signal handler (see [`App::run_graceful`]) or your
-    /// own logic for zero-drop rolling deploys.
+    /// The flag starts draining. Readiness fails immediately, existing sockets
+    /// keep running until the configured deadline, then transports are stopped.
+    /// Uncooperative callbacks are detached; they cannot be killed by Rust.
     pub fn run_until(self, addr: &str, shutdown: Arc<AtomicBool>) -> std::io::Result<()> {
+        let lifecycle = self.lifecycle.clone();
+        let grace = self.drain_timeout;
         let (workers, limits, listeners, state, service) = self.into_service();
-        let handles = spawn_listeners(listeners, &state, &shutdown);
+        let listener_stop = Arc::new(AtomicBool::new(false));
+        let handles = spawn_listeners(listeners, &state, &listener_stop, &lifecycle);
+        let control = lifecycle.clone();
+        let monitor = std::thread::spawn(move || {
+            while control.phase() != Phase::Stopped {
+                if shutdown.load(Ordering::Acquire) {
+                    control.drain(grace);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
         let result =
-            sutegi_http::serve_until(addr, workers, limits, service, Arc::clone(&shutdown));
-        shutdown.store(true, Ordering::SeqCst);
+            sutegi_http::serve_lifecycle(addr, workers, limits, service, lifecycle.clone());
+        lifecycle.stop();
+        listener_stop.store(true, Ordering::Release);
+        let _ = monitor.join();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
         for handle in handles {
-            let _ = handle.join();
+            while !handle.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
         }
         result
     }
@@ -1181,11 +1323,13 @@ fn spawn_listeners(
     listeners: Vec<ListenerDef>,
     state: &Arc<StateMap>,
     shutdown: &Arc<AtomicBool>,
+    lifecycle: &Lifecycle,
 ) -> Vec<std::thread::JoinHandle<()>> {
     listeners
         .into_iter()
         .map(|def| {
             let ctx = ListenerCtx {
+                lifecycle: lifecycle.clone(),
                 name: def.name.clone(),
                 state: Arc::clone(state),
                 shutdown: Arc::clone(shutdown),
@@ -1335,6 +1479,7 @@ impl Group {
     ) -> Group {
         let pattern = join_prefix(&self.prefix, pattern);
         self.routes.push(Route {
+            upload: None,
             method,
             segs: compile_pattern(&pattern),
             pattern,

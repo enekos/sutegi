@@ -35,6 +35,7 @@ members = [
     "examples/redactor",
     "examples/ws-chat",
     "examples/chat",
+    "examples/call",
     "examples/ws-load",
     "examples/http-load",
 ]

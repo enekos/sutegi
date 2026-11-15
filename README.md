@@ -584,6 +584,12 @@ Reset links are **bound to the current password hash**: the moment the
 password changes, every outstanding reset link dies — stateless single-use.
 See `examples/auth` for the full flow wired into routes.
 
+## Calls
+
+The [call example](examples/call/README.md) combines authenticated WebRTC
+signalling, reconnects, streaming recording uploads, and seekable playback.
+See [Calls in Sutegi](docs/CALLS.md) for the framework APIs and deployment boundaries.
+
 ## File storage
 
 The same swap-the-backend idea, for bytes (`--features storage`). One

@@ -1,0 +1,17 @@
+[package]
+name = "call-example"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "call"
+path = "src/main.rs"
+
+[dependencies]
+sutegi = { path = "../../crates/sutegi", default-features = false, features = ["ws", "storage", "graceful"] }
+
+[lints]
+workspace = true

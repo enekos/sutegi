@@ -101,6 +101,7 @@ Read the full website content here on GitHub. Start with the [overview](OVERVIEW
 Long-form guides, maintained by hand and linked from the reference page they extend.
 
 - [Actors & supervision](ACTORS.md)
+- [Calls in Sutegi](CALLS.md)
 - [Concurrency & throughput](CONCURRENCY.md)
 - [Building clean, hexagonal apps in sutegi](HEXAGONAL.md)
 - [JSON path queries](JSON.md)
@@ -111,6 +112,7 @@ Long-form guides, maintained by hand and linked from the reference page they ext
 - [Reactive queries](REACTIVE.md)
 - [Realtime: WebSockets, PubSub, Channels, Presence](REALTIME.md)
 - [Full-text + hybrid search](SEARCH.md)
+- [Streaming uploads](UPLOADS.md)
 
 ## Maintaining these docs
 

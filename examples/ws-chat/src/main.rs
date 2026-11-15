@@ -18,8 +18,8 @@ use sutegi::ws::broadcast;
 /// use from any thread, so a plain map is the whole "presence" story here.
 static ROSTER: Mutex<Option<HashMap<u64, (String, Conn)>>> = Mutex::new(None);
 
-/// Fan a line out to the whole room. `broadcast` encodes once and takes each
-/// shard's lock once — the right primitive even when the room is large.
+/// Fan a line out to the whole room. Encode once and share the frame bytes;
+/// each connection independently enforces its outbound queue budget.
 fn say(text: &str) {
     let frame = text_frame(text);
     if let Some(roster) = ROSTER.lock().unwrap().as_ref() {

@@ -5,10 +5,15 @@
 //! and the request lifecycle trivial to reason about — for a human reading
 //! the source, or an agent reasoning about the running app.
 
+mod upload;
+pub use upload::{RequestBody, Service, UploadLimits};
+mod lifecycle;
+pub use lifecycle::{Lifecycle, Phase};
+
 use std::borrow::Cow;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -141,6 +146,11 @@ pub type UpgradeTakeover = Box<dyn FnOnce(TcpStream, Vec<u8>) + Send + 'static>;
 pub enum Body {
     Full(Vec<u8>),
     Stream(StreamProducer),
+    /// A streaming body with an authoritative length, including for HEAD.
+    Reader {
+        reader: Box<dyn Read + Send>,
+        length: u64,
+    },
     Upgrade(UpgradeTakeover),
 }
 
@@ -186,6 +196,16 @@ impl Response {
         producer: impl FnOnce(&mut dyn Write) -> io::Result<()> + Send + 'static,
     ) -> Response {
         self.body = Body::Stream(Box::new(producer));
+        self
+    }
+
+    /// Stream exactly `length` bytes without buffering. A short reader or
+    /// write failure closes the connection; excess bytes are never written.
+    pub fn with_reader(mut self, reader: impl Read + Send + 'static, length: u64) -> Response {
+        self.body = Body::Reader {
+            reader: Box::new(reader),
+            length,
+        };
         self
     }
 
@@ -458,7 +478,7 @@ pub fn parse_request_deadline<R: BufRead>(
 /// beforehand (`parse_request`, `handle_connection`) reach it directly, skipping
 /// the redundant up-front deadline check. The clock is read once per request /
 /// header line (see [`read_line_capped`]) and once per partial body read.
-fn parse_request_impl<R: BufRead>(
+fn parse_head_impl<R: BufRead>(
     reader: &mut R,
     limits: &Limits,
     deadline: Instant,
@@ -550,42 +570,65 @@ fn parse_request_impl<R: BufRead>(
         headers.push((k.to_string(), v.to_string()));
     }
 
-    // Refuse oversized bodies before allocating an attacker-controlled buffer.
-    let content_length = content_length.unwrap_or(0);
-    if content_length > limits.max_body {
-        return Ok(Some(Incoming::TooLarge));
-    }
-    // Read the body in chunks, re-checking the deadline each iteration so a
-    // slow body drip is bounded exactly like the header phase — a single
-    // `read_exact` has no total-time bound.
-    let mut body = vec![0u8; content_length];
-    let mut filled = 0;
-    while filled < content_length {
-        match reader.read(&mut body[filled..]) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "connection closed before the request body was fully read",
-                ));
-            }
-            Ok(n) => filled += n,
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-        if filled < content_length && Instant::now() > deadline {
-            return Ok(Some(Incoming::Reject { status: 408 }));
-        }
-    }
-
     Ok(Some(Incoming::Request(Request {
         method,
         path,
         query,
         version,
         headers,
-        body,
+        body: Vec::new(),
         peer: None,
     })))
+}
+
+fn parse_request_impl<R: BufRead>(
+    reader: &mut R,
+    limits: &Limits,
+    deadline: Instant,
+) -> io::Result<Option<Incoming>> {
+    match parse_head_impl(reader, limits, deadline)? {
+        Some(Incoming::Request(mut req)) => {
+            match read_buffered_body(reader, &mut req, limits, deadline)? {
+                Some(reject) => Ok(Some(reject)),
+                None => Ok(Some(Incoming::Request(req))),
+            }
+        }
+        other => Ok(other),
+    }
+}
+
+fn read_buffered_body<R: Read>(
+    reader: &mut R,
+    req: &mut Request,
+    limits: &Limits,
+    deadline: Instant,
+) -> io::Result<Option<Incoming>> {
+    let content_length = req
+        .header("content-length")
+        .and_then(parse_content_length)
+        .unwrap_or(0);
+    if content_length > limits.max_body {
+        return Ok(Some(Incoming::TooLarge));
+    }
+    req.body = vec![0u8; content_length];
+    let mut filled = 0;
+    while filled < content_length {
+        match reader.read(&mut req.body[filled..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "incomplete request body",
+                ))
+            }
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+        if filled < content_length && Instant::now() > deadline {
+            return Ok(Some(Incoming::Reject { status: 408 }));
+        }
+    }
+    Ok(None)
 }
 
 /// RFC 9110 `tchar`: the bytes allowed in a header field name (`token`).
@@ -685,6 +728,29 @@ fn write_head_and_body<W: Write>(
             }
             w.flush()
         }
+        Body::Reader { reader, length } => {
+            let _ = write!(head, "content-length: {length}\r\n");
+            head.push_str(if keep_alive {
+                "connection: keep-alive\r\n\r\n"
+            } else {
+                "connection: close\r\n\r\n"
+            });
+            w.write_all(head.as_bytes())?;
+            if !head_only {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let copied = io::copy(&mut reader.take(length), w)?;
+                    if copied != length {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "short response body",
+                        ));
+                    }
+                    Ok(())
+                }))
+                .unwrap_or_else(|_| Err(io::Error::other("response reader panicked")))?;
+            }
+            w.flush()
+        }
         Body::Stream(producer) => {
             // No content-length: framing is "read until close".
             head.push_str("connection: close\r\n\r\n");
@@ -775,6 +841,7 @@ pub fn status_reason(status: u16) -> &'static str {
         101 => "Switching Protocols",
         200 => "OK",
         201 => "Created",
+        206 => "Partial Content",
         202 => "Accepted",
         204 => "No Content",
         301 => "Moved Permanently",
@@ -887,9 +954,120 @@ where
     Ok(())
 }
 
+/// Serve probes and requests during draining; stop at the lifecycle deadline.
+/// Closes active HTTP sockets and cancels queued work on stop. Arbitrary user
+/// callbacks cannot be forcibly killed and must observe the same lifecycle.
+pub fn serve_lifecycle<H>(
+    addr: &str,
+    workers: usize,
+    limits: Limits,
+    handler: H,
+    lifecycle: Lifecycle,
+) -> io::Result<()>
+where
+    H: Service + Send + Sync + 'static,
+{
+    let listener = TcpListener::bind(addr)?;
+    // Blocking accept: a polled listener adds its sleep to every new
+    // connection. Stop (or the drain deadline) wakes it with a self-connect.
+    spawn_accept_waker(listener.local_addr()?, lifecycle.clone());
+    let handler = Arc::new(handler);
+    let pool = ThreadPool::with_queue(workers.max(1), limits.max_pending);
+    let sockets = Arc::new(Mutex::new(
+        std::collections::HashMap::<u64, TcpStream>::new(),
+    ));
+    let mut id = 0u64;
+    while lifecycle.phase() != Phase::Stopped {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if lifecycle.phase() == Phase::Stopped {
+                    break;
+                }
+                let _ = stream.set_nodelay(true);
+                // Out of descriptors (EMFILE) shows up here as often as in
+                // accept: shed this one connection and ride it out.
+                let copy = match stream.try_clone() {
+                    Ok(copy) => copy,
+                    Err(e) => {
+                        accept_error_backoff(&e);
+                        continue;
+                    }
+                };
+                if pool.is_saturated() {
+                    reject_overloaded(stream);
+                    continue;
+                }
+                id += 1;
+                sockets.lock().unwrap().insert(id, copy);
+                let guard = SocketGuard {
+                    id,
+                    sockets: Arc::clone(&sockets),
+                };
+                let handler = Arc::clone(&handler);
+                pool.try_execute(move || {
+                    let _guard = guard;
+                    let _ = handle_connection(stream, &*handler, &limits);
+                });
+            }
+            Err(e) => accept_error_backoff(&e),
+        }
+    }
+    for socket in sockets.lock().unwrap().values() {
+        let _ = socket.shutdown(std::net::Shutdown::Both);
+    }
+    pool.cancel_pending();
+    Ok(())
+}
+/// Wakes a blocking `accept` once the lifecycle stops: on `stop()`, or when a
+/// drain deadline passes with no request around to observe it.
+fn spawn_accept_waker(local: std::net::SocketAddr, lifecycle: Lifecycle) {
+    let (tx, rx) = mpsc::channel::<()>();
+    lifecycle.on_change(move || {
+        let _ = tx.send(());
+    });
+    let mut target = local;
+    if target.ip().is_unspecified() {
+        target.set_ip(match target {
+            std::net::SocketAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+            std::net::SocketAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+        });
+    }
+    let _ = thread::Builder::new()
+        .name("sutegi-http-accept-waker".into())
+        .spawn(move || loop {
+            match lifecycle.phase() {
+                Phase::Stopped => {
+                    let _ = TcpStream::connect_timeout(&target, Duration::from_secs(1));
+                    return;
+                }
+                Phase::Draining => {
+                    let left = lifecycle.deadline().map_or(Duration::ZERO, |d| {
+                        d.saturating_duration_since(Instant::now())
+                    });
+                    let _ = rx.recv_timeout(left.max(Duration::from_millis(1)));
+                }
+                Phase::Running => {
+                    if rx.recv().is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+}
+
+struct SocketGuard {
+    id: u64,
+    sockets: Arc<Mutex<std::collections::HashMap<u64, TcpStream>>>,
+}
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        self.sockets.lock().unwrap().remove(&self.id);
+    }
+}
+
 fn handle_connection<H>(stream: TcpStream, handler: &H, limits: &Limits) -> io::Result<()>
 where
-    H: Fn(Request) -> Response,
+    H: Service,
 {
     // Slowloris protection: bound how long a slow client can hold this worker.
     if let Some(t) = limits.timeout {
@@ -915,17 +1093,55 @@ where
         // forever (slowloris, CWE-400). Recomputed per request.
         let deadline = Instant::now() + limits.header_timeout;
         // Deadline is fresh from `now`, so skip the redundant up-front guard.
-        match parse_request_impl(&mut reader, limits, deadline) {
+        match parse_head_impl(&mut reader, limits, deadline) {
             Ok(Some(Incoming::Request(mut req))) => {
                 req.peer = peer.clone();
+                if let Some(upload) = handler.upload_limits(&req) {
+                    let Some(length) = req.header("content-length").and_then(parse_content_length)
+                    else {
+                        return write_response(&mut writer, Response::new(411), false);
+                    };
+                    if length > upload.max_bytes {
+                        return write_response(&mut writer, Response::new(413), false);
+                    }
+                    if req.header("expect").is_some() {
+                        return write_response(&mut writer, Response::new(417), false);
+                    }
+                    let is_head = req.method == Method::Head;
+                    let mut body =
+                        RequestBody::new(&mut reader, writer.try_clone()?, length, upload);
+                    let mut response =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            handler.handle_upload(req, &mut body)
+                        }))
+                        .unwrap_or_else(|_| Response::new(500));
+                    if let Some(status) = body.failure() {
+                        if response.status != status {
+                            response = Response::new(status);
+                        }
+                    } else if (200..300).contains(&response.status) && body.remaining() != 0 {
+                        response = Response::new(400);
+                    }
+                    // Always close: a refusal may leave unread body/pipeline bytes.
+                    return write_head_and_body(&mut writer, response, false, is_head);
+                }
+                if let Some(reject) = read_buffered_body(&mut reader, &mut req, limits, deadline)? {
+                    let status = match reject {
+                        Incoming::TooLarge => 413,
+                        Incoming::Reject { status } => status,
+                        _ => unreachable!(),
+                    };
+                    return write_response(&mut writer, Response::new(status), false);
+                }
                 let keep = wants_keep_alive(&req);
                 let is_head = req.method == Method::Head;
                 // Panic isolation: a panicking handler returns 500 instead of
                 // silently killing this worker thread.
-                let resp = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(req)))
-                    .unwrap_or_else(|_| {
-                        Response::new(500).with_body(&b"500 Internal Server Error"[..])
-                    });
+                let resp =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler.handle(req)))
+                        .unwrap_or_else(|_| {
+                            Response::new(500).with_body(&b"500 Internal Server Error"[..])
+                        });
                 if let Body::Upgrade(takeover) = resp.body {
                     // Protocol upgrade: write the 101 head, then detach. Any
                     // bytes the client pipelined after its request (e.g. the
@@ -1004,6 +1220,15 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 /// Back off after an accept error. Out of file descriptors (`EMFILE`) fails
 /// every call immediately, so retrying at once would spin a core at 100%;
 /// a client aborting mid-handshake or a signal is transient and retried now.
+/// Best effort `503` for a connection the worker queue has no room for: the
+/// client learns to back off instead of seeing a bare reset.
+fn reject_overloaded(mut stream: TcpStream) {
+    let _ = stream.set_nonblocking(true);
+    let _ = stream.write_all(
+        b"HTTP/1.1 503 Service Unavailable\r\nretry-after: 1\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+    );
+}
+
 fn accept_error_backoff(e: &io::Error) {
     if !matches!(
         e.kind(),
@@ -1021,6 +1246,9 @@ const DEFAULT_MAX_PENDING: usize = 1024;
 pub struct ThreadPool {
     sender: Option<mpsc::SyncSender<Job>>,
     workers: Vec<thread::JoinHandle<()>>,
+    cancel: Arc<AtomicBool>,
+    queued: Arc<AtomicUsize>,
+    max_pending: usize,
 }
 
 impl ThreadPool {
@@ -1035,8 +1263,12 @@ impl ThreadPool {
         let (sender, receiver) = mpsc::sync_channel::<Job>(max_pending);
         let receiver = Arc::new(Mutex::new(receiver));
         let mut workers = Vec::with_capacity(size);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let queued = Arc::new(AtomicUsize::new(0));
         for i in 0..size {
             let receiver = Arc::clone(&receiver);
+            let cancel = Arc::clone(&cancel);
+            let queued = Arc::clone(&queued);
             let worker = thread::Builder::new()
                 .name(format!("sutegi-http-{i}"))
                 .spawn(move || loop {
@@ -1046,6 +1278,10 @@ impl ThreadPool {
                         .recv();
                     match job {
                         Ok(job) => {
+                            queued.fetch_sub(1, Ordering::AcqRel);
+                            if cancel.load(Ordering::Acquire) {
+                                continue;
+                            }
                             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
                         }
                         Err(_) => break,
@@ -1057,6 +1293,42 @@ impl ThreadPool {
         ThreadPool {
             sender: Some(sender),
             workers,
+            cancel,
+            queued,
+            max_pending,
+        }
+    }
+
+    /// True when the queue is full. Exact for a single submitting thread
+    /// (workers only ever shrink the queue); advisory with several.
+    pub fn is_saturated(&self) -> bool {
+        self.queued.load(Ordering::Acquire) >= self.max_pending
+    }
+
+    /// Nonblocking admission. A rejected closure is dropped immediately.
+    pub fn try_execute(&self, f: impl FnOnce() + Send + 'static) -> bool {
+        // Count before sending: a worker may dequeue (and decrement) before
+        // `try_send` returns.
+        self.queued.fetch_add(1, Ordering::AcqRel);
+        let sent = self
+            .sender
+            .as_ref()
+            .is_some_and(|s| s.try_send(Box::new(f)).is_ok());
+        if !sent {
+            self.queued.fetch_sub(1, Ordering::AcqRel);
+        }
+        sent
+    }
+
+    /// Stop pending work and join only completed workers. In-flight callbacks
+    /// must cooperate; their threads are detached if they have not returned.
+    pub fn cancel_pending(mut self) {
+        self.cancel.store(true, Ordering::Release);
+        self.sender.take();
+        for worker in self.workers.drain(..) {
+            if worker.is_finished() {
+                let _ = worker.join();
+            }
         }
     }
 
@@ -1066,7 +1338,10 @@ impl ThreadPool {
         F: FnOnce() + Send + 'static,
     {
         if let Some(sender) = &self.sender {
-            let _ = sender.send(Box::new(f));
+            self.queued.fetch_add(1, Ordering::AcqRel);
+            if sender.send(Box::new(f)).is_err() {
+                self.queued.fetch_sub(1, Ordering::AcqRel);
+            }
         }
     }
 }
@@ -1084,6 +1359,28 @@ impl Drop for ThreadPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sized_readers_frame_head_and_reject_truncation() {
+        let mut wire = Vec::new();
+        let response = Response::new(200).with_reader(std::io::empty(), 200_000_000);
+        write_head_and_body(&mut wire, response, false, true).unwrap();
+        let wire = String::from_utf8(wire).unwrap();
+        assert!(wire.contains("content-length: 200000000\r\n"));
+        assert!(wire.ends_with("\r\n\r\n"));
+        let mut wire = Vec::new();
+        let response = Response::new(200).with_reader(std::io::Cursor::new(b"abc"), 4);
+        assert_eq!(
+            write_response(&mut wire, response, true)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        let mut wire = Vec::new();
+        let response = Response::new(200).with_reader(std::io::Cursor::new(b"abc"), 2);
+        write_response(&mut wire, response, true).unwrap();
+        assert!(wire.ends_with(b"\r\n\r\nab"));
+    }
 
     #[test]
     fn parses_request_with_body() {
@@ -1542,6 +1839,28 @@ mod tests {
         release_tx.send(()).unwrap();
         done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         producer.join().unwrap();
+    }
+
+    #[test]
+    fn thread_pool_reports_saturation_without_counting_rejects() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let pool = ThreadPool::with_queue(1, 1);
+        assert!(pool.try_execute(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }));
+        started_rx.recv().unwrap();
+        assert!(!pool.is_saturated());
+        assert!(pool.try_execute(|| {}));
+        assert!(pool.is_saturated());
+        assert!(!pool.try_execute(|| {}));
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pool.is_saturated() {
+            assert!(Instant::now() < deadline, "queue never drained");
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     // ---- security regressions -------------------------------------------

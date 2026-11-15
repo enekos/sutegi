@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sutegi calls</title>
+<style>
+body{font:16px/1.5 system-ui;background:#171a20;color:#e8eaf0;max-width:960px;margin:2rem auto;padding:0 1rem}h1{margin-bottom:.25rem}label{display:block;margin:.5rem 0}input,button{font:inherit;padding:.6rem;border-radius:.4rem;border:1px solid #667082}button{cursor:pointer;background:#b9d4ff;color:#15243b}button:disabled{opacity:.5}input{background:#242b38;color:inherit}.videos{display:grid;grid-template-columns:1fr 1fr;gap:1rem}video{width:100%;background:#080a10;border-radius:.5rem}#status{padding:.6rem;background:#252e3d}small{color:#b8c1d0}.controls{display:flex;gap:.6rem;flex-wrap:wrap;margin:1rem 0}#playback{max-height:320px}a{color:#b9d4ff}@media(max-width:600px){.videos{grid-template-columns:1fr}}
+</style></head><body>
+<h1>Sutegi calls</h1><p>Join the same room from two separate browser profiles. Your camera and microphone stay off until you join.</p>
+<form id="join-form"><label>Room <input id="room" required pattern="[A-Za-z0-9-]{1,64}" value="demo" autocomplete="off"></label><label>Access key <input id="key" type="password" required minlength="16" autocomplete="off"></label><button id="join">Join call</button></form>
+<p id="status" role="status" aria-live="polite">Ready to join</p>
+<div class="videos"><section><h2>You</h2><video id="local" autoplay playsinline muted></video></section><section><h2>Other participant</h2><video id="remote" autoplay playsinline></video></section></div>
+<div class="controls"><button id="hangup" disabled>Leave call</button><button id="record" disabled>Record my camera</button><button id="stop-record" disabled>Stop and save recording</button></div>
+<small>Recording is opt-in and captures only your camera and microphone. Samples stop after 60 seconds or 48 MiB. Saved recordings are available to authenticated members of this room.</small>
+<p id="saved" role="status"></p><video id="playback" controls playsinline hidden></video>
+<script type="module" src="/client.js"></script></body></html>

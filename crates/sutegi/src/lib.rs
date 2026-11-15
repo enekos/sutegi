@@ -461,6 +461,7 @@ pub mod prelude {
         Ctx, Error, Group, IntoResponse, Limits, ListenerCtx, Method, Mw, Params, Request,
         Response, SseSink, StreamSink, ToolCtx,
     };
+    pub use sutegi_web::{download, Lifecycle, Phase, RequestBody, UploadLimits};
 
     #[cfg(feature = "events")]
     pub use sutegi_events::{
@@ -507,7 +508,9 @@ pub mod prelude {
     #[cfg(feature = "storage-db")]
     pub use sutegi_storage::DbStorage;
     #[cfg(feature = "ws")]
-    pub use sutegi_web::ws::{binary_frame, text_frame, Conn, Msg, WsConfig};
+    pub use sutegi_web::ws::{
+        binary_frame, text_frame, Conn, DispatchConfig, Msg, SendStatus, WsConfig,
+    };
     #[cfg(feature = "ws")]
     pub use sutegi_web::Ws;
 

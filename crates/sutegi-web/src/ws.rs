@@ -19,7 +19,9 @@
 use std::sync::Arc;
 
 use sutegi_http::{Request, Response};
-pub use sutegi_ws::{binary_frame, text_frame, Conn, Msg, WsConfig, WsRuntime};
+pub use sutegi_ws::{
+    binary_frame, text_frame, Conn, DispatchConfig, Msg, SendStatus, WsConfig, WsRuntime, WsStats,
+};
 
 /// Builder for one WebSocket endpoint's callbacks.
 #[derive(Clone, Default)]
@@ -59,6 +61,21 @@ impl Ws {
     /// already committed.)
     pub fn authorize(mut self, f: impl Fn(&Request) -> bool + Send + Sync + 'static) -> Ws {
         self.handlers.authorize = Some(Arc::new(f));
+        self
+    }
+
+    /// Execute the callbacks configured so far on a bounded worker pool.
+    pub fn dispatch(mut self, config: DispatchConfig) -> std::io::Result<Ws> {
+        self.handlers = self.handlers.dispatched(config)?;
+        Ok(self)
+    }
+
+    /// Allow only application-verified existing sessions to reconnect while draining.
+    pub fn admit_during_drain(
+        mut self,
+        f: impl Fn(&Request) -> bool + Send + Sync + 'static,
+    ) -> Ws {
+        self.handlers.admit_during_drain = Some(Arc::new(f));
         self
     }
 
@@ -169,6 +186,14 @@ pub(crate) fn upgrade_response(
             return Response::new(403).with_body(&b"forbidden"[..]);
         }
     }
+    let existing = handlers.admit_during_drain.as_ref().is_some_and(|f| f(req));
+    if runtime.lifecycle().phase() == sutegi_http::Phase::Stopped
+        || (runtime.lifecycle().phase() == sutegi_http::Phase::Draining && !existing)
+    {
+        return Response::new(503)
+            .with_header("retry-after", "1")
+            .with_body("server draining");
+    }
     if !runtime.has_capacity() {
         // Refuse before the 101 so the client sees a clean HTTP error and
         // can back off / be routed elsewhere.
@@ -180,7 +205,7 @@ pub(crate) fn upgrade_response(
     let handlers = Arc::clone(handlers);
     let req = req.clone(); // handed to on_open after adoption
     Response::upgrade(move |stream, leftover| {
-        let _ = rt.adopt(stream, leftover, handlers, req);
+        let _ = rt.adopt_with_policy(stream, leftover, handlers, req, existing);
     })
     .with_header("upgrade", "websocket")
     .with_header("connection", "Upgrade")
@@ -362,6 +387,21 @@ mod tests {
             &handlers,
         );
         assert_eq!(bad.status, 403);
+    }
+
+    #[test]
+    fn draining_refuses_new_sessions_but_allows_authorized_reconnects() {
+        let rt = runtime();
+        rt.lifecycle().drain(std::time::Duration::from_secs(1));
+        let req = with_extra(&[]);
+        assert_eq!(
+            upgrade_response(&req, &rt, &Arc::new(Handlers::default())).status,
+            503
+        );
+        let reconnect = Arc::new(Ws::new().admit_during_drain(|_| true).handlers);
+        assert_eq!(upgrade_response(&req, &rt, &reconnect).status, 101);
+        rt.shutdown();
+        assert_eq!(upgrade_response(&req, &rt, &reconnect).status, 503);
     }
 
     #[test]
