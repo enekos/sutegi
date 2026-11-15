@@ -19,7 +19,9 @@
 use std::sync::Arc;
 
 use sutegi_http::{Request, Response};
-pub use sutegi_ws::{binary_frame, text_frame, Conn, Msg, WsConfig, WsRuntime};
+pub use sutegi_ws::{
+    binary_frame, text_frame, Conn, Msg, SendStatus, WsConfig, WsRuntime, WsStats,
+};
 
 /// Builder for one WebSocket endpoint's callbacks.
 #[derive(Clone, Default)]

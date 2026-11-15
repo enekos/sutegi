@@ -217,7 +217,7 @@ keep anything stronger in a table.
 ## Scaling notes
 
 - Broadcast to a large room encodes the frame **once** (`Arc`-shared) and
-  takes each reactor shard's lock once — the 80k-socket transport numbers
+  reserves queue capacity for every recipient — the 80k-socket transport numbers
   in the ws docs apply to channel broadcasts unchanged.
 - Per-connection ordering is guaranteed (callbacks inline on the shard).
   Cross-connection ordering within a topic follows broker order: in-process
@@ -243,3 +243,19 @@ DATABASE_URL=postgres://… cargo run -p chat-example -- 127.0.0.1:8080 &
 DATABASE_URL=postgres://… cargo run -p chat-example -- 127.0.0.1:8081 &
 # open a room on each port; messages and the online list cross pods
 ```
+
+## Bounded sends
+
+`Conn::try_send_text`, `try_send_binary` and `try_send_shared` return
+`SendStatus::{Queued, Full, Closed}`. Queued means accepted locally, never a
+remote delivery acknowledgement. Retry or close explicitly on Full; do not
+busy-loop on the reactor thread. The older `send_*` helpers close with 1013
+on overload instead of silently dropping an application message.
+
+`WsConfig::max_pending_commands` (4096) and `max_pending_bytes` (16 MiB) bound
+each shard inbox. A shard can also hold one bounded batch while processing.
+`max_buffered` bounds each connection's application frames across the inbox
+and socket output together. Close commands have separate capacity, at most
+one per connection; admission bounds pending upgrades. `WsRuntime::stats()`
+reports connections, pending commands/bytes and rejected sends. The same
+snapshot is available at the ops-guarded `GET /__ws` endpoint.

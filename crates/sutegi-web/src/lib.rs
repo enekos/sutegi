@@ -580,6 +580,23 @@ impl App {
                 let rt = sutegi_ws::WsRuntime::start(self.ws_config.clone())
                     .expect("sutegi-ws: failed to start reactor (kqueue/epoll/pipe unavailable)");
                 self.ws_runtime = Some(Arc::clone(&rt));
+                let monitor = Arc::clone(&rt);
+                self = self.get(
+                    "/__ws",
+                    "WebSocket queue and connection statistics.",
+                    move |_| {
+                        let stats = monitor.stats();
+                        json(
+                            200,
+                            &Json::obj(vec![
+                                ("connections", Json::int(stats.connections as i64)),
+                                ("pending_commands", Json::int(stats.pending_commands as i64)),
+                                ("pending_bytes", Json::int(stats.pending_bytes as i64)),
+                                ("rejected_sends", Json::int(stats.rejected_sends as i64)),
+                            ]),
+                        )
+                    },
+                );
                 rt
             }
         };
@@ -873,8 +890,19 @@ impl App {
                 ]),
             ),
         ];
-        if let Some(caps) = &self.capabilities {
-            doc.push(("capabilities", caps.clone()));
+        #[allow(unused_mut)]
+        let mut caps = self
+            .capabilities
+            .clone()
+            .unwrap_or_else(|| Json::obj(vec![]));
+        #[cfg(feature = "ws")]
+        if self.ws_runtime.is_some() {
+            if let Json::Obj(ref mut values) = caps {
+                values.insert("ws_backpressure".into(), Json::Bool(true));
+            }
+        }
+        if caps.as_object().is_some_and(|values| !values.is_empty()) {
+            doc.push(("capabilities", caps));
         }
         if !self.search.is_empty() {
             doc.push(("search", Json::arr(self.search.clone())));

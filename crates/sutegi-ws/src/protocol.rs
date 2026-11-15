@@ -250,7 +250,7 @@ pub fn parse_close(payload: &[u8]) -> Result<(u16, &str), ProtocolError> {
 
 /// Close codes a peer may legitimately send (RFC 6455 §7.4).
 fn valid_close_code(code: u16) -> bool {
-    matches!(code, 1000..=1003 | 1007..=1011 | 3000..=4999)
+    matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999)
 }
 
 #[cfg(test)]

@@ -584,3 +584,70 @@ fn stale_handle_never_reaches_the_next_occupant_of_its_slot() {
     let (_, payload) = read_frame(&mut client_b);
     assert_eq!(payload, b"still-mine");
 }
+
+#[test]
+fn fallible_sends_bound_inbox_and_release_reservations() {
+    use sutegi_ws::SendStatus;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handlers = Handlers {
+        on_open: Some(Arc::new(move |conn, _| {
+            let first = conn.try_send_text("hello");
+            let second = conn.try_send_text("again");
+            tx.send((conn.clone(), first, second, conn.buffered_bytes()))
+                .unwrap();
+        })),
+        ..Handlers::default()
+    };
+    let (rt, mut client) = connect_pair(
+        handlers,
+        WsConfig {
+            max_pending_commands: 1,
+            max_pending_bytes: 32,
+            ..test_config()
+        },
+    );
+    let (conn, first, second, bytes) = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        (first, second, bytes),
+        (SendStatus::Queued, SendStatus::Full, 7)
+    );
+    assert_eq!(read_frame(&mut client).1, b"hello");
+    wait_for("reservation release", || conn.buffered_bytes() == 0);
+    assert_eq!(rt.stats().rejected_sends, 1);
+    drop(client);
+    wait_for("closed handle", || conn.is_closed());
+    assert_eq!(conn.try_send_text("late"), SendStatus::Closed);
+}
+
+#[test]
+fn close_bypasses_a_full_data_inbox() {
+    use sutegi_ws::SendStatus;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handlers = Handlers {
+        on_open: Some(Arc::new(move |conn, _| {
+            let first = conn.try_send_text("123456"); // eight encoded bytes
+            let second = conn.try_send_text("x");
+            conn.close(1013, "overloaded");
+            conn.close(1013, "duplicate");
+            tx.send((conn.clone(), first, second)).unwrap();
+        })),
+        ..Handlers::default()
+    };
+    let (rt, mut client) = connect_pair(
+        handlers,
+        WsConfig {
+            max_pending_bytes: 8,
+            ..test_config()
+        },
+    );
+    let (conn, first, second) = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!((first, second), (SendStatus::Queued, SendStatus::Full));
+    let (opcode, payload) = read_frame(&mut client);
+    assert_eq!(opcode, 8);
+    assert_eq!(&payload[..2], &1013u16.to_be_bytes());
+    client
+        .write_all(&client_frame(8, &1013u16.to_be_bytes(), true))
+        .unwrap();
+    wait_for("close", || rt.connections() == 0);
+    wait_for("discarded reservation", || conn.buffered_bytes() == 0);
+}

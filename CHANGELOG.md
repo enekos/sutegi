@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- WebSockets: bounded shard inboxes, fallible sends and queue statistics. Legacy send helpers close overloaded connections with 1013. `WsConfig` gains pending command/byte limits.
+
 ## [0.13.0] - 2026-11-08
 
 The security release. A whole-repo audit at v0.12.0 found one cross-user data leak and four unauthenticated ways to take a server down; this release fixes every critical/high/medium-with-reach finding. **Several defaults now fail closed — read *Breaking* before upgrading.**

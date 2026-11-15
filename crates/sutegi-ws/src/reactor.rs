@@ -82,6 +82,10 @@ pub struct WsConfig {
     /// Per-connection outbound queue cap; a slower consumer is dropped.
     /// Default 1 MiB.
     pub max_buffered: usize,
+    /// Maximum pending data commands per shard. Default 4096.
+    pub max_pending_commands: usize,
+    /// Maximum pending data bytes per shard. Default 16 MiB.
+    pub max_pending_bytes: usize,
     /// Process-wide connection cap. Default 1_048_576.
     pub max_connections: usize,
     /// Max concurrent connections from a single source IP (0 = unlimited).
@@ -102,6 +106,8 @@ impl Default for WsConfig {
             ping_interval: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(75),
             max_buffered: 1 << 20,
+            max_pending_commands: 4096,
+            max_pending_bytes: 16 << 20,
             max_connections: 1 << 20,
             max_connections_per_ip: 1024,
             raise_nofile: true,
@@ -184,18 +190,39 @@ struct AdoptData {
     ip: Option<String>,
 }
 
+/// Result of accepting a frame locally; `Queued` is not a delivery receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendStatus {
+    Queued,
+    Full,
+    Closed,
+}
+
+#[derive(Default)]
+struct ConnBudget {
+    closed: AtomicBool,
+    bytes: AtomicUsize,
+}
+
+/// Reservation follows the frame from inbox to socket, and releases on every
+/// error/close path as well as successful writes.
+struct Reservation {
+    budget: Arc<ConnBudget>,
+    bytes: usize,
+}
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.budget.bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
 enum Cmd {
     Adopt(Box<AdoptData>),
     Send {
         token: u32,
         id: u64,
         buf: Arc<Vec<u8>>,
-    },
-    /// One frame to many connections on the same shard — a broadcast that
-    /// takes the shard lock once instead of once per target.
-    SendMany {
-        targets: Vec<(u32, u64)>,
-        buf: Arc<Vec<u8>>,
+        reservation: Reservation,
     },
     Close {
         token: u32,
@@ -205,72 +232,147 @@ enum Cmd {
     },
 }
 
-/// The half of a shard visible to other threads: an injection queue plus a
-/// wake pipe. `wake_pending` dedups wake bytes so a hot sender can't fill
-/// the pipe.
+#[derive(Default)]
+struct Inbox {
+    data: Vec<Cmd>,
+    control: Vec<Cmd>,
+    bytes: usize,
+}
+
 struct ShardShared {
-    inbox: Mutex<Vec<Cmd>>,
+    inbox: Mutex<Inbox>,
     pipe: WakePipe,
     wake_pending: AtomicBool,
+    max_commands: usize,
+    max_bytes: usize,
+    max_buffered: usize,
+    rejected: AtomicUsize,
 }
 
 impl ShardShared {
-    fn inject(&self, cmd: Cmd) {
-        self.inbox.lock().unwrap().push(cmd);
+    fn wake(&self) {
         if !self.wake_pending.swap(true, Ordering::AcqRel) {
             self.pipe.wake();
         }
     }
+
+    // Only one close per admitted connection; adopts are bounded by admission.
+    // These do not compete with data for queue capacity.
+    fn control(&self, cmd: Cmd) {
+        self.inbox.lock().unwrap().control.push(cmd);
+        self.wake();
+    }
 }
 
-/// A cheap, cloneable, thread-safe handle to one live connection.
-///
-/// Sends are fire-and-forget: if the connection has closed (or closes before
-/// the reactor drains the queue), the frame is dropped silently — exactly
-/// the semantics a broadcast loop wants. Every command carries the
-/// process-unique connection id, which is never reused, so a stale handle is
-/// harmless even after its slab slot is reused by another connection.
+/// A cheap, cloneable handle. Fallible sends reserve both shard capacity and
+/// the connection's bytes, including frames not yet written to the socket.
 #[derive(Clone)]
 pub struct Conn {
     id: u64,
     token: u32,
     shard: Arc<ShardShared>,
+    budget: Arc<ConnBudget>,
 }
 
 impl Conn {
-    /// Process-unique id, stable for the life of the connection. Key your
-    /// rosters/maps with this.
     pub fn id(&self) -> u64 {
         self.id
     }
 
-    pub fn send_text(&self, text: &str) {
-        self.send_shared(&text_frame(text));
+    pub fn is_closed(&self) -> bool {
+        self.budget.closed.load(Ordering::Acquire)
     }
 
-    pub fn send_binary(&self, data: &[u8]) {
-        self.send_shared(&binary_frame(data));
+    pub fn buffered_bytes(&self) -> usize {
+        self.budget.bytes.load(Ordering::Acquire)
     }
 
-    /// Enqueue a pre-encoded frame (from [`text_frame`]/[`binary_frame`]) to
-    /// this one connection. To fan a frame out to many, prefer [`broadcast`],
-    /// which takes each shard's lock once instead of once per connection.
-    pub fn send_shared(&self, frame: &Arc<Vec<u8>>) {
-        self.shard.inject(Cmd::Send {
+    pub fn try_send_text(&self, text: &str) -> SendStatus {
+        if text.len() > self.shard.max_buffered {
+            return self.too_large();
+        }
+        self.try_send_shared(&text_frame(text))
+    }
+
+    pub fn try_send_binary(&self, data: &[u8]) -> SendStatus {
+        if data.len() > self.shard.max_buffered {
+            return self.too_large();
+        }
+        self.try_send_shared(&binary_frame(data))
+    }
+
+    fn too_large(&self) -> SendStatus {
+        if self.is_closed() {
+            return SendStatus::Closed;
+        }
+        self.shard.rejected.fetch_add(1, Ordering::Relaxed);
+        SendStatus::Full
+    }
+
+    pub fn try_send_shared(&self, frame: &Arc<Vec<u8>>) -> SendStatus {
+        let mut inbox = self.shard.inbox.lock().unwrap();
+        if self.is_closed() {
+            return SendStatus::Closed;
+        }
+        let bytes = frame.len();
+        if inbox.data.len() >= self.shard.max_commands
+            || bytes > self.shard.max_bytes.saturating_sub(inbox.bytes)
+            || self
+                .budget
+                .bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    n.checked_add(bytes)
+                        .filter(|v| *v <= self.shard.max_buffered)
+                })
+                .is_err()
+        {
+            self.shard.rejected.fetch_add(1, Ordering::Relaxed);
+            return SendStatus::Full;
+        }
+        inbox.bytes += bytes;
+        inbox.data.push(Cmd::Send {
             token: self.token,
             id: self.id,
             buf: Arc::clone(frame),
+            reservation: Reservation {
+                budget: Arc::clone(&self.budget),
+                bytes,
+            },
         });
+        drop(inbox);
+        self.shard.wake();
+        SendStatus::Queued
     }
 
-    /// Start a graceful close: sends a close frame, then drops the socket
-    /// once the peer acknowledges (or after a grace period).
+    /// Compatibility helper: an overloaded connection is closed with 1013.
+    pub fn send_text(&self, text: &str) {
+        if self.try_send_text(text) == SendStatus::Full {
+            self.close(1013, "send queue full");
+        }
+    }
+    pub fn send_binary(&self, data: &[u8]) {
+        if self.try_send_binary(data) == SendStatus::Full {
+            self.close(1013, "send queue full");
+        }
+    }
+    pub fn send_shared(&self, frame: &Arc<Vec<u8>>) {
+        if self.try_send_shared(frame) == SendStatus::Full {
+            self.close(1013, "send queue full");
+        }
+    }
     pub fn close(&self, code: u16, reason: &str) {
-        self.shard.inject(Cmd::Close {
+        if self.budget.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let mut end = reason.len().min(123);
+        while !reason.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.shard.control(Cmd::Close {
             token: self.token,
             id: self.id,
             code,
-            reason: reason.to_string(),
+            reason: reason[..end].to_owned(),
         });
     }
 }
@@ -294,23 +396,8 @@ pub fn broadcast<'a, I>(conns: I, frame: &Arc<Vec<u8>>)
 where
     I: IntoIterator<Item = &'a Conn>,
 {
-    // Group by shard identity (the Arc's pointer), carrying one Arc clone of
-    // the shard per group so we can inject after the grouping pass.
-    type ShardGroup = (Arc<ShardShared>, Vec<(u32, u64)>);
-    let mut by_shard: HashMap<usize, ShardGroup> = HashMap::new();
     for conn in conns {
-        let key = Arc::as_ptr(&conn.shard) as usize;
-        by_shard
-            .entry(key)
-            .or_insert_with(|| (Arc::clone(&conn.shard), Vec::new()))
-            .1
-            .push((conn.token, conn.id));
-    }
-    for (_, (shard, targets)) in by_shard {
-        shard.inject(Cmd::SendMany {
-            targets,
-            buf: Arc::clone(frame),
-        });
+        conn.send_shared(frame);
     }
 }
 
@@ -413,7 +500,11 @@ impl WsRuntime {
         let mut shards = Vec::with_capacity(n);
         for i in 0..n {
             let shared = Arc::new(ShardShared {
-                inbox: Mutex::new(Vec::new()),
+                inbox: Mutex::new(Inbox::default()),
+                max_commands: cfg.max_pending_commands,
+                max_bytes: cfg.max_pending_bytes,
+                max_buffered: cfg.max_buffered,
+                rejected: AtomicUsize::new(0),
                 pipe: WakePipe::new()?,
                 wake_pending: AtomicBool::new(false),
             });
@@ -462,7 +553,7 @@ impl WsRuntime {
             return Err(io::Error::other("connection cap reached"));
         }
         let i = self.next_shard.fetch_add(1, Ordering::Relaxed) % self.shards.len();
-        self.shards[i].inject(Cmd::Adopt(Box::new(AdoptData {
+        self.shards[i].control(Cmd::Adopt(Box::new(AdoptData {
             stream,
             leftover,
             handlers,
@@ -470,6 +561,21 @@ impl WsRuntime {
             ip,
         })));
         Ok(())
+    }
+
+    /// Pending commands/bytes and rejected sends, summed across shards.
+    pub fn stats(&self) -> WsStats {
+        let mut stats = WsStats {
+            connections: self.connections(),
+            ..WsStats::default()
+        };
+        for shard in &self.shards {
+            let inbox = shard.inbox.lock().unwrap();
+            stats.pending_commands += inbox.data.len();
+            stats.pending_bytes += inbox.bytes;
+            stats.rejected_sends += shard.rejected.load(Ordering::Relaxed);
+        }
+        stats
     }
 
     /// Live connection count (admitted, not yet released) across all shards.
@@ -489,11 +595,13 @@ impl WsRuntime {
 // ---------------------------------------------------------------------------
 
 struct OutBuf {
+    _reservation: Option<Reservation>,
     buf: Arc<Vec<u8>>,
     pos: usize,
 }
 
 struct ConnState {
+    budget: Arc<ConnBudget>,
     stream: TcpStream,
     id: u64,
     /// Unparsed inbound bytes (bounded: frames are refused from their length
@@ -589,24 +697,27 @@ impl Shard {
         // Swap the queue out under the lock, process outside it.
         let cmds = {
             let mut inbox = self.shared.inbox.lock().unwrap();
-            if inbox.is_empty() {
+            if inbox.data.is_empty() && inbox.control.is_empty() {
                 return;
             }
             std::mem::take(&mut *inbox)
         };
-        for cmd in cmds {
+        // Close commands take priority when a producer has filled the data queue.
+        for cmd in cmds.control.into_iter().chain(cmds.data) {
             match cmd {
                 Cmd::Adopt(data) => self.adopt(*data),
-                Cmd::Send { token, id, buf } => {
-                    if self.live(token, id) {
-                        self.enqueue(token, buf);
-                    }
-                }
-                Cmd::SendMany { targets, buf } => {
-                    for (token, id) in targets {
-                        if self.live(token, id) {
-                            self.enqueue(token, Arc::clone(&buf));
-                        }
+                Cmd::Send {
+                    token,
+                    id,
+                    buf,
+                    reservation,
+                } => {
+                    if self.live(token, id)
+                        && self.slab[token as usize]
+                            .as_ref()
+                            .is_some_and(|s| s.closing.is_none())
+                    {
+                        self.enqueue_reserved(token, buf, Some(reservation));
                     }
                 }
                 Cmd::Close {
@@ -634,6 +745,7 @@ impl Shard {
         let state = self.slab[token as usize].as_ref().unwrap();
         Conn {
             id: state.id,
+            budget: Arc::clone(&state.budget),
             token,
             shard: Arc::clone(&self.shared),
         }
@@ -672,6 +784,7 @@ impl Shard {
             return;
         }
         let state = ConnState {
+            budget: Arc::new(ConnBudget::default()),
             stream,
             id: NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed),
             rbuf: leftover,
@@ -903,6 +1016,9 @@ impl Shard {
         if already {
             return;
         }
+        if let Some(state) = self.slab[t].as_ref() {
+            state.budget.closed.store(true, Ordering::Release);
+        }
         let frame = Arc::new(encode_close(code, reason));
         self.enqueue(token, frame);
         if let Some(state) = self.slab[t].as_mut() {
@@ -914,13 +1030,26 @@ impl Shard {
     /// Queue bytes and try to flush immediately (the hot path writes with a
     /// single syscall and never touches the poller).
     fn enqueue(&mut self, token: u32, buf: Arc<Vec<u8>>) {
+        self.enqueue_reserved(token, buf, None);
+    }
+
+    fn enqueue_reserved(
+        &mut self,
+        token: u32,
+        buf: Arc<Vec<u8>>,
+        reservation: Option<Reservation>,
+    ) {
         let t = token as usize;
         let state = match self.slab[t].as_mut() {
             Some(s) => s,
             None => return,
         };
         state.out_bytes += buf.len();
-        state.out.push_back(OutBuf { buf, pos: 0 });
+        state.out.push_back(OutBuf {
+            buf,
+            pos: 0,
+            _reservation: reservation,
+        });
         if state.out_bytes > self.cfg.max_buffered {
             // Slow consumer: dropping it is the only bounded option.
             self.remove(token, 1006);
@@ -984,10 +1113,12 @@ impl Shard {
         let Some(state) = self.slab[t].take() else {
             return;
         };
+        state.budget.closed.store(true, Ordering::Release);
         // `on_close` sees the right id; its sends are dropped because the
         // slot is already vacated (and any later occupant has another id).
         let conn = Conn {
             id: state.id,
+            budget: Arc::clone(&state.budget),
             token,
             shard: Arc::clone(&self.shared),
         };
@@ -1065,4 +1196,13 @@ impl Shard {
             self.slab.shrink_to_fit();
         }
     }
+}
+
+/// Snapshot of transport load. Queue values exclude the batch being processed.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WsStats {
+    pub connections: usize,
+    pub pending_commands: usize,
+    pub pending_bytes: usize,
+    pub rejected_sends: usize,
 }
