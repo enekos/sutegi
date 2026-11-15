@@ -53,6 +53,7 @@ pub struct Channels {
     authorize: Option<AuthorizeFn>,
     max_joins: usize,
     inbound_rate: (u32, u32),
+    dispatch: Option<sutegi_ws::DispatchConfig>,
     #[cfg(feature = "presence")]
     presence_interval: Option<std::time::Duration>,
 }
@@ -67,6 +68,7 @@ impl Default for Channels {
             authorize: None,
             max_joins: DEFAULT_MAX_JOINS,
             inbound_rate: DEFAULT_INBOUND_RATE,
+            dispatch: None,
             #[cfg(feature = "presence")]
             presence_interval: None,
         }
@@ -98,6 +100,12 @@ impl Channels {
     }
 
     /// Register a channel. First matching pattern wins at join time.
+    /// Run channel callbacks away from reactor threads with per-connection ordering.
+    pub fn dispatch(mut self, config: sutegi_ws::DispatchConfig) -> Channels {
+        self.dispatch = Some(config);
+        self
+    }
+
     pub fn channel(mut self, channel: Channel) -> Channels {
         self.channels.push(channel);
         self
@@ -158,6 +166,7 @@ impl Channels {
             authorize: self.authorize,
             max_joins: self.max_joins,
             inbound_rate: self.inbound_rate,
+            dispatch: self.dispatch,
             #[cfg(feature = "presence")]
             presence: {
                 let mut p = crate::presence::PresenceState::default();
@@ -193,6 +202,7 @@ pub(crate) struct HubInner {
     authorize: Option<AuthorizeFn>,
     max_joins: usize,
     inbound_rate: (u32, u32),
+    dispatch: Option<sutegi_ws::DispatchConfig>,
     #[cfg(feature = "presence")]
     pub(crate) presence: crate::presence::PresenceState,
 }
@@ -254,6 +264,7 @@ impl Bucket {
 struct JoinEntry {
     join_ref: Option<String>,
     assigns: Arc<Mutex<Json>>,
+    live: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct TopicEntry {
@@ -276,6 +287,7 @@ pub struct Socket {
     topic: String,
     join_ref: Option<String>,
     assigns: Arc<Mutex<Json>>,
+    live: Arc<std::sync::atomic::AtomicBool>,
     /// Armed only while the join callback runs: work queued here executes
     /// after the member is admitted and the ok reply is on the wire.
     pending: Option<Arc<Mutex<Vec<AfterJoinFn>>>>,
@@ -334,8 +346,18 @@ impl Socket {
         self.assigns.lock().unwrap().get(key).cloned()
     }
 
+    /// False after disconnect, leave, refusal or replacement by a new join.
+    pub fn is_current(&self) -> bool {
+        !self.conn.is_closed() && self.live.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Push an event to **this member only** (stamped with its `join_ref`).
     pub fn push(&self, event: &str, payload: &Json) {
+        // Serialize the current-generation check and enqueue against teardown.
+        let _memberships = self.hub.inner.conns.lock().unwrap();
+        if !self.is_current() {
+            return;
+        }
         self.conn.send_text(&protocol::serialize(
             &self.topic,
             event,
@@ -374,6 +396,10 @@ impl Socket {
 }
 
 impl ChannelHub {
+    pub fn dispatch_config(&self) -> Option<sutegi_ws::DispatchConfig> {
+        self.inner.dispatch.clone()
+    }
+
     /// Broadcast an event to every member of `topic`, across pods. Callable
     /// from anywhere — HTTP handlers, background threads, the REPL.
     pub fn broadcast(&self, topic: &str, event: &str, payload: &Json) {
@@ -593,6 +619,7 @@ impl HubInner {
             topic: env.topic.clone(),
             join_ref: join_ref.clone(),
             assigns: Arc::new(Mutex::new(Json::obj(vec![]))),
+            live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             pending: Some(pending.clone()),
         };
         // The callback runs outside every hub lock: it may broadcast, push,
@@ -618,6 +645,9 @@ impl HubInner {
                 }
             }
             Err(reason) => {
+                socket
+                    .live
+                    .store(false, std::sync::atomic::Ordering::Release);
                 self.reply(conn, env, join_ref.as_deref(), false, &reason);
             }
         }
@@ -634,6 +664,7 @@ impl HubInner {
                     JoinEntry {
                         join_ref: socket.join_ref.clone(),
                         assigns: Arc::clone(&socket.assigns),
+                        live: Arc::clone(&socket.live),
                     },
                 );
             }
@@ -679,6 +710,7 @@ impl HubInner {
             topic: env.topic.clone(),
             join_ref: join.join_ref.clone(),
             assigns: join.assigns,
+            live: join.live,
             pending: None,
         };
         match handler(&socket, &env.payload) {
@@ -743,9 +775,13 @@ impl HubInner {
     pub(crate) fn teardown(&self, conn: &Conn, topic: &str, reason: LeaveReason) {
         let removed = {
             let mut conns = self.conns.lock().unwrap();
-            conns
+            let removed = conns
                 .get_mut(&conn.id())
-                .and_then(|e| e.joins.remove(topic))
+                .and_then(|e| e.joins.remove(topic));
+            if let Some(join) = &removed {
+                join.live.store(false, std::sync::atomic::Ordering::Release);
+            }
+            removed
         };
         let Some(join) = removed else { return };
         self.forget_member(conn.id(), topic);
@@ -762,6 +798,7 @@ impl HubInner {
                     topic: topic.to_string(),
                     join_ref: join.join_ref.clone(),
                     assigns: join.assigns,
+                    live: join.live,
                     pending: None,
                 };
                 leave(&socket, reason);

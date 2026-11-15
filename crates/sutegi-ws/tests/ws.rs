@@ -651,3 +651,115 @@ fn close_bypasses_a_full_data_inbox() {
     wait_for("close", || rt.connections() == 0);
     wait_for("discarded reservation", || conn.buffered_bytes() == 0);
 }
+
+#[test]
+fn dispatched_handler_does_not_block_reactor_or_other_connections() {
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let closed = Arc::new(AtomicUsize::new(0));
+    let handlers = Handlers {
+        on_message: Some(Arc::new({
+            let gate = gate.clone();
+            move |conn, msg| {
+                if let Msg::Text(text) = msg {
+                    if text == "block" {
+                        started_tx.send(()).unwrap();
+                        let (lock, wake) = &*gate;
+                        let mut ready = lock.lock().unwrap();
+                        while !*ready {
+                            ready = wake.wait(ready).unwrap();
+                        }
+                    }
+                    conn.send_text(&text);
+                }
+            }
+        })),
+        on_close: Some(Arc::new({
+            let closed = closed.clone();
+            move |_, _| {
+                closed.fetch_add(1, Ordering::SeqCst);
+            }
+        })),
+        ..Handlers::default()
+    }
+    .dispatched(sutegi_ws::DispatchConfig {
+        workers: 2,
+        ..Default::default()
+    })
+    .unwrap();
+    let (rt, mut a) = connect_pair(handlers.clone(), test_config());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut b = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    b.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    rt.adopt(
+        listener.accept().unwrap().0,
+        vec![],
+        Arc::new(handlers),
+        upgrade_request(),
+    )
+    .unwrap();
+    a.write_all(&client_frame(1, b"block", true)).unwrap();
+    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    b.write_all(&client_frame(1, b"responsive", true)).unwrap();
+    assert_eq!(read_frame(&mut b).1, b"responsive");
+    // Even this connection's ping stays on the reactor, despite its blocked callback.
+    a.write_all(&client_frame(9, b"ping", true)).unwrap();
+    assert_eq!(read_frame(&mut a), (10, b"ping".to_vec()));
+    a.write_all(&client_frame(1, b"cancel-me", true)).unwrap();
+    drop(a);
+    wait_for("transport removed", || rt.connections() == 1);
+    {
+        let (lock, wake) = &*gate;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+    }
+    wait_for("ordered close callback", || {
+        closed.load(Ordering::SeqCst) == 1
+    });
+}
+
+#[test]
+fn dispatch_overload_closes_and_cleans_up_once() {
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let closed = Arc::new(AtomicUsize::new(0));
+    let handlers = Handlers {
+        on_open: Some(Arc::new({
+            let gate = gate.clone();
+            move |_, _| {
+                tx.send(()).unwrap();
+                let (lock, wake) = &*gate;
+                let mut ready = lock.lock().unwrap();
+                while !*ready {
+                    ready = wake.wait(ready).unwrap();
+                }
+            }
+        })),
+        on_close: Some(Arc::new({
+            let closed = closed.clone();
+            move |_, _| {
+                closed.fetch_add(1, Ordering::SeqCst);
+            }
+        })),
+        ..Handlers::default()
+    }
+    .dispatched(sutegi_ws::DispatchConfig {
+        workers: 1,
+        max_pending_per_connection: 1,
+        ..Default::default()
+    })
+    .unwrap();
+    let (rt, mut client) = connect_pair(handlers, test_config());
+    rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    client.write_all(&client_frame(1, b"one", true)).unwrap();
+    client.write_all(&client_frame(1, b"two", true)).unwrap();
+    assert_eq!(&read_frame(&mut client).1[..2], &1013u16.to_be_bytes());
+    drop(client);
+    wait_for("transport removed", || rt.connections() == 0);
+    {
+        let (lock, wake) = &*gate;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+    }
+    wait_for("cleanup", || closed.load(Ordering::SeqCst) == 1);
+}

@@ -636,14 +636,18 @@ impl App {
         if let Some(gate) = authorize {
             ws = ws.authorize(move |req: &Request| gate(req));
         }
+        let dispatch = hub.dispatch_config();
         let (open, message, close) = (hub.clone(), hub.clone(), hub);
-        self.ws(
-            pattern,
-            doc,
-            ws.on_open(move |conn, req| open.on_open(conn, req))
-                .on_message(move |conn, msg| message.on_message(conn, msg))
-                .on_close(move |conn, code| close.on_close(conn, code)),
-        )
+        ws = ws
+            .on_open(move |conn, req| open.on_open(conn, req))
+            .on_message(move |conn, msg| message.on_message(conn, msg))
+            .on_close(move |conn, code| close.on_close(conn, code));
+        if let Some(config) = dispatch {
+            ws = ws
+                .dispatch(config)
+                .expect("invalid channel dispatch configuration");
+        }
+        self.ws(pattern, doc, ws)
     }
 
     /// Mount an actor registry at `GET /__actors`: live state, mailbox
@@ -899,6 +903,7 @@ impl App {
         if self.ws_runtime.is_some() {
             if let Json::Obj(ref mut values) = caps {
                 values.insert("ws_backpressure".into(), Json::Bool(true));
+                values.insert("ws_handler_dispatch".into(), Json::str("opt-in"));
             }
         }
         if caps.as_object().is_some_and(|values| !values.is_empty()) {

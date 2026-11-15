@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use sutegi_http::{Request, Response};
 pub use sutegi_ws::{
-    binary_frame, text_frame, Conn, Msg, SendStatus, WsConfig, WsRuntime, WsStats,
+    binary_frame, text_frame, Conn, DispatchConfig, Msg, SendStatus, WsConfig, WsRuntime, WsStats,
 };
 
 /// Builder for one WebSocket endpoint's callbacks.
@@ -62,6 +62,12 @@ impl Ws {
     pub fn authorize(mut self, f: impl Fn(&Request) -> bool + Send + Sync + 'static) -> Ws {
         self.handlers.authorize = Some(Arc::new(f));
         self
+    }
+
+    /// Execute the callbacks configured so far on a bounded worker pool.
+    pub fn dispatch(mut self, config: DispatchConfig) -> std::io::Result<Ws> {
+        self.handlers = self.handlers.dispatched(config)?;
+        Ok(self)
     }
 
     /// Restrict the handshake to these exact `Origin` values — the built-in

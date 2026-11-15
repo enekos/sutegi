@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- ws/channels: opt-in bounded callback pools with per-connection ordering, cancellation of queued messages on disconnect, and generation-fenced channel pushes.
+
 - WebSockets: bounded shard inboxes, fallible sends and queue statistics. Legacy send helpers close overloaded connections with 1013. `WsConfig` gains pending command/byte limits.
 
 ## [0.13.0] - 2026-11-08

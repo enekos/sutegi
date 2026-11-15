@@ -28,6 +28,8 @@
 //! This crate is transport only. Topics/rooms, presence, and rejoin
 //! semantics are the channels layer built on top of it.
 
+mod dispatch;
+pub use dispatch::DispatchConfig;
 mod poller;
 pub mod protocol;
 mod reactor;

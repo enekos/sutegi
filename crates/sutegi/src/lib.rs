@@ -507,7 +507,9 @@ pub mod prelude {
     #[cfg(feature = "storage-db")]
     pub use sutegi_storage::DbStorage;
     #[cfg(feature = "ws")]
-    pub use sutegi_web::ws::{binary_frame, text_frame, Conn, Msg, WsConfig};
+    pub use sutegi_web::ws::{
+        binary_frame, text_frame, Conn, DispatchConfig, Msg, SendStatus, WsConfig,
+    };
     #[cfg(feature = "ws")]
     pub use sutegi_web::Ws;
 
