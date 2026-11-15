@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Example/docs: Sutegi-only two-browser WebRTC calls with authenticated room signalling, reconnect generations, opt-in recording, range playback, TURN configuration and browser verification tooling.
+
 - Storage/playback: explicit streaming capabilities, atomic filesystem `put_reader`, seekable object handles, and length-delimited HTTP readers with GET byte ranges and HEAD support.
 
 - HTTP/web: opt-in streaming upload routes with header authorization, per-route byte/deadline limits, sticky read failures, and unchanged buffered-route size limits. Content-Length is required; chunked requests remain rejected.
