@@ -391,8 +391,11 @@ mod tests {
         let mut p = 1001u16.to_be_bytes().to_vec();
         p.extend_from_slice("adiós".as_bytes());
         assert_eq!(parse_close(&p), Ok((1001, "adiós")));
+        for code in [1012u16, 1013, 1014] {
+            assert_eq!(parse_close(&code.to_be_bytes()), Ok((code, "")));
+        }
         // Reserved codes a peer must not send.
-        for code in [0u16, 999, 1004, 1005, 1006, 1012, 2999] {
+        for code in [0u16, 999, 1004, 1005, 1006, 1015, 2999] {
             assert_eq!(
                 parse_close(&code.to_be_bytes()),
                 Err(ProtocolError::BadCloseFrame),
