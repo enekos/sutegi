@@ -55,9 +55,17 @@ impl Lifecycle {
                 .checked_add(grace)
                 .unwrap_or_else(Instant::now),
         );
-        self.0.phase.store(1, Ordering::Release);
+        // stop() can race with this request. Never resurrect a stopped
+        // lifecycle after publishing the deadline.
+        let changed = self
+            .0
+            .phase
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
         drop(deadline);
-        self.wake();
+        if changed {
+            self.wake();
+        }
     }
     pub fn stop(&self) {
         if self.0.phase.swap(2, Ordering::AcqRel) != 2 {
@@ -75,7 +83,9 @@ impl Lifecycle {
     fn wake(&self) {
         let wakes = self.0.wakes.lock().unwrap().clone();
         for wake in wakes {
-            wake();
+            // One application hook must not suppress notifications to other
+            // transports or unwind through an event loop polling phase().
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wake()));
         }
     }
 }
@@ -83,6 +93,30 @@ impl Lifecycle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stopped_state_wins_a_concurrent_drain() {
+        for _ in 0..100 {
+            let lifecycle = Lifecycle::new();
+            let drain = lifecycle.clone();
+            let thread = std::thread::spawn(move || drain.drain(Duration::from_secs(60)));
+            lifecycle.stop();
+            thread.join().unwrap();
+            assert_eq!(lifecycle.phase(), Phase::Stopped);
+        }
+    }
+    #[test]
+    fn a_panicking_hook_does_not_suppress_other_notifications() {
+        use std::sync::atomic::AtomicBool;
+        let lifecycle = Lifecycle::new();
+        let called = Arc::new(AtomicBool::new(false));
+        lifecycle.on_change(|| panic!("application hook"));
+        let flag = called.clone();
+        lifecycle.on_change(move || {
+            flag.store(true, Ordering::Release);
+        });
+        lifecycle.stop();
+        assert!(called.load(Ordering::Acquire));
+    }
     #[test]
     fn repeated_drain_does_not_extend_the_deadline() {
         let state = Lifecycle::new();
