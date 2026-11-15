@@ -1021,6 +1021,7 @@ where
                     if req.header("expect").is_some() {
                         return write_response(&mut writer, Response::new(417), false);
                     }
+                    let is_head = req.method == Method::Head;
                     let mut body =
                         RequestBody::new(&mut reader, writer.try_clone()?, length, upload);
                     let mut response =
@@ -1036,7 +1037,7 @@ where
                         response = Response::new(400);
                     }
                     // Always close: a refusal may leave unread body/pipeline bytes.
-                    return write_response(&mut writer, response, false);
+                    return write_head_and_body(&mut writer, response, false, is_head);
                 }
                 if let Some(reject) = read_buffered_body(&mut reader, &mut req, limits, deadline)? {
                     let status = match reject {
