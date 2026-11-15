@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-15
+
+The calls release: everything a WebRTC call server needs from the framework — bounded WebSocket sends, ordered callback pools, a shared drain lifecycle, streaming uploads and seekable range downloads — plus a complete two-browser call example.
+
+### Fixed
+
+- HTTP: `App::run` / `serve_lifecycle` accept connections with a blocking `accept` again. The lifecycle path briefly polled a nonblocking listener, adding up to 250 µs of sleep to every new connection (`e2e_request` 106 → 322 µs); a waker thread now self-connects when the lifecycle stops or the drain deadline passes.
+- ws: a graceful `Conn::close` is delivered after the frames already accepted for that connection, so `send(..); close(..)` no longer drops the send. Only the overload close (1013 from `send_*`) jumps ahead of its backlog.
+- HTTP: running out of file descriptors while duplicating an accepted socket sheds that connection and backs off instead of stopping the server.
+- `Duration::MAX` as a drain grace or upload timeout means "no limit", not "already expired".
+
+### Changed
+
+- HTTP: when the worker queue is full (`Limits::max_pending`), a new connection gets `503 Service Unavailable` with `retry-after: 1` instead of waiting (`serve`) or a bare close. `ThreadPool::is_saturated` reports it.
+- ws: legacy `send_*` helpers close an overloaded connection with 1013 instead of buffering without bound; use `try_send_*` to handle `SendStatus::Full` yourself.
+- web: `App::run_until` starts a drain (default grace 5 s, `App::drain_timeout`) instead of stopping at once.
+
+### Added
+
 - Example/docs: Sutegi-only two-browser WebRTC calls with authenticated room signalling, reconnect generations, opt-in recording, range playback, TURN configuration and browser verification tooling.
 
 - Storage/playback: explicit streaming capabilities, atomic filesystem `put_reader`, seekable object handles, and length-delimited HTTP readers with GET byte ranges and HEAD support.

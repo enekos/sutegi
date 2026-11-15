@@ -12,7 +12,7 @@ Because every route, model, tool, capability and searchable table registers its 
 AUTH="Authorization: Bearer dev-token"
 curl -H "$AUTH" localhost:8080/__introspect
 # {
-#   "framework": "sutegi", "version": "0.13.0", "name": "todo",
+#   "framework": "sutegi", "version": "0.14.0", "name": "todo",
 #   "routes": [ { "method": "GET", "pattern": "/todos/:id", "doc": "…" } ],
 #   "models": [ … ], "tools": [ … ],
 #   "capabilities": { "backend": "postgres", "skip_locked": true, … },
