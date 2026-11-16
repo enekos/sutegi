@@ -6,7 +6,7 @@
 //! (fixed-seed splitmix64) for reproducibility in CI, matching the harness
 //! style used across the other crates.
 
-use sutegi_ws::protocol::{decode_frame, encode_frame, parse_close, Opcode};
+use sutegi_ws::protocol::{Opcode, decode_frame, encode_frame, parse_close};
 
 fn splitmix(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);

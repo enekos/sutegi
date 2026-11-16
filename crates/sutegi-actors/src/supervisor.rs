@@ -8,8 +8,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::{
-    spawn_on_shared, Actor, ActorRef, ActorStatus, Envelope, Exit, ExitReason, ExitSink, Registry,
-    Shared,
+    Actor, ActorRef, ActorStatus, Envelope, Exit, ExitReason, ExitSink, Registry, Shared,
+    spawn_on_shared,
 };
 
 /// When a child is (re)started after exiting.
@@ -721,11 +721,12 @@ mod tests {
             .child(ChildSpec::new("bomber", || AlwaysBombs))
             .start();
         wait_for(|| sup.status().state == SupervisorState::Failed);
-        assert!(sup
-            .status()
-            .children
-            .iter()
-            .all(|c| c.state != ActorState::Running));
+        assert!(
+            sup.status()
+                .children
+                .iter()
+                .all(|c| c.state != ActorState::Running)
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@
 //! the honest ceiling is **roughly a few MB per object** — past that, use
 //! real object storage ([`crate::S3Store`]).
 
-use crate::{now_secs, validate_key, ObjectMeta, Storage};
+use crate::{ObjectMeta, Storage, now_secs, validate_key};
 use sutegi_crypto::{base64_decode, base64_encode};
 use sutegi_json::Json;
 use sutegi_orm::{Backend, Value};

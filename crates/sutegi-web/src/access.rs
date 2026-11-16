@@ -1,6 +1,6 @@
 use std::borrow::Cow;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use sutegi_http::{Request, Response};

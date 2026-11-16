@@ -6,7 +6,7 @@
 
 use sutegi_json::Json;
 use sutegi_orm::pg::Pg;
-use sutegi_orm::{search, Backend, Value};
+use sutegi_orm::{Backend, Value, search};
 
 fn db() -> Option<Pg> {
     let url = std::env::var("SUTEGI_PG_TEST_URL").ok()?;

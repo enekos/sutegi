@@ -76,13 +76,26 @@ fn reply(stream: &mut TcpStream) -> String {
 fn authorization_and_size_checks_run_before_body_reads() {
     let server = Server::start(app(UploadLimits::default()));
     for (head, status) in [
-        ("POST /recording HTTP/1.1\r\nContent-Length: 209715200\r\n\r\n", 403),
-        ("POST /recording HTTP/1.1\r\nAuthorization: Bearer test\r\nContent-Length: 209715201\r\n\r\n", 413),
-        ("POST /recording HTTP/1.1\r\nAuthorization: Bearer test\r\n\r\n", 411),
-        ("POST /recording HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n", 501),
+        (
+            "POST /recording HTTP/1.1\r\nContent-Length: 209715200\r\n\r\n",
+            403,
+        ),
+        (
+            "POST /recording HTTP/1.1\r\nAuthorization: Bearer test\r\nContent-Length: 209715201\r\n\r\n",
+            413,
+        ),
+        (
+            "POST /recording HTTP/1.1\r\nAuthorization: Bearer test\r\n\r\n",
+            411,
+        ),
+        (
+            "POST /recording HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+            501,
+        ),
         ("POST /plain HTTP/1.1\r\nContent-Length: 17\r\n\r\n", 413),
     ] {
-        let mut stream = server.connect(); stream.write_all(head.as_bytes()).unwrap();
+        let mut stream = server.connect();
+        stream.write_all(head.as_bytes()).unwrap();
         assert!(reply(&mut stream).starts_with(&format!("HTTP/1.1 {status}")));
     }
 }

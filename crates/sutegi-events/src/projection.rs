@@ -8,14 +8,14 @@
 //! The row claim serializes a projection across pods (two workers on the same
 //! projection just take turns), while distinct projections run independently.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
 use sutegi_orm::{Backend, Transactional, Value};
 
-use crate::store::{decode_event, ensure_tables, now_millis, StoredEvent};
+use crate::store::{StoredEvent, decode_event, ensure_tables, now_millis};
 
 /// A projection handler: receives each stored event **and the transaction the
 /// checkpoint moves in** — write your read model through it and the update is
@@ -254,7 +254,7 @@ impl Drop for ProjectionWorkers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{event, EventStore, Expected};
+    use crate::store::{EventStore, Expected, event};
     use std::sync::atomic::AtomicUsize;
     use sutegi_json::Json;
     use sutegi_orm::db::Db;

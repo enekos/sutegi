@@ -2,7 +2,7 @@
 //! reads, and aggregate folding, over any ORM backend.
 
 use sutegi_json::Json;
-use sutegi_orm::{row, Backend, Transactional, Value};
+use sutegi_orm::{Backend, Transactional, Value, row};
 
 use crate::Aggregate;
 

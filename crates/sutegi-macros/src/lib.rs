@@ -24,7 +24,7 @@
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, Data, DeriveInput, Fields, Type};
+use syn::{Data, DeriveInput, Fields, Type, parse_macro_input};
 
 #[derive(Clone, Copy)]
 enum Scalar {
@@ -161,14 +161,14 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 return Err(syn::Error::new_spanned(
                     &input,
                     "#[derive(Model)] requires named fields",
-                ))
+                ));
             }
         },
         _ => {
             return Err(syn::Error::new_spanned(
                 &input,
                 "#[derive(Model)] can only be applied to structs",
-            ))
+            ));
         }
     };
 
@@ -889,14 +889,14 @@ fn expand_validate(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> 
                 return Err(syn::Error::new_spanned(
                     name,
                     "#[derive(Validate)] requires named fields",
-                ))
+                ));
             }
         },
         _ => {
             return Err(syn::Error::new_spanned(
                 name,
                 "#[derive(Validate)] can only be derived for structs",
-            ))
+            ));
         }
     };
 

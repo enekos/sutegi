@@ -25,8 +25,8 @@
 use std::collections::VecDeque;
 use std::net::{Shutdown, TcpStream};
 
-use crate::protocol::{be_i32, parse_error, Client};
 use crate::Config;
+use crate::protocol::{Client, be_i32, parse_error};
 
 /// PostgreSQL truncates identifiers to `NAMEDATALEN - 1` bytes. A longer
 /// channel name would be silently aliased with every other name sharing its

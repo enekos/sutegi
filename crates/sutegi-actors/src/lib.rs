@@ -46,8 +46,8 @@ pub use supervisor::{
 };
 
 use std::collections::BTreeMap;
-use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -578,7 +578,7 @@ mod tests {
         }
         let s = spawn_opts(Slow, Opts::new().mailbox(1));
         s.tell(()).unwrap(); // being processed
-                             // Wait until the first message is dequeued so the second fills the box.
+        // Wait until the first message is dequeued so the second fills the box.
         std::thread::sleep(Duration::from_millis(50));
         s.tell(()).unwrap(); // fills the mailbox
         assert_eq!(s.tell(()), Err(TellError::Full));

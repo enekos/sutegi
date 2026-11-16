@@ -10,8 +10,8 @@
 //! [`Smtp::allow_plaintext_auth`] — e.g. a relay on a private network you
 //! trust. `AUTH` is never sent to a server that does not advertise it.
 
-use crate::message::{check_mailbox, Email};
 use crate::Transport;
+use crate::message::{Email, check_mailbox};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;

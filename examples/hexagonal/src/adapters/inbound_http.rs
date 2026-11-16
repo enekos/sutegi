@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use sutegi::hexagon::{respond, respond_created, AppError, IntoJson, UseCase};
+use sutegi::hexagon::{AppError, IntoJson, UseCase, respond, respond_created};
 use sutegi::prelude::*;
 
 use crate::application::{CompleteTodo, CreateTodo, ListTodos};

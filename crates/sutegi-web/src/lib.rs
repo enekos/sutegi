@@ -9,8 +9,8 @@
 
 use std::any::{Any, TypeId};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use std::time::Duration;
 pub use sutegi_http::{
@@ -1264,7 +1264,9 @@ impl App {
                     "  WARNING: ops surface (/__introspect /__metrics /__tools*) is PUBLIC — ops_public() with no ops_guard"
                 );
             } else {
-                println!("  ops surface closed (403) — no ops_guard set; only /__health /__ready are served");
+                println!(
+                    "  ops surface closed (403) — no ops_guard set; only /__health /__ready are served"
+                );
             }
         }
         if !self.listeners.is_empty() {
@@ -1411,7 +1413,7 @@ fn tool_stream(defs: &Arc<Vec<ToolDef>>, c: &Ctx) -> Response {
     let def = match defs.iter().find(|d| d.name == name && d.is_stream()) {
         Some(d) => d,
         None => {
-            return Error::not_found(format!("unknown streaming tool '{name}'")).into_response()
+            return Error::not_found(format!("unknown streaming tool '{name}'")).into_response();
         }
     };
     if let Err(e) = validate_tool_args(&def.schema, &args) {
@@ -2116,10 +2118,11 @@ mod tests {
         assert_eq!(redirect("/login").status, 302);
         assert_eq!(no_content().status, 204);
         let h = html(200, "<p>hi</p>");
-        assert!(h
-            .headers
-            .iter()
-            .any(|(k, v)| k == "content-type" && v.contains("text/html")));
+        assert!(
+            h.headers
+                .iter()
+                .any(|(k, v)| k == "content-type" && v.contains("text/html"))
+        );
     }
 
     #[test]
@@ -2252,10 +2255,11 @@ mod tests {
     fn json_and_text_helpers_set_content_type() {
         let j = json(201, &Json::obj(vec![("ok", Json::Bool(true))]));
         assert_eq!(j.status, 201);
-        assert!(j
-            .headers
-            .iter()
-            .any(|(k, v)| k == "content-type" && v.contains("application/json")));
+        assert!(
+            j.headers
+                .iter()
+                .any(|(k, v)| k == "content-type" && v.contains("application/json"))
+        );
         assert_eq!(status(204).status, 204);
         assert_eq!(not_found().status, 404);
     }
@@ -2266,19 +2270,22 @@ mod tests {
         // OPTIONS is answered with 204 + allow-origin.
         let resp = pre(&req(Method::Options, b"")).unwrap();
         assert_eq!(resp.status, 204);
-        assert!(resp
-            .headers
-            .iter()
-            .any(|(k, v)| k == "access-control-allow-origin" && v == "https://join.com"));
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(k, v)| k == "access-control-allow-origin" && v == "https://join.com")
+        );
         // Non-OPTIONS passes through.
         assert!(pre(&req(Method::Get, b"")).is_none());
         // The after-middleware stamps the header on any response.
         let after = cors("*");
         let stamped = after(&req(Method::Get, b""), Response::new(200));
-        assert!(stamped
-            .headers
-            .iter()
-            .any(|(k, v)| k == "access-control-allow-origin" && v == "*"));
+        assert!(
+            stamped
+                .headers
+                .iter()
+                .any(|(k, v)| k == "access-control-allow-origin" && v == "*")
+        );
     }
 
     /// The header a credentialed frontend cannot work without, on **both**
@@ -2341,14 +2348,16 @@ mod tests {
             "content-type".into(),
         ));
         let resp = cors_preflight_credentialed("https://app.hirusta.io")(&r).unwrap();
-        assert!(resp
-            .headers
-            .iter()
-            .any(|(k, v)| k == "access-control-allow-headers" && v == "content-type"));
-        assert!(resp
-            .headers
-            .iter()
-            .any(|(k, v)| k == "access-control-allow-headers" && v != "*"));
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(k, v)| k == "access-control-allow-headers" && v == "content-type")
+        );
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(k, v)| k == "access-control-allow-headers" && v != "*")
+        );
     }
 
     #[test]
@@ -2370,10 +2379,12 @@ mod tests {
         // Wrong / missing creds → 401 with a Basic challenge.
         let denied = guard(&req(Method::Get, b"")).unwrap();
         assert_eq!(denied.status, 401);
-        assert!(denied
-            .headers
-            .iter()
-            .any(|(k, v)| k == "www-authenticate" && v.contains("Basic")));
+        assert!(
+            denied
+                .headers
+                .iter()
+                .any(|(k, v)| k == "www-authenticate" && v.contains("Basic"))
+        );
         // base64("user:pass") == "dXNlcjpwYXNz".
         let mut r = req(Method::Get, b"");
         r.headers
@@ -2440,9 +2451,11 @@ mod tests {
         });
         let rid = header_of(&resp, REQUEST_ID_HEADER).expect("rid stamped");
         assert_eq!(records.len(), 2);
-        assert!(records
-            .iter()
-            .all(|r| r.field("rid").map(|v| v.to_string()) == Some(rid.clone())));
+        assert!(
+            records
+                .iter()
+                .all(|r| r.field("rid").map(|v| v.to_string()) == Some(rid.clone()))
+        );
         let access = &records[1];
         assert_eq!(
             (access.target.as_str(), access.msg.as_str()),

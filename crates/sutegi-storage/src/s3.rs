@@ -332,11 +332,7 @@ impl S3Store {
 
     /// `https` or `http`.
     pub(crate) fn scheme(&self) -> &'static str {
-        if self.https {
-            "https"
-        } else {
-            "http"
-        }
+        if self.https { "https" } else { "http" }
     }
 
     /// The `Host` header / URL authority.

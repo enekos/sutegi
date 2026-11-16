@@ -37,6 +37,6 @@ mod reactor;
 pub use poller::raise_nofile_limit;
 pub use protocol::accept_key;
 pub use reactor::{
-    binary_frame, broadcast, text_frame, Conn, Handlers, Msg, SendStatus, WsConfig, WsRuntime,
-    WsStats,
+    Conn, Handlers, Msg, SendStatus, WsConfig, WsRuntime, WsStats, binary_frame, broadcast,
+    text_frame,
 };

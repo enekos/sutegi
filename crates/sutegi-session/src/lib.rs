@@ -297,9 +297,10 @@ mod tests {
         let s = Sessions::new(KEY).insecure();
         // A token over attacker-chosen JSON must not load as a session.
         let forged = s.token(r#"{"uid":1,"exp":99999999999}"#);
-        assert!(s
-            .load(&req_with_cookie("sutegi_session", &forged))
-            .is_empty());
+        assert!(
+            s.load(&req_with_cookie("sutegi_session", &forged))
+                .is_empty()
+        );
         // And a real session cookie must not verify as a token.
         let mut sess = s.load(&req_with_cookie("x", ""));
         sess.set("uid", Json::int(1));
@@ -355,9 +356,10 @@ mod tests {
         let reloaded = s.load(&req_with_cookie("sid", &cookie));
         assert_eq!(reloaded.get_str("user"), Some("eneko"));
         // A session signed under "sid" is invisible under the default name.
-        assert!(s
-            .load(&req_with_cookie("sutegi_session", &cookie))
-            .is_empty());
+        assert!(
+            s.load(&req_with_cookie("sutegi_session", &cookie))
+                .is_empty()
+        );
     }
 
     #[test]

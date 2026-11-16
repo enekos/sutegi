@@ -315,9 +315,11 @@ fn concurrent_dev_syncs_converge_on_a_pooled_file_db() {
     let tmp = TempDb::new("sync_race");
     let db = tmp.open();
     let schema = || {
-        vec![TableSchema::new("sync_t")
-            .column(Column::new("id", ColType::Integer).primary())
-            .column(Column::new("title", ColType::Text))]
+        vec![
+            TableSchema::new("sync_t")
+                .column(Column::new("id", ColType::Integer).primary())
+                .column(Column::new("title", ColType::Text)),
+        ]
     };
 
     std::thread::scope(|s| {
@@ -345,9 +347,11 @@ fn concurrent_dev_syncs_converge_on_a_pooled_file_db() {
     assert_eq!(live.len(), 1);
     assert_eq!(live[0], schema()[0].normalized());
     // And a follow-up sync agrees there is nothing left to do.
-    assert!(sutegi_orm::migrate::sync(&db, &schema())
-        .unwrap()
-        .is_empty());
+    assert!(
+        sutegi_orm::migrate::sync(&db, &schema())
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

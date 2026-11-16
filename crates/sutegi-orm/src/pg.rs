@@ -12,7 +12,7 @@
 //! single node (or a local KV store) is enough.
 
 use crate::backend::Backend;
-use crate::value::{create_table_sql, Dialect, TableSchema, Value};
+use crate::value::{Dialect, TableSchema, Value, create_table_sql};
 use std::cell::RefCell;
 use sutegi_json::Json;
 use sutegi_pg::Config;
@@ -130,7 +130,7 @@ fn pg_coltype(data_type: &str, udt_name: &str) -> crate::value::ColType {
 /// (a [`Pg`] pool or a [`Tx`]). Uses `information_schema` + `pg_index`; the
 /// framework's `_sutegi_migrations` ledger is excluded.
 fn introspect_pg(exec: &dyn Backend) -> Result<Vec<TableSchema>, String> {
-    use crate::value::{parse_default_literal, Column, FkAction, ForeignKey, Index};
+    use crate::value::{Column, FkAction, ForeignKey, Index, parse_default_literal};
 
     let s = |j: &Json, k: &str| j.get(k).and_then(Json::as_str).unwrap_or("").to_string();
     let b = |j: &Json, k: &str| j.get(k).and_then(Json::as_bool).unwrap_or(false);

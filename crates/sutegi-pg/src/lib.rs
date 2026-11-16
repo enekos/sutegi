@@ -130,7 +130,7 @@ impl std::str::FromStr for AuthMethods {
                 _ => {
                     return Err(format!(
                         "require_auth cannot mix negated and plain methods: {s}"
-                    ))
+                    ));
                 }
             };
             let slot = match name {

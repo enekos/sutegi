@@ -14,7 +14,7 @@ use std::borrow::Cow;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -618,7 +618,7 @@ fn read_buffered_body<R: Read>(
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "incomplete request body",
-                ))
+                ));
             }
             Ok(n) => filled += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -1034,21 +1034,23 @@ fn spawn_accept_waker(local: std::net::SocketAddr, lifecycle: Lifecycle) {
     }
     let _ = thread::Builder::new()
         .name("sutegi-http-accept-waker".into())
-        .spawn(move || loop {
-            match lifecycle.phase() {
-                Phase::Stopped => {
-                    let _ = TcpStream::connect_timeout(&target, Duration::from_secs(1));
-                    return;
-                }
-                Phase::Draining => {
-                    let left = lifecycle.deadline().map_or(Duration::ZERO, |d| {
-                        d.saturating_duration_since(Instant::now())
-                    });
-                    let _ = rx.recv_timeout(left.max(Duration::from_millis(1)));
-                }
-                Phase::Running => {
-                    if rx.recv().is_err() {
+        .spawn(move || {
+            loop {
+                match lifecycle.phase() {
+                    Phase::Stopped => {
+                        let _ = TcpStream::connect_timeout(&target, Duration::from_secs(1));
                         return;
+                    }
+                    Phase::Draining => {
+                        let left = lifecycle.deadline().map_or(Duration::ZERO, |d| {
+                            d.saturating_duration_since(Instant::now())
+                        });
+                        let _ = rx.recv_timeout(left.max(Duration::from_millis(1)));
+                    }
+                    Phase::Running => {
+                        if rx.recv().is_err() {
+                            return;
+                        }
                     }
                 }
             }
@@ -1150,8 +1152,8 @@ where
                     write_upgrade_head(&mut writer, resp.status, &resp.headers)?;
                     let leftover = reader.buffer().to_vec();
                     drop(reader); // closes the try_clone'd read handle
-                                  // Upgraded sockets are event-loop-managed; per-op
-                                  // timeouts belong to the blocking HTTP path.
+                    // Upgraded sockets are event-loop-managed; per-op
+                    // timeouts belong to the blocking HTTP path.
                     let _ = writer.set_read_timeout(None);
                     let _ = writer.set_write_timeout(None);
                     // Panic isolation: the takeover is app code too. A panic
@@ -1271,20 +1273,22 @@ impl ThreadPool {
             let queued = Arc::clone(&queued);
             let worker = thread::Builder::new()
                 .name(format!("sutegi-http-{i}"))
-                .spawn(move || loop {
-                    let job = receiver
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .recv();
-                    match job {
-                        Ok(job) => {
-                            queued.fetch_sub(1, Ordering::AcqRel);
-                            if cancel.load(Ordering::Acquire) {
-                                continue;
+                .spawn(move || {
+                    loop {
+                        let job = receiver
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .recv();
+                        match job {
+                            Ok(job) => {
+                                queued.fetch_sub(1, Ordering::AcqRel);
+                                if cancel.load(Ordering::Acquire) {
+                                    continue;
+                                }
+                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
                             }
-                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                            Err(_) => break,
                         }
-                        Err(_) => break,
                     }
                 })
                 .expect("spawn http worker thread");
@@ -1529,9 +1533,11 @@ mod tests {
     #[test]
     fn empty_stream_yields_none() {
         let mut reader = BufReader::new(&b""[..]);
-        assert!(parse_request(&mut reader, &Limits::default())
-            .unwrap()
-            .is_none());
+        assert!(
+            parse_request(&mut reader, &Limits::default())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1871,8 +1877,7 @@ mod tests {
         // parsed as a 0-length-body request whose chunk data leaks into the
         // next request on keep-alive (request smuggling, CWE-444). Chunked
         // decoding is intentionally not implemented.
-        let raw =
-            "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let raw = "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
         let mut reader = BufReader::new(raw.as_bytes());
         match parse_request(&mut reader, &Limits::default()).unwrap() {
             Some(Incoming::Reject { status }) => assert_eq!(status, 501),

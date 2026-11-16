@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::thread;
 
-use sutegi_events::{append_tx, event, EventError, EventStore, Expected, Projections};
+use sutegi_events::{EventError, EventStore, Expected, Projections, append_tx, event};
 use sutegi_json::Json;
 use sutegi_orm::pg::Pg;
 use sutegi_orm::{Backend, Transactional, Value};

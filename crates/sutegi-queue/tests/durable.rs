@@ -11,10 +11,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sutegi_json::Json;
-use sutegi_orm::pg::Pg;
 use sutegi_orm::Backend;
 use sutegi_orm::Value;
-use sutegi_queue::{now_ms, Queue};
+use sutegi_orm::pg::Pg;
+use sutegi_queue::{Queue, now_ms};
 
 // Both tests share one `sutegi_jobs` table, so they must not run concurrently
 // (one's DROP would nuke the other's rows). Serialize them.

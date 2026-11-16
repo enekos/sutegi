@@ -184,15 +184,21 @@ mod tests {
     fn invalid_mail_is_rejected_before_transport() {
         let mem = Memory::new();
         let mailer = Mailer::new(mem.clone(), "app@example.com").unwrap();
-        assert!(mailer
-            .send(Email::new().subject("no rcpt").text("x"))
-            .is_err());
-        assert!(mailer
-            .send(Email::new().to("a@b.co").subject("no body"))
-            .is_err());
-        assert!(mailer
-            .send(Email::new().to("garbage").subject("s").text("x"))
-            .is_err());
+        assert!(
+            mailer
+                .send(Email::new().subject("no rcpt").text("x"))
+                .is_err()
+        );
+        assert!(
+            mailer
+                .send(Email::new().to("a@b.co").subject("no body"))
+                .is_err()
+        );
+        assert!(
+            mailer
+                .send(Email::new().to("garbage").subject("s").text("x"))
+                .is_err()
+        );
         assert_eq!(mem.count(), 0);
     }
 

@@ -431,7 +431,7 @@ fn render_nodes(
                         return Err(format!(
                             "@foreach over non-array value ({})",
                             kind_of(&other)
-                        ))
+                        ));
                     }
                 };
                 let len = items.len();
@@ -611,10 +611,12 @@ mod tests {
         );
         // Missing collection renders nothing; scalars error.
         assert_eq!(render("@foreach(nope as x)x@endforeach", &ctx(vec![])), "");
-        assert!(Template::compile("@foreach(v as x)x@endforeach")
-            .unwrap()
-            .render(&ctx(vec![("v", Json::int(3))]))
-            .is_err());
+        assert!(
+            Template::compile("@foreach(v as x)x@endforeach")
+                .unwrap()
+                .render(&ctx(vec![("v", Json::int(3))]))
+                .is_err()
+        );
     }
 
     #[test]
@@ -638,10 +640,12 @@ mod tests {
         );
 
         // Includes without a registry, and unknown names, error clearly.
-        assert!(Template::compile("@include(x)")
-            .unwrap()
-            .render(&ctx(vec![]))
-            .is_err());
+        assert!(
+            Template::compile("@include(x)")
+                .unwrap()
+                .render(&ctx(vec![]))
+                .is_err()
+        );
         assert!(ts.render("nope", &ctx(vec![])).is_err());
     }
 

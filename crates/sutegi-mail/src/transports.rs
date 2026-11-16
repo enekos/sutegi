@@ -1,8 +1,8 @@
 //! The non-network transports: `Log` (dev default), `Memory` (tests), and
 //! `Sendmail` (pipe to the local MTA binary — pairs with a VPS Postfix).
 
-use crate::message::{check_mailbox, Email};
 use crate::Transport;
+use crate::message::{Email, check_mailbox};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 

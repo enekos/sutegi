@@ -231,7 +231,7 @@ fn render_predicates(
                 // No containment operator; emulating @> with json_each walks
                 // would lie about semantics. The caps gate reports it first.
                 Dialect::Sqlite => {
-                    return Err(crate::backend::unsupported("json_contains", "sqlite"))
+                    return Err(crate::backend::unsupported("json_contains", "sqlite"));
                 }
                 Dialect::Postgres => {
                     params.push(v.clone());
@@ -953,29 +953,39 @@ mod tests {
     fn injection_in_identifier_slots_is_rejected_at_build() {
         // Column, table, order-by, and operator slots each reject an injection
         // attempt with an error rather than emitting the payload as SQL.
-        assert!(QueryBuilder::table("todos")
-            .filter("id; DROP TABLE todos", "=", Value::Int(1))
-            .build()
-            .is_err());
-        assert!(QueryBuilder::table("todos; DROP TABLE users")
-            .build()
-            .is_err());
-        assert!(QueryBuilder::table("t")
-            .order_by("name); DROP TABLE t --", false)
-            .build()
-            .is_err());
-        assert!(QueryBuilder::table("t")
-            .filter("id", "= 1 OR 1=1 --", Value::Int(1))
-            .build()
-            .is_err());
+        assert!(
+            QueryBuilder::table("todos")
+                .filter("id; DROP TABLE todos", "=", Value::Int(1))
+                .build()
+                .is_err()
+        );
+        assert!(
+            QueryBuilder::table("todos; DROP TABLE users")
+                .build()
+                .is_err()
+        );
+        assert!(
+            QueryBuilder::table("t")
+                .order_by("name); DROP TABLE t --", false)
+                .build()
+                .is_err()
+        );
+        assert!(
+            QueryBuilder::table("t")
+                .filter("id", "= 1 OR 1=1 --", Value::Int(1))
+                .build()
+                .is_err()
+        );
         // The write path (INSERT/UPSERT identifiers) is guarded too.
         assert!(validate_write_idents("t", &[("a); DROP --", Value::Int(1))], &[]).is_err());
         assert!(validate_write_idents("t", &[("a", Value::Int(1))], &["id"]).is_ok());
         // where_raw stays the explicit, caller-owned escape hatch (not validated).
-        assert!(QueryBuilder::table("t")
-            .where_raw("anything the caller wants", vec![])
-            .build()
-            .is_ok());
+        assert!(
+            QueryBuilder::table("t")
+                .where_raw("anything the caller wants", vec![])
+                .build()
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1263,19 +1273,22 @@ mod tests {
         // Containment: Postgres renders, canonical build errors.
         let qb =
             QueryBuilder::table("docs").where_json_contains("meta", sutegi_json::Json::obj(vec![]));
-        assert!(qb
-            .build_for(Dialect::Postgres)
-            .unwrap()
-            .0
-            .contains("meta @> ?::jsonb"));
+        assert!(
+            qb.build_for(Dialect::Postgres)
+                .unwrap()
+                .0
+                .contains("meta @> ?::jsonb")
+        );
         assert!(qb.build().is_err());
         assert!(qb.uses_json());
 
         // A malformed path is a builder error, not engine SQL.
-        assert!(QueryBuilder::table("docs")
-            .where_json("meta", "$..", "=", Value::Int(1))
-            .build()
-            .is_err());
+        assert!(
+            QueryBuilder::table("docs")
+                .where_json("meta", "$..", "=", Value::Int(1))
+                .build()
+                .is_err()
+        );
     }
 
     #[test]
@@ -1300,10 +1313,12 @@ mod tests {
         assert_eq!(sql, "DELETE FROM todos WHERE done = ? RETURNING id");
 
         // Injection attempt in a returning column is rejected.
-        assert!(UpdateBuilder::table("todos")
-            .set("done", Value::Bool(true))
-            .returning(&["id; DROP TABLE todos"])
-            .build()
-            .is_err());
+        assert!(
+            UpdateBuilder::table("todos")
+                .set("done", Value::Bool(true))
+                .returning(&["id; DROP TABLE todos"])
+                .build()
+                .is_err()
+        );
     }
 }

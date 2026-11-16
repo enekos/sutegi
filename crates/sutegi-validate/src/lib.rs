@@ -33,11 +33,7 @@ impl ValidationErrors {
 
     /// Collapse into a `Result`, so callers can `?` on validation.
     pub fn into_result(self) -> Result<(), ValidationErrors> {
-        if self.is_empty() {
-            Ok(())
-        } else {
-            Err(self)
-        }
+        if self.is_empty() { Ok(()) } else { Err(self) }
     }
 
     /// `{ "field": ["message", ...], ... }` — ready to return to an agent.
@@ -327,11 +323,7 @@ pub fn validate_schema(schema: &Json, value: &Json) -> Result<(), ValidationErro
 }
 
 fn path_label(path: &str) -> &str {
-    if path.is_empty() {
-        "value"
-    } else {
-        path
-    }
+    if path.is_empty() { "value" } else { path }
 }
 
 fn validate_node(schema: &Json, value: &Json, path: &str, errors: &mut ValidationErrors) {
@@ -579,7 +571,7 @@ mod tests {
         let errs = rules.validate(&bad).unwrap_err().to_json();
         assert!(errs.get("score").is_some());
         assert!(errs.get("tags").is_some()); // MaxLen counts array items
-                                             // In-bounds passes; MinLen also counts array length.
+        // In-bounds passes; MinLen also counts array length.
         let good = Json::obj(vec![
             ("score", Json::num(50)),
             ("tags", Json::arr(vec![Json::str("a")])),
@@ -608,12 +600,16 @@ mod tests {
             &[Rule::In(vec!["1".into(), "2".into(), "3".into()])],
         );
         // A numeric value stringifies and matches.
-        assert!(rules
-            .validate(&Json::obj(vec![("level", Json::num(2))]))
-            .is_ok());
-        assert!(rules
-            .validate(&Json::obj(vec![("level", Json::num(9))]))
-            .is_err());
+        assert!(
+            rules
+                .validate(&Json::obj(vec![("level", Json::num(2))]))
+                .is_ok()
+        );
+        assert!(
+            rules
+                .validate(&Json::obj(vec![("level", Json::num(9))]))
+                .is_err()
+        );
     }
 
     #[test]

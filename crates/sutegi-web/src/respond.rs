@@ -11,7 +11,7 @@
 //! });
 //! ```
 
-use crate::{json, no_content, text, Response};
+use crate::{Response, json, no_content, text};
 use sutegi_json::Json;
 
 /// A transport-agnostic error that converts into an HTTP [`Response`].

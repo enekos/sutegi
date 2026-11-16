@@ -17,8 +17,8 @@
 //! database), so [`Db::memory`] pins the pool to size 1.
 
 use crate::backend::Backend;
-use crate::value::{create_table_sql, Dialect, TableSchema, Value};
-use rusqlite::{params_from_iter, types::Value as SqlValue, Connection};
+use crate::value::{Dialect, TableSchema, Value, create_table_sql};
+use rusqlite::{Connection, params_from_iter, types::Value as SqlValue};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex};
@@ -400,7 +400,7 @@ fn sqlite_coltype(decl: &str) -> crate::value::ColType {
 /// Reflect every user table's schema out of a SQLite connection via `PRAGMA`.
 /// Shared by [`Db`] and [`Tx`].
 fn introspect_sqlite(conn: &Connection) -> Result<Vec<TableSchema>, String> {
-    use crate::value::{parse_default_literal, Column, ForeignKey, Index};
+    use crate::value::{Column, ForeignKey, Index, parse_default_literal};
 
     let s = |j: &Json, k: &str| j.get(k).and_then(Json::as_str).unwrap_or("").to_string();
     let i = |j: &Json, k: &str| j.get(k).and_then(Json::as_i64).unwrap_or(0);
@@ -775,12 +775,14 @@ mod tests {
         assert_eq!(db.count(&QueryBuilder::table("todos")).unwrap(), 3);
 
         // for_update is a documented no-op on SQLite; skip_locked errors.
-        assert!(db
-            .select(&QueryBuilder::table("todos").for_update())
-            .is_ok());
-        assert!(db
-            .select(&QueryBuilder::table("todos").for_update().skip_locked())
-            .is_err());
+        assert!(
+            db.select(&QueryBuilder::table("todos").for_update())
+                .is_ok()
+        );
+        assert!(
+            db.select(&QueryBuilder::table("todos").for_update().skip_locked())
+                .is_err()
+        );
     }
 
     #[test]
@@ -976,12 +978,14 @@ mod tests {
             .unwrap();
         }
         assert_eq!(db.count(&QueryBuilder::table("todos")).unwrap(), 7);
-        assert!(db
-            .exists(&QueryBuilder::table("todos").filter("id", "=", Value::Int(3)))
-            .unwrap());
-        assert!(!db
-            .exists(&QueryBuilder::table("todos").filter("id", "=", Value::Int(99)))
-            .unwrap());
+        assert!(
+            db.exists(&QueryBuilder::table("todos").filter("id", "=", Value::Int(3)))
+                .unwrap()
+        );
+        assert!(
+            !db.exists(&QueryBuilder::table("todos").filter("id", "=", Value::Int(99)))
+                .unwrap()
+        );
 
         let page = db
             .paginate(&QueryBuilder::table("todos").order_by("id", false), 2, 3)

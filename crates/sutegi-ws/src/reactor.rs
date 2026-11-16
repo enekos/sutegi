@@ -40,9 +40,9 @@ use std::time::{Duration, Instant};
 
 use sutegi_http::{Lifecycle, Phase, Request};
 
-use crate::poller::{raise_nofile_limit, Poller, WakePipe};
+use crate::poller::{Poller, WakePipe, raise_nofile_limit};
 use crate::protocol::{
-    decode_frame, encode_close, encode_frame, parse_close, Opcode, ProtocolError,
+    Opcode, ProtocolError, decode_frame, encode_close, encode_frame, parse_close,
 };
 
 /// Reserved poller token for the shard's wake pipe.

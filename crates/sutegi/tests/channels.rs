@@ -277,9 +277,11 @@ fn replies_heartbeat_and_protocol_errors() {
     // Garbage frames get a ref-less stg:error, and the connection survives.
     c.send("not json at all");
     let err = c.recv_event("stg:error");
-    assert!(str_at(&err, "/payload/reason")
-        .unwrap()
-        .contains("not JSON"));
+    assert!(
+        str_at(&err, "/payload/reason")
+            .unwrap()
+            .contains("not JSON")
+    );
     c.send(r#"{"topic":"stg","event":"heartbeat","ref":"hb2"}"#);
     assert_eq!(str_at(&c.recv_event("stg:reply"), "/ref"), Some("hb2"));
 
