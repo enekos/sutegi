@@ -330,7 +330,7 @@ where
 pub fn require_role<B>(
     auth: Arc<Auth<B>>,
     role: &str,
-) -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static
+) -> impl Fn(&Request) -> Option<Response> + Send + Sync + use<B>
 where
     B: Backend + Send + Sync + 'static,
 {

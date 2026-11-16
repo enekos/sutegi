@@ -24,6 +24,7 @@
 use std::sync::Arc;
 use sutegi::auth::login_key;
 use sutegi::crypto::{hex, random_bytes};
+use sutegi::mail::transports::Log;
 use sutegi::prelude::*;
 use sutegi::session::MIN_SECRET_LEN;
 
@@ -66,10 +67,11 @@ fn main() -> std::io::Result<()> {
     let (tok_issue, tok_who, who_auth) = (tokens.clone(), tokens.clone(), auth.clone());
 
     // Mail: MAIL_* env if set, else the log driver (links print to stderr).
-    if std::env::var("MAIL_FROM").is_err() {
-        std::env::set_var("MAIL_FROM", "Auth Demo <auth@example.com>");
-    }
-    let mailer = Arc::new(Mailer::from_env().expect("configure mailer"));
+    let mailer = match std::env::var_os("MAIL_FROM") {
+        Some(_) => Mailer::from_env(),
+        None => Mailer::new(Log::new(), "Auth Demo <auth@example.com>"),
+    };
+    let mailer = Arc::new(mailer.expect("configure mailer"));
     let base_url = std::env::var("APP_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
     let mail = Arc::new(AuthMail::new(
         mailer,

@@ -1650,9 +1650,7 @@ pub fn logger() -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static
 
 /// A pre-middleware that answers CORS preflight (`OPTIONS`) with `204` and the
 /// permitted origin. Pair with [`cors`] (an after-middleware) for full CORS.
-pub fn cors_preflight(
-    origin: &str,
-) -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static {
+pub fn cors_preflight(origin: &str) -> impl Fn(&Request) -> Option<Response> + Send + Sync + use<> {
     let origin = origin.to_string();
     move |req: &Request| {
         if req.method == Method::Options {
@@ -1673,7 +1671,7 @@ pub fn cors_preflight(
 
 /// An after-middleware that stamps `Access-Control-Allow-Origin` onto every
 /// response. Register with [`App::after`].
-pub fn cors(origin: &str) -> impl Fn(&Request, Response) -> Response + Send + Sync + 'static {
+pub fn cors(origin: &str) -> impl Fn(&Request, Response) -> Response + Send + Sync + use<> {
     let origin = origin.to_string();
     move |_req: &Request, resp: Response| resp.with_header("access-control-allow-origin", &origin)
 }
@@ -1702,7 +1700,7 @@ pub fn cors(origin: &str) -> impl Fn(&Request, Response) -> Response + Send + Sy
 /// discards is the confusing half-configured state.
 pub fn cors_preflight_credentialed(
     origin: &str,
-) -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static {
+) -> impl Fn(&Request) -> Option<Response> + Send + Sync + use<> {
     let origin = origin.to_string();
     move |req: &Request| {
         if req.method != Method::Options {
@@ -1737,7 +1735,7 @@ pub fn cors_preflight_credentialed(
 /// server answers, and the browser refuses to hand the body to the page.
 pub fn cors_credentialed(
     origin: &str,
-) -> impl Fn(&Request, Response) -> Response + Send + Sync + 'static {
+) -> impl Fn(&Request, Response) -> Response + Send + Sync + use<> {
     let origin = origin.to_string();
     move |_req: &Request, resp: Response| {
         // Idempotent, because this also runs over the responses the preflight
@@ -1760,7 +1758,7 @@ pub fn cors_credentialed(
 
 /// A pre-middleware requiring `Authorization: Bearer <token>`; else `401`.
 /// The header is compared in constant time (no early exit on a mismatch).
-pub fn bearer(token: &str) -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static {
+pub fn bearer(token: &str) -> impl Fn(&Request) -> Option<Response> + Send + Sync + use<> {
     let expected = format!("Bearer {}", token);
     move |req: &Request| match req.header("authorization") {
         Some(h) if sutegi_crypto::constant_time_eq(h.as_bytes(), expected.as_bytes()) => None,
@@ -1772,7 +1770,7 @@ pub fn bearer(token: &str) -> impl Fn(&Request) -> Option<Response> + Send + Syn
 pub fn basic(
     user: &str,
     pass: &str,
-) -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static {
+) -> impl Fn(&Request) -> Option<Response> + Send + Sync + use<> {
     let expected = format!(
         "Basic {}",
         sutegi_crypto::base64_encode(format!("{}:{}", user, pass).as_bytes())

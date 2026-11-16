@@ -210,7 +210,7 @@ pub(crate) struct Exit {
     /// dependents itself on RestForOne/OneForAll, and their exits arrive
     /// after the new generation has already started; the generation tells
     /// those stale exits apart from real crashes.
-    pub gen: u64,
+    pub generation: u64,
     pub reason: ExitReason,
 }
 
@@ -390,7 +390,7 @@ pub(crate) fn spawn_on_shared<A: Actor>(
     mut actor: A,
     shared: Arc<Shared>,
     mailbox: usize,
-    gen: u64,
+    generation: u64,
     sink: Option<ExitSink>,
 ) -> (ActorRef<A::Msg>, JoinHandle<()>) {
     let (tx, rx) = mpsc::sync_channel(mailbox);
@@ -399,13 +399,13 @@ pub(crate) fn spawn_on_shared<A: Actor>(
         shared: Arc::clone(&shared),
     };
     let id = shared.id;
-    let join = std::thread::spawn(move || run_actor(id, gen, &mut actor, rx, shared, sink));
+    let join = std::thread::spawn(move || run_actor(id, generation, &mut actor, rx, shared, sink));
     (aref, join)
 }
 
 fn run_actor<A: Actor>(
     id: u64,
-    gen: u64,
+    generation: u64,
     actor: &mut A,
     rx: Receiver<Envelope<A::Msg>>,
     shared: Arc<Shared>,
@@ -430,7 +430,11 @@ fn run_actor<A: Actor>(
     shared.finish(&reason);
     let _ = catch_unwind(AssertUnwindSafe(|| actor.stopped(&reason)));
     if let Some(sink) = sink {
-        sink(Exit { id, gen, reason });
+        sink(Exit {
+            id,
+            generation,
+            reason,
+        });
     }
 }
 
