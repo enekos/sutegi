@@ -14,6 +14,7 @@
 use crate::backend::Backend;
 use crate::value::{Dialect, TableSchema, Value, create_table_sql};
 use std::cell::RefCell;
+use std::fmt::{NumBuffer, Write as _};
 use sutegi_json::Json;
 use sutegi_pg::Config;
 
@@ -25,18 +26,19 @@ pub use sutegi_pg::{Client, PgValue, Pool};
 /// `$1, $2, …` form. `?` inside single-quoted string literals is left untouched.
 pub fn to_pg_placeholders(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len() + 8);
-    let mut n = 0;
+    let mut n = 0u32;
+    let mut num = NumBuffer::new();
     let mut in_str = false;
     for c in sql.chars() {
         match c {
             '\'' => {
-                in_str = !in_str;
+                in_str.toggle();
                 out.push(c);
             }
             '?' if !in_str => {
                 n += 1;
                 out.push('$');
-                out.push_str(&n.to_string());
+                out.push_str(n.format_into(&mut num));
             }
             _ => out.push(c),
         }
@@ -483,8 +485,10 @@ fn copy_text(v: &Value, out: &mut String) {
     };
     match v {
         Value::Null => out.push_str("\\N"),
-        Value::Int(i) => out.push_str(&i.to_string()),
-        Value::Real(r) => out.push_str(&r.to_string()),
+        Value::Int(i) => out.push_str(i.format_into(&mut NumBuffer::new())),
+        Value::Real(r) => {
+            let _ = write!(out, "{r}"); // fmt::Write for String is infallible
+        }
         Value::Bool(b) => out.push(if *b { 't' } else { 'f' }),
         Value::Text(s) => escape_into(s, out),
         Value::Json(j) => escape_into(&j.to_string(), out),

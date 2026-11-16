@@ -7,7 +7,7 @@
 //! agent diffs or caches the introspection surface.
 
 use std::collections::BTreeMap;
-use std::fmt::{self, Write};
+use std::fmt::{self, NumBuffer, Write};
 use std::ops::Index;
 
 /// A JSON value.
@@ -145,26 +145,26 @@ impl Json {
     }
 
     fn write_pretty(&self, out: &mut String, depth: usize) {
-        let pad = |n: usize| "  ".repeat(n);
+        let pad = |out: &mut String, n: usize| out.extend(std::iter::repeat_n("  ", n));
         match self {
             Json::Arr(a) if !a.is_empty() => {
                 out.push_str("[\n");
                 for (i, v) in a.iter().enumerate() {
-                    out.push_str(&pad(depth + 1));
+                    pad(out, depth + 1);
                     v.write_pretty(out, depth + 1);
                     if i + 1 < a.len() {
                         out.push(',');
                     }
                     out.push('\n');
                 }
-                out.push_str(&pad(depth));
+                pad(out, depth);
                 out.push(']');
             }
             Json::Obj(m) if !m.is_empty() => {
                 out.push_str("{\n");
                 let len = m.len();
                 for (i, (k, v)) in m.iter().enumerate() {
-                    out.push_str(&pad(depth + 1));
+                    pad(out, depth + 1);
                     escape_into(out, k);
                     out.push_str(": ");
                     v.write_pretty(out, depth + 1);
@@ -173,7 +173,7 @@ impl Json {
                     }
                     out.push('\n');
                 }
-                out.push_str(&pad(depth));
+                pad(out, depth);
                 out.push('}');
             }
             // Scalars and empty containers fall through to the compact form.
@@ -190,7 +190,7 @@ impl Json {
             Json::Bool(false) => out.push_str("false"),
             Json::Num(n) => {
                 if n.is_finite() && n.fract() == 0.0 && n.abs() < 1e15 {
-                    let _ = write!(out, "{}", *n as i64);
+                    out.push_str((*n as i64).format_into(&mut NumBuffer::new()));
                 } else if n.is_finite() {
                     let _ = write!(out, "{}", n);
                 } else {

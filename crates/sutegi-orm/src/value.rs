@@ -1,6 +1,7 @@
 //! Schema primitives: the scalar [`Value`] type bound to query parameters, the
 //! column/table descriptors, and the DDL/JSON emitters derived from them.
 
+use std::fmt::Write as _;
 use sutegi_json::Json;
 
 /// A SQL value used as a bound parameter.
@@ -44,7 +45,7 @@ pub fn vector_to_text(v: &[f32]) -> String {
         if i > 0 {
             s.push(',');
         }
-        s.push_str(&x.to_string());
+        let _ = write!(s, "{x}"); // fmt::Write for String is infallible
     }
     s.push(']');
     s

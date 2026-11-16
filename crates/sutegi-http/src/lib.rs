@@ -11,6 +11,7 @@ mod lifecycle;
 pub use lifecycle::{Lifecycle, Phase};
 
 use std::borrow::Cow;
+use std::fmt::NumBuffer;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -657,6 +658,12 @@ pub fn write_response<W: Write>(w: &mut W, resp: Response, keep_alive: bool) -> 
     write_head_and_body(w, resp, keep_alive, false)
 }
 
+fn push_content_length(head: &mut String, length: u64) {
+    head.push_str("content-length: ");
+    head.push_str(length.format_into(&mut NumBuffer::new()));
+    head.push_str("\r\n");
+}
+
 /// Like [`write_response`], but when `head_only` is set (a `HEAD` request) the
 /// status line and headers — including the exact `Content-Length` a `GET` would
 /// have produced — are written and the body bytes (or stream producer) are
@@ -667,12 +674,14 @@ fn write_head_and_body<W: Write>(
     keep_alive: bool,
     head_only: bool,
 ) -> io::Result<()> {
-    use std::fmt::Write as _;
-
-    let reason = status_reason(resp.status);
-    // One growable buffer for the whole head — no per-header `format!` allocs.
+    // One growable buffer for the whole head — no per-header `format!` allocs,
+    // and numbers go through `format_into` rather than the `fmt` machinery.
     let mut head = String::with_capacity(256);
-    let _ = write!(head, "HTTP/1.1 {} {}\r\n", resp.status, reason);
+    head.push_str("HTTP/1.1 ");
+    head.push_str(resp.status.format_into(&mut NumBuffer::new()));
+    head.push(' ');
+    head.push_str(status_reason(resp.status));
+    head.push_str("\r\n");
     let mut has_content_type = false;
     // Upgrade heads are written verbatim (the app's `connection: upgrade` is
     // the point); every other body's framing belongs to the server.
@@ -705,7 +714,7 @@ fn write_head_and_body<W: Write>(
 
     match resp.body {
         Body::Full(bytes) => {
-            let _ = write!(head, "content-length: {}\r\n", bytes.len());
+            push_content_length(&mut head, bytes.len() as u64);
             head.push_str(if keep_alive {
                 "connection: keep-alive\r\n\r\n"
             } else {
@@ -730,7 +739,7 @@ fn write_head_and_body<W: Write>(
             w.flush()
         }
         Body::Reader { reader, length } => {
-            let _ = write!(head, "content-length: {length}\r\n");
+            push_content_length(&mut head, length);
             head.push_str(if keep_alive {
                 "connection: keep-alive\r\n\r\n"
             } else {
