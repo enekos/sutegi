@@ -928,6 +928,7 @@ fn sqlite_rebuild(
 mod tests {
     use super::*;
     use crate::value::{ColType, FkAction};
+    use std::assert_matches;
 
     fn users() -> TableSchema {
         TableSchema::new("users")
@@ -1051,7 +1052,7 @@ mod tests {
         // On Postgres they differ (TEXT vs JSONB) → one AlterColumn.
         let pg = diff(&a, &b, Dialect::Postgres);
         assert_eq!(pg.ops.len(), 1);
-        assert!(matches!(pg.ops[0], SchemaOp::AlterColumn { .. }));
+        assert_matches!(pg.ops[0], SchemaOp::AlterColumn { .. });
     }
 
     #[test]

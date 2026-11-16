@@ -300,7 +300,10 @@ fn leg_size(k: usize) -> usize {
 /// vector leg (pgvector pushdown on Postgres, portable brute force on
 /// SQLite). Returns base-table rows with a `_score` column, best first —
 /// the modern RAG retrieval shape, one call.
-#[allow(clippy::too_many_arguments)] // a search call site reads better flat than through a params struct
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a search call site reads better flat than through a params struct"
+)]
 pub fn hybrid_search<B: Backend>(
     db: &B,
     table: &str,

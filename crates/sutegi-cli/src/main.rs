@@ -207,7 +207,7 @@ fn cmd_introspect(url: Option<&String>) -> Result<(), String> {
 /// A bare-minimum HTTP/1.1 GET client (std only), enough to read an
 /// introspection endpoint.
 fn http_get(url: &str) -> io::Result<String> {
-    let rest = url.strip_prefix("http://").unwrap_or(url);
+    let rest = url.trim_prefix("http://");
     let (authority, path) = match rest.split_once('/') {
         Some((a, p)) => (a, format!("/{}", p)),
         None => (rest, "/".to_string()),

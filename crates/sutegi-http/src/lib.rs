@@ -349,6 +349,7 @@ impl Default for Limits {
 }
 
 /// The outcome of parsing one request off the connection.
+#[derive(Debug)]
 pub enum Incoming {
     /// A well-formed request, ready to hand to the handler.
     Request(Request),
@@ -1363,6 +1364,7 @@ impl Drop for ThreadPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[test]
     fn sized_readers_frame_head_and_reject_truncation() {
@@ -1424,10 +1426,10 @@ mod tests {
             max_body: 100,
             ..Limits::default()
         };
-        assert!(matches!(
+        assert_matches!(
             parse_request(&mut reader, &limits).unwrap(),
             Some(Incoming::TooLarge)
-        ));
+        );
     }
 
     #[test]
@@ -1524,10 +1526,10 @@ mod tests {
             max_header_bytes: 100,
             ..Limits::default()
         };
-        assert!(matches!(
+        assert_matches!(
             parse_request(&mut reader, &limits).unwrap(),
             Some(Incoming::TooLarge)
-        ));
+        );
     }
 
     #[test]

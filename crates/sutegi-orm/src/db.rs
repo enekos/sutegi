@@ -20,8 +20,9 @@ use crate::backend::Backend;
 use crate::value::{Dialect, TableSchema, Value, create_table_sql};
 use rusqlite::{Connection, params_from_iter, types::Value as SqlValue};
 use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::sync::{Arc, Condvar, Mutex};
+use std::collections::{BTreeMap, BTreeSet};
+use std::mem::DropGuard;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use sutegi_json::Json;
 
 /// Where a pool's connections come from.
@@ -51,21 +52,13 @@ impl Source {
 /// live [`crate::backend::LockGuard`]s. SQLite has no server to coordinate
 /// through, so the reach is one OS process (`CapScope::Process`) — the honest
 /// analog of Postgres session locks for the single-node store.
-fn lock_registry() -> &'static Mutex<std::collections::HashSet<String>> {
-    use std::sync::OnceLock;
-    static REGISTRY: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
-}
+///
+/// A set of names is valid whatever a panicking holder was doing, so poison is
+/// recovered — the release runs in a drop, which must not panic again.
+static LOCK_REGISTRY: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
-/// Removes its registry entry on drop — the hold inside a SQLite lock guard.
-struct RegistryToken {
-    key: String,
-}
-
-impl Drop for RegistryToken {
-    fn drop(&mut self) {
-        lock_registry().lock().unwrap().remove(&self.key);
-    }
+fn lock_registry() -> MutexGuard<'static, BTreeSet<String>> {
+    LOCK_REGISTRY.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 struct Inner {
@@ -552,14 +545,15 @@ impl Backend for Db {
     /// [`Source::lock_namespace`].
     fn try_lock(&self, name: &str) -> Result<Option<crate::backend::LockGuard>, String> {
         let key = format!("{}\u{1f}{name}", self.pool.lock_ns);
-        let mut held = lock_registry().lock().unwrap();
-        if held.contains(&key) {
+        if !lock_registry().insert(key.clone()) {
             return Ok(None);
         }
-        held.insert(key.clone());
+        let release = DropGuard::new(key, |key: String| {
+            lock_registry().remove(&key);
+        });
         Ok(Some(crate::backend::LockGuard::new(
             name,
-            Box::new(RegistryToken { key }),
+            Box::new(release),
         )))
     }
 }
@@ -659,7 +653,7 @@ fn sql_to_json(v: SqlValue) -> Json {
         SqlValue::Integer(i) => Json::int(i),
         SqlValue::Real(r) => Json::Num(r),
         SqlValue::Text(s) => Json::str(s),
-        SqlValue::Blob(b) => Json::str(String::from_utf8_lossy(&b).into_owned()),
+        SqlValue::Blob(b) => Json::str(String::from_utf8_lossy_owned(b)),
     }
 }
 

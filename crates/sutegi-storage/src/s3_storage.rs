@@ -358,7 +358,7 @@ fn percent_decode(s: &str) -> String {
         out.push(b[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    String::from_utf8_lossy_owned(out)
 }
 
 /// `Fri, 24 May 2013 00:00:00 GMT` (RFC 7231 IMF-fixdate) → unix seconds.

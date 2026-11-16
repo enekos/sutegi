@@ -373,7 +373,7 @@ pub fn parse_default_literal(raw: &str) -> Option<Value> {
     if s.eq_ignore_ascii_case("false") {
         return Some(Value::Bool(false));
     }
-    if let Some(inner) = s.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
+    if let Some(inner) = s.strip_circumfix('\'', '\'') {
         return Some(Value::Text(inner.replace("''", "'")));
     }
     if let Ok(i) = s.parse::<i64>() {

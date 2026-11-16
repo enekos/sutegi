@@ -123,7 +123,7 @@ impl Repl {
     pub fn eval(&self, line: &str) -> String {
         let mut buf: Vec<u8> = Vec::new();
         let _ = self.dispatch(line.trim(), &mut buf);
-        String::from_utf8_lossy(&buf).into_owned()
+        String::from_utf8_lossy_owned(buf)
     }
 
     fn dispatch(&self, line: &str, out: &mut dyn Write) -> io::Result<()> {
@@ -541,7 +541,7 @@ fn header_line(header_text: &str, name: &str) -> Option<String> {
 }
 
 fn parse_addr(addr: &str) -> (String, u16) {
-    let rest = addr.strip_prefix("http://").unwrap_or(addr);
+    let rest = addr.trim_prefix("http://");
     let rest = rest.trim_end_matches('/');
     match rest.split_once(':') {
         Some((h, p)) => (h.to_string(), p.parse().unwrap_or(80)),

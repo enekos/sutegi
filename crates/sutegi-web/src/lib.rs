@@ -960,7 +960,6 @@ impl App {
                 ]),
             ),
         ];
-        #[allow(unused_mut)]
         let mut caps = self
             .capabilities
             .clone()
@@ -1366,7 +1365,13 @@ fn manifest_entry(name: &str, description: &str, parameters: Json, streaming: bo
 
 /// Validate `args` against a tool's declared schema (when the `validate` feature
 /// is on); returns a ready `422` [`Error`] on failure.
-#[allow(unused_variables)]
+#[cfg_attr(
+    not(feature = "validate"),
+    expect(
+        unused_variables,
+        reason = "the arguments are read only by the validator"
+    )
+)]
 fn validate_tool_args(schema: &Json, args: &Json) -> Result<(), Error> {
     #[cfg(feature = "validate")]
     if let Err(errs) = sutegi_validate::validate_schema(schema, args) {
@@ -1437,7 +1442,7 @@ fn tool_stream(defs: &Arc<Vec<ToolDef>>, c: &Ctx) -> Response {
 
 /// SIGTERM/SIGINT handling for graceful shutdown (only with the `graceful` feature).
 #[cfg(feature = "graceful")]
-#[allow(unsafe_code)]
+#[expect(unsafe_code, reason = "installing a signal handler is a libc call")]
 mod signal {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, OnceLock};
@@ -1961,7 +1966,7 @@ fn url_decode(s: &str) -> String {
             }
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    String::from_utf8_lossy_owned(out)
 }
 
 fn hex_val(b: u8) -> Option<u8> {

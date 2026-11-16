@@ -426,6 +426,7 @@ pub(crate) use sutegi_crypto::now_millis;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use sutegi_orm::db::Db;
 
     fn store() -> EventStore<Db> {
@@ -494,10 +495,10 @@ mod tests {
         );
 
         // NoStream on an existing stream → conflict.
-        assert!(matches!(
+        assert_matches!(
             store.append("a", Expected::NoStream, &[deposited(2)]),
             Err(EventError::Conflict { actual: 1, .. })
-        ));
+        );
 
         // The right version and Any both go through.
         assert_eq!(

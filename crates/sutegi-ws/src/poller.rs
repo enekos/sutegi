@@ -7,7 +7,10 @@
 //! with actual traffic. Level-triggered on both platforms, so a partial read
 //! simply fires again — no edge-tracking subtlety.
 
-#![allow(unsafe_code)]
+#![expect(
+    unsafe_code,
+    reason = "kqueue/epoll/pipe/rlimit syscalls; std has no poller"
+)]
 
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
@@ -317,7 +320,10 @@ impl WakePipe {
 /// sockets is a million fds, and default soft limits (256 on macOS, 1024 on
 /// many Linuxes) are the first wall a big fleet hits. Returns the resulting
 /// soft limit.
-#[allow(clippy::unnecessary_cast)]
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "rlim_t is u64 on the targets CI builds, but not on every libc"
+)]
 pub fn raise_nofile_limit() -> u64 {
     let mut rl = libc::rlimit {
         rlim_cur: 0,

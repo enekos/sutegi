@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -132,14 +132,13 @@ fn inbound_request_id(req: &Request) -> Option<String> {
 }
 
 fn new_request_id() -> String {
-    static PREFIX: OnceLock<String> = OnceLock::new();
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let prefix = PREFIX.get_or_init(|| match sutegi_crypto::random_bytes(4) {
+    static PREFIX: LazyLock<String> = LazyLock::new(|| match sutegi_crypto::random_bytes(4) {
         Ok(bytes) => sutegi_crypto::hex(&bytes),
         Err(_) => format!("{:08x}", std::process::id()),
     });
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("{prefix}{seq:08x}")
+    format!("{}{seq:08x}", *PREFIX)
 }
 
 pub(crate) fn recent_logs(req: &Request) -> Json {

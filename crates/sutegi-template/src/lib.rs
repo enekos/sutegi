@@ -220,7 +220,6 @@ fn lex(src: &str) -> Result<Vec<(Tok, usize)>, String> {
 }
 
 /// Try to lex a `@directive` at the start of `rest`.
-#[allow(clippy::type_complexity)]
 fn directive(rest: &str) -> Option<(Result<Tok, String>, usize)> {
     if !rest.starts_with('@') {
         return None;
@@ -417,7 +416,7 @@ fn render_nodes(
             Node::If { cond, then, els } => {
                 let mut truthy = is_truthy(&lookup(&cond.path, root, scopes));
                 if cond.negated {
-                    truthy = !truthy;
+                    truthy.toggle();
                 }
                 let branch = if truthy { then } else { els };
                 render_nodes(branch, root, scopes, registry, depth, out)?;
