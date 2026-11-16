@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use aatxe_bench::{bench, keep, Suite};
 
-use sutegi::http::{parse_request, Limits, Method};
+use sutegi::http::{parse_request, write_response, Limits, Method, Response};
 use sutegi::json::Json;
 use sutegi::orm::db::Db;
 use sutegi::orm::{QueryBuilder, UpdateBuilder, Value};
@@ -54,6 +54,29 @@ fn main() {
         keep(value.to_pretty());
     });
 
+    // Integer-heavy payload (an id list + paging envelope): isolates the
+    // integer path of the serializer from string escaping.
+    let ids = Json::parse(&format!(
+        "{{\"total\":12345,\"page\":7,\"ids\":[{}]}}",
+        (100_000..100_064).map(|i| i.to_string()).collect::<Vec<_>>().join(",")
+    ))
+    .unwrap();
+    bench(&mut suite, "json_serialize_ints", || {
+        keep(ids.to_string());
+    });
+
+    // --- HTTP/1.1 response head + small body, into a reused buffer ---
+    let mut sink: Vec<u8> = Vec::with_capacity(1024);
+    bench(&mut suite, "http_write_response", || {
+        sink.clear();
+        let resp = Response::new(200)
+            .with_header("content-type", "application/json")
+            .with_header("x-request-id", "a1b2c3d400000001")
+            .with_body(&br#"{"ok":true}"#[..]);
+        write_response(&mut sink, resp, true).unwrap();
+        keep(sink.len());
+    });
+
     // --- HTTP/1.1 request parsing ---
     let raw = b"GET /users/42?page=2 HTTP/1.1\r\nHost: localhost\r\nUser-Agent: bench\r\nAccept: */*\r\n\r\n";
     let limits = Limits::default();
@@ -81,6 +104,21 @@ fn main() {
             .unwrap();
         keep(built);
     });
+
+    // --- `?` → `$n` placeholder rewrite (every Postgres query goes through it) ---
+    #[cfg(feature = "postgres")]
+    {
+        let sql = QueryBuilder::table("events")
+            .filter("kind", "=", Value::Text("x".into()))
+            .filter_in("id", (0..12).map(Value::Int).collect())
+            .limit(20)
+            .build()
+            .unwrap()
+            .0;
+        bench(&mut suite, "pg_placeholders", || {
+            keep(sutegi::orm::pg::to_pg_placeholders(&sql));
+        });
+    }
 
     // --- ORM update-builder emission ---
     bench(&mut suite, "update_builder", || {
