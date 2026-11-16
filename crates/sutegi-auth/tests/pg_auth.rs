@@ -2,8 +2,8 @@
 //! only when `SUTEGI_PG_TEST_URL` is set (same gate as the other suites).
 
 use sutegi_auth::{Tokens, Users};
-use sutegi_orm::pg::Pg;
 use sutegi_orm::Backend;
+use sutegi_orm::pg::Pg;
 
 fn pg() -> Option<Pg> {
     let url = match std::env::var("SUTEGI_PG_TEST_URL") {
@@ -39,10 +39,12 @@ fn users_and_tokens_on_postgres() {
             .id,
         u.id
     );
-    assert!(users
-        .authenticate("pg-it@example.com", "wrong password")
-        .unwrap()
-        .is_none());
+    assert!(
+        users
+            .authenticate("pg-it@example.com", "wrong password")
+            .unwrap()
+            .is_none()
+    );
 
     let (plain, rec) = tokens.issue(u.id, "agent").unwrap();
     assert_eq!(tokens.verify(&plain).unwrap(), Some(u.id));
@@ -50,9 +52,11 @@ fn users_and_tokens_on_postgres() {
     assert_eq!(tokens.verify(&plain).unwrap(), None);
 
     users.set_password(u.id, "rotated-pass").unwrap();
-    assert!(users
-        .authenticate("pg-it@example.com", "rotated-pass")
-        .unwrap()
-        .is_some());
+    assert!(
+        users
+            .authenticate("pg-it@example.com", "rotated-pass")
+            .unwrap()
+            .is_some()
+    );
     assert!(users.delete(u.id).unwrap());
 }

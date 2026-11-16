@@ -31,7 +31,7 @@
 //!   `Response`, so inbound HTTP adapters are one line.
 
 use sutegi_json::Json;
-use sutegi_web::{json, Response};
+use sutegi_web::{Response, json};
 
 /// A transport-agnostic application/domain error. Lives in the inner layers;
 /// adapters map it to their transport (the HTTP mapping is provided here as the
@@ -262,8 +262,8 @@ mod tests {
 
     #[test]
     fn cqrs_command_query_and_events() {
-        use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
 
         struct CreateThing {
             name: String,
@@ -281,11 +281,13 @@ mod tests {
             CreateThing { name: "x".into() }.execute().unwrap(),
             "created:x"
         );
-        assert!(CreateThing {
-            name: String::new()
-        }
-        .execute()
-        .is_err());
+        assert!(
+            CreateThing {
+                name: String::new()
+            }
+            .execute()
+            .is_err()
+        );
 
         struct CountThings;
         impl Query for CountThings {
@@ -379,8 +381,8 @@ mod tests {
 
     #[test]
     fn event_bus_only_fires_matching_type() {
-        use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
         struct A;
         impl Event for A {}
         struct B;

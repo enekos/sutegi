@@ -102,7 +102,7 @@ macro_rules! schemas {
 pub mod binding {
     use sutegi_orm::row::FromRow;
     use sutegi_orm::{Backend, Model, Value};
-    use sutegi_web::{json, Params, Response};
+    use sutegi_web::{Params, Response, json};
 
     /// Look up `params[key]` as the primary key of model `T`. Returns the
     /// hydrated model, or `Err(Response)` (404 if missing, 500 on db error)
@@ -160,8 +160,8 @@ pub mod config;
 pub mod migrate {
     use sutegi_json::Json;
     pub use sutegi_orm::migrate::{
-        drift, generate, generate_via, status_json, write_migration_file, DriftReport, Migration,
-        MigrationOps, MigrationStatus, Migrator, PlannedMigration,
+        DriftReport, Migration, MigrationOps, MigrationStatus, Migrator, PlannedMigration, drift,
+        generate, generate_via, status_json, write_migration_file,
     };
     pub use sutegi_orm::schema_diff::{self, Plan, SchemaOp};
     use sutegi_orm::{Backend, TableSchema, Transactional};
@@ -440,7 +440,7 @@ pub mod migrate {
 /// [`collect`] constructor — chainable `map`/`filter`/`group_by`/`chunk`/… over
 /// any iterable, with zero third-party deps.
 pub mod collection;
-pub use collection::{collect, Collection};
+pub use collection::{Collection, collect};
 
 /// Read a single env var with a fallback — a shortcut over [`config::Config`]
 /// for the common one-off case (`PORT`, `WORKERS`, …).
@@ -451,22 +451,22 @@ pub fn env_or(key: &str, default: &str) -> String {
 /// The common imports for building an app. Items appear only when their feature
 /// is enabled, so the prelude tracks your build.
 pub mod prelude {
-    pub use crate::collection::{collect, Collection};
+    pub use crate::collection::{Collection, collect};
     pub use crate::config::Config;
     pub use sutegi_json::Json;
     pub use sutegi_web::{
-        basic, bearer, cors, cors_credentialed, cors_preflight, cors_preflight_credentialed,
-        form_body, html, json, json_body, logger, mw, no_content, not_found, query_params,
-        rate_limit, redirect, schema, secure_headers, sse, status, stream, text, AccessLog, App,
-        Ctx, Error, Group, IntoResponse, Limits, ListenerCtx, Method, Mw, Params, Request,
-        Response, SseSink, StreamSink, ToolCtx,
+        AccessLog, App, Ctx, Error, Group, IntoResponse, Limits, ListenerCtx, Method, Mw, Params,
+        Request, Response, SseSink, StreamSink, ToolCtx, basic, bearer, cors, cors_credentialed,
+        cors_preflight, cors_preflight_credentialed, form_body, html, json, json_body, logger, mw,
+        no_content, not_found, query_params, rate_limit, redirect, schema, secure_headers, sse,
+        status, stream, text,
     };
-    pub use sutegi_web::{download, Lifecycle, Phase, RequestBody, UploadLimits};
+    pub use sutegi_web::{Lifecycle, Phase, RequestBody, UploadLimits, download};
 
     #[cfg(feature = "events")]
     pub use sutegi_events::{
-        event, Aggregate, EventError, EventStore, Expected, NewEvent, ProjectionWorkers,
-        Projections, StoredEvent,
+        Aggregate, EventError, EventStore, Expected, NewEvent, ProjectionWorkers, Projections,
+        StoredEvent, event,
     };
     #[cfg(feature = "orm")]
     pub use sutegi_orm::migrate::{Migration, Migrator};
@@ -483,16 +483,16 @@ pub mod prelude {
     #[cfg(feature = "repl")]
     pub use sutegi_repl::Repl;
     #[cfg(feature = "validate")]
-    pub use sutegi_validate::{validate_schema, Rule, Ruleset, Validate, ValidationErrors};
+    pub use sutegi_validate::{Rule, Ruleset, Validate, ValidationErrors, validate_schema};
 
     #[cfg(feature = "derive")]
     pub use sutegi_macros::{Model, Validate};
 
     #[cfg(feature = "actors")]
     pub use sutegi_actors::{
-        spawn, spawn_opts, Actor, ActorRef, ActorState, ActorStatus, AskError, ChildSpec,
-        ExitReason, Opts as ActorOpts, Registry as ActorRegistry, ReplyTo, Restart, Strategy,
-        Supervisor, SupervisorHandle, SupervisorState, SupervisorStatus, TellError,
+        Actor, ActorRef, ActorState, ActorStatus, AskError, ChildSpec, ExitReason,
+        Opts as ActorOpts, Registry as ActorRegistry, ReplyTo, Restart, Strategy, Supervisor,
+        SupervisorHandle, SupervisorState, SupervisorStatus, TellError, spawn, spawn_opts,
     };
 
     #[cfg(feature = "presence")]
@@ -508,17 +508,17 @@ pub mod prelude {
     #[cfg(feature = "storage-db")]
     pub use sutegi_storage::DbStorage;
     #[cfg(feature = "ws")]
-    pub use sutegi_web::ws::{
-        binary_frame, text_frame, Conn, DispatchConfig, Msg, SendStatus, WsConfig,
-    };
-    #[cfg(feature = "ws")]
     pub use sutegi_web::Ws;
+    #[cfg(feature = "ws")]
+    pub use sutegi_web::ws::{
+        Conn, DispatchConfig, Msg, SendStatus, WsConfig, binary_frame, text_frame,
+    };
 
     #[cfg(feature = "auth")]
     pub use sutegi_auth::{
-        hash_password, needs_rehash, require_auth, require_csrf, require_role, require_token,
-        require_verified, token_user, verify_password, ApiToken, Auth, Identified, Remember,
-        Throttle, Tokens, User, Users,
+        ApiToken, Auth, Identified, Remember, Throttle, Tokens, User, Users, hash_password,
+        needs_rehash, require_auth, require_csrf, require_role, require_token, require_verified,
+        token_user, verify_password,
     };
 
     #[cfg(feature = "template")]
@@ -547,7 +547,7 @@ pub mod prelude {
 
     #[cfg(feature = "hexagon")]
     pub use sutegi_hexagon::{
-        respond, respond_created, AppError, AppResult, Command, Event, EventBus, IntoJson, Query,
-        UseCase,
+        AppError, AppResult, Command, Event, EventBus, IntoJson, Query, UseCase, respond,
+        respond_created,
     };
 }

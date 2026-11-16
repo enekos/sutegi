@@ -20,8 +20,8 @@
 //! generators silently drop data.
 
 use crate::value::{
-    column_from_json, column_to_json, fk_from_json, fk_to_json, index_from_json, index_to_json,
-    schema_from_json, schema_to_json, Column, Dialect, ForeignKey, Index, TableSchema,
+    Column, Dialect, ForeignKey, Index, TableSchema, column_from_json, column_to_json,
+    fk_from_json, fk_to_json, index_from_json, index_to_json, schema_from_json, schema_to_json,
 };
 use sutegi_json::Json;
 
@@ -498,14 +498,15 @@ fn diff_table(cur: &TableSchema, want: &TableSchema, dialect: Dialect, plan: &mu
     }
     // Changed columns present on both sides.
     for want_col in &want.columns {
-        if let Some(cur_col) = cur.col(&want_col.name) {
-            if !columns_match(cur_col, want_col, dialect) {
-                let op = SchemaOp::AlterColumn {
-                    table: table.clone(),
-                    from: cur_col.clone(),
-                    to: want_col.clone(),
-                };
-                match op.safety() {
+        if let Some(cur_col) = cur.col(&want_col.name)
+            && !columns_match(cur_col, want_col, dialect)
+        {
+            let op = SchemaOp::AlterColumn {
+                table: table.clone(),
+                from: cur_col.clone(),
+                to: want_col.clone(),
+            };
+            match op.safety() {
                     Safety::Destructive => plan.warnings.push(format!(
                         "column `{}.{}` change may lose data or fail on existing rows",
                         table, want_col.name
@@ -516,8 +517,7 @@ fn diff_table(cur: &TableSchema, want: &TableSchema, dialect: Dialect, plan: &mu
                     )),
                     Safety::Safe => {}
                 }
-                plan.ops.push(op);
-            }
+            plan.ops.push(op);
         }
     }
 
@@ -687,7 +687,7 @@ pub fn apply_all(schemas: &mut Vec<TableSchema>, ops: &[SchemaOp]) -> Result<(),
 // DDL emission (P4): SchemaOp -> executable SQL statements, per dialect.
 // ---------------------------------------------------------------------------
 
-use crate::value::{column_sql, create_index_sql, create_table_only, default_sql, FkAction};
+use crate::value::{FkAction, column_sql, create_index_sql, create_table_only, default_sql};
 
 /// PostgreSQL's conventional constraint names, matched so `DROP CONSTRAINT`
 /// finds what `CREATE TABLE`/`ADD` produced.
@@ -928,6 +928,7 @@ fn sqlite_rebuild(
 mod tests {
     use super::*;
     use crate::value::{ColType, FkAction};
+    use std::assert_matches;
 
     fn users() -> TableSchema {
         TableSchema::new("users")
@@ -992,13 +993,16 @@ mod tests {
             // add / drop / alter columns + add an index + a default
             (
                 vec![users()],
-                vec![TableSchema::new("users")
-                    .column(Column::new("id", ColType::Integer).primary())
-                    .column(Column::new("email", ColType::Text).unique())
-                    .column(
-                        Column::new("name", ColType::Text).default(crate::Value::Text("".into())),
-                    )
-                    .index(&["email"])],
+                vec![
+                    TableSchema::new("users")
+                        .column(Column::new("id", ColType::Integer).primary())
+                        .column(Column::new("email", ColType::Text).unique())
+                        .column(
+                            Column::new("name", ColType::Text)
+                                .default(crate::Value::Text("".into())),
+                        )
+                        .index(&["email"]),
+                ],
             ),
             // change a foreign key's on_delete
             (
@@ -1048,36 +1052,44 @@ mod tests {
         // On Postgres they differ (TEXT vs JSONB) → one AlterColumn.
         let pg = diff(&a, &b, Dialect::Postgres);
         assert_eq!(pg.ops.len(), 1);
-        assert!(matches!(pg.ops[0], SchemaOp::AlterColumn { .. }));
+        assert_matches!(pg.ops[0], SchemaOp::AlterColumn { .. });
     }
 
     #[test]
     fn rename_shaped_change_warns_but_keeps_drop_add() {
-        let a = vec![TableSchema::new("t")
-            .column(Column::new("id", ColType::Integer).primary())
-            .column(Column::new("title", ColType::Text))];
-        let b = vec![TableSchema::new("t")
-            .column(Column::new("id", ColType::Integer).primary())
-            .column(Column::new("headline", ColType::Text))];
+        let a = vec![
+            TableSchema::new("t")
+                .column(Column::new("id", ColType::Integer).primary())
+                .column(Column::new("title", ColType::Text)),
+        ];
+        let b = vec![
+            TableSchema::new("t")
+                .column(Column::new("id", ColType::Integer).primary())
+                .column(Column::new("headline", ColType::Text)),
+        ];
         let plan = diff(&a, &b, Dialect::Sqlite);
         // Never guesses: emits both a drop and an add.
-        assert!(plan
-            .ops
-            .iter()
-            .any(|o| matches!(o, SchemaOp::DropColumn { .. })));
-        assert!(plan
-            .ops
-            .iter()
-            .any(|o| matches!(o, SchemaOp::AddColumn { .. })));
+        assert!(
+            plan.ops
+                .iter()
+                .any(|o| matches!(o, SchemaOp::DropColumn { .. }))
+        );
+        assert!(
+            plan.ops
+                .iter()
+                .any(|o| matches!(o, SchemaOp::AddColumn { .. }))
+        );
         assert!(plan.warnings.iter().any(|w| w.contains("possible rename")));
     }
 
     #[test]
     fn not_null_without_default_is_flagged_needs_data() {
         let a = vec![TableSchema::new("t").column(Column::new("id", ColType::Integer).primary())];
-        let b = vec![TableSchema::new("t")
-            .column(Column::new("id", ColType::Integer).primary())
-            .column(Column::new("qty", ColType::Integer))];
+        let b = vec![
+            TableSchema::new("t")
+                .column(Column::new("id", ColType::Integer).primary())
+                .column(Column::new("qty", ColType::Integer)),
+        ];
         let plan = diff(&a, &b, Dialect::Sqlite);
         let add = plan
             .ops
@@ -1192,10 +1204,11 @@ mod ddl_tests {
             .column(Column::new("name", ColType::Text).nullable())
             .column(Column::new("qty", ColType::Integer).default(Value::Int(7)));
         let plan = diff(&shadow, std::slice::from_ref(&altered), Dialect::Sqlite);
-        assert!(plan
-            .ops
-            .iter()
-            .any(|o| matches!(o, SchemaOp::AlterColumn { .. })));
+        assert!(
+            plan.ops
+                .iter()
+                .any(|o| matches!(o, SchemaOp::AlterColumn { .. }))
+        );
         run_plan(&db, &mut shadow, &plan, Dialect::Sqlite);
 
         // The row rode through the rebuild intact.
@@ -1242,10 +1255,11 @@ mod ddl_tests {
             std::slice::from_ref(&posts_fk),
             Dialect::Sqlite,
         );
-        assert!(plan
-            .ops
-            .iter()
-            .any(|o| matches!(o, SchemaOp::AddForeignKey { .. })));
+        assert!(
+            plan.ops
+                .iter()
+                .any(|o| matches!(o, SchemaOp::AddForeignKey { .. }))
+        );
         // Thread only the posts table through the rebuild.
         let mut posts_shadow = vec![posts.clone()];
         run_plan(&db, &mut posts_shadow, &plan, Dialect::Sqlite);

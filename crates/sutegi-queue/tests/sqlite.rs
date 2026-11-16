@@ -7,10 +7,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sutegi_json::Json;
-use sutegi_orm::db::Db;
 use sutegi_orm::Backend;
 use sutegi_orm::Value;
-use sutegi_queue::{now_ms, Queue};
+use sutegi_orm::db::Db;
+use sutegi_queue::{Queue, now_ms};
 
 /// A fresh database file per test. WAL is what production runs, and an
 /// in-memory database would not be shared across the pool's connections.
@@ -169,11 +169,13 @@ fn a_panicking_handler_dead_letters_instead_of_taking_the_worker() {
     q.run_once().expect("the panic is caught, not propagated");
     let failed = q.failed(10).expect("failed");
     assert_eq!(failed.len(), 1);
-    assert!(failed[0]
-        .get("last_error")
-        .and_then(Json::as_str)
-        .unwrap_or_default()
-        .contains("panicked"));
+    assert!(
+        failed[0]
+            .get("last_error")
+            .and_then(Json::as_str)
+            .unwrap_or_default()
+            .contains("panicked")
+    );
 
     // The queue still works afterwards.
     q.dispatch("ok", Json::Null).expect("dispatch");
@@ -188,11 +190,13 @@ fn an_unregistered_name_is_a_failure_not_a_silent_drop() {
     q.run_once().expect("run");
     let failed = q.failed(10).expect("failed");
     assert_eq!(failed.len(), 1);
-    assert!(failed[0]
-        .get("last_error")
-        .and_then(Json::as_str)
-        .unwrap_or_default()
-        .contains("no handler registered"));
+    assert!(
+        failed[0]
+            .get("last_error")
+            .and_then(Json::as_str)
+            .unwrap_or_default()
+            .contains("no handler registered")
+    );
 }
 
 #[test]

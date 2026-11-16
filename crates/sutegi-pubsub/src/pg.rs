@@ -285,10 +285,10 @@ impl Drop for Publisher {
         // NOTIFY (the client's own I/O timeouts).
         self.stop.store(true, Ordering::Release);
         drop(self.tx.take());
-        if let Some(handle) = self.handle.take() {
-            if handle.join().is_err() {
-                sutegi_log::error!("pubsub", "publisher thread panicked");
-            }
+        if let Some(handle) = self.handle.take()
+            && handle.join().is_err()
+        {
+            sutegi_log::error!("pubsub", "publisher thread panicked");
         }
     }
 }

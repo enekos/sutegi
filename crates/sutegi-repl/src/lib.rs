@@ -123,7 +123,7 @@ impl Repl {
     pub fn eval(&self, line: &str) -> String {
         let mut buf: Vec<u8> = Vec::new();
         let _ = self.dispatch(line.trim(), &mut buf);
-        String::from_utf8_lossy(&buf).into_owned()
+        String::from_utf8_lossy_owned(buf)
     }
 
     fn dispatch(&self, line: &str, out: &mut dyn Write) -> io::Result<()> {
@@ -403,10 +403,10 @@ impl Repl {
                     .map_err(|e| e.to_string())?;
                 let text = String::from_utf8_lossy(&buf);
                 let text = text.trim();
-                if let Some(status) = text.strip_prefix('[').and_then(|t| t.split(']').next()) {
-                    if text.starts_with('[') && status.chars().all(|c| c.is_ascii_digit()) {
-                        return Err(format!("GET {target} -> {status}"));
-                    }
+                if let Some(status) = text.strip_prefix('[').and_then(|t| t.split(']').next())
+                    && status.bytes().all(|b| b.is_ascii_digit())
+                {
+                    return Err(format!("GET {target} -> {status}"));
                 }
                 Json::parse(text)
             }
@@ -510,10 +510,10 @@ fn header(headers: &[(String, String)], name: &str) -> Option<String> {
 
 fn print_body(out: &mut dyn Write, content_type: &str, bytes: &[u8]) -> io::Result<()> {
     let text = String::from_utf8_lossy(bytes);
-    if content_type.contains("application/json") {
-        if let Ok(j) = Json::parse(&text) {
-            return writeln!(out, "{}", j.to_pretty());
-        }
+    if content_type.contains("application/json")
+        && let Ok(j) = Json::parse(&text)
+    {
+        return writeln!(out, "{}", j.to_pretty());
     }
     writeln!(out, "{}", text.trim_end())
 }
@@ -541,7 +541,7 @@ fn header_line(header_text: &str, name: &str) -> Option<String> {
 }
 
 fn parse_addr(addr: &str) -> (String, u16) {
-    let rest = addr.strip_prefix("http://").unwrap_or(addr);
+    let rest = addr.trim_prefix("http://");
     let rest = rest.trim_end_matches('/');
     match rest.split_once(':') {
         Some((h, p)) => (h.to_string(), p.parse().unwrap_or(80)),

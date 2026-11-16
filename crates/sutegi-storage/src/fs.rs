@@ -7,7 +7,7 @@
 //! Files that appear on disk out-of-band (no sidecar) fall back to an
 //! extension-derived guess.
 
-use crate::{content_type_of, validate_key, ObjectMeta, OpenObject, Storage, StorageCaps};
+use crate::{ObjectMeta, OpenObject, Storage, StorageCaps, content_type_of, validate_key};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -284,23 +284,26 @@ mod tests {
     fn partial_uploads_preserve_objects_and_clean_temporary_files() {
         let s = temp_store();
         s.put("call.webm", b"old", "video/webm").unwrap();
-        assert!(s
-            .put_reader("call.webm", &mut &b"short"[..], 100, "video/mp4")
-            .is_err());
+        assert!(
+            s.put_reader("call.webm", &mut &b"short"[..], 100, "video/mp4")
+                .is_err()
+        );
         assert_eq!(s.get("call.webm").unwrap().unwrap(), b"old");
         assert_eq!(
             s.stat("call.webm").unwrap().unwrap().content_type,
             "video/webm"
         );
-        assert!(s
-            .put_reader("missing.webm", &mut &b""[..], 1, "video/webm")
-            .is_err());
+        assert!(
+            s.put_reader("missing.webm", &mut &b""[..], 1, "video/webm")
+                .is_err()
+        );
         assert!(!s.exists("missing.webm").unwrap());
-        assert!(fs::read_dir(s.root()).unwrap().all(|e| !e
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .ends_with(TMP_SUFFIX)));
+        assert!(fs::read_dir(s.root()).unwrap().all(|e| {
+            !e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(TMP_SUFFIX)
+        }));
         let _ = fs::remove_dir_all(s.root());
     }
 

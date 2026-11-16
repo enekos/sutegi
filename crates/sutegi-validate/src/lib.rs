@@ -33,11 +33,7 @@ impl ValidationErrors {
 
     /// Collapse into a `Result`, so callers can `?` on validation.
     pub fn into_result(self) -> Result<(), ValidationErrors> {
-        if self.is_empty() {
-            Ok(())
-        } else {
-            Err(self)
-        }
+        if self.is_empty() { Ok(()) } else { Err(self) }
     }
 
     /// `{ "field": ["message", ...], ... }` — ready to return to an agent.
@@ -214,52 +210,52 @@ fn check_rule(field: &str, rule: &Rule, value: &Json, errors: &mut ValidationErr
             }
         }
         Rule::Between(min, max) => {
-            if let Some(n) = value.as_f64() {
-                if n < *min || n > *max {
-                    errors.add(
-                        field,
-                        format!("The {} must be between {} and {}.", field, min, max),
-                    );
-                }
+            if let Some(n) = value.as_f64()
+                && (n < *min || n > *max)
+            {
+                errors.add(
+                    field,
+                    format!("The {} must be between {} and {}.", field, min, max),
+                );
             }
         }
         // Handled in `Ruleset::validate` (needs sibling-field access).
         Rule::Same(_) => {}
         Rule::Min(min) => {
-            if let Some(n) = value.as_f64() {
-                if n < *min {
-                    errors.add(field, format!("The {} must be at least {}.", field, min));
-                }
+            if let Some(n) = value.as_f64()
+                && n < *min
+            {
+                errors.add(field, format!("The {} must be at least {}.", field, min));
             }
         }
         Rule::Max(max) => {
-            if let Some(n) = value.as_f64() {
-                if n > *max {
-                    errors.add(
-                        field,
-                        format!("The {} must not be greater than {}.", field, max),
-                    );
-                }
+            if let Some(n) = value.as_f64()
+                && n > *max
+            {
+                errors.add(
+                    field,
+                    format!("The {} must not be greater than {}.", field, max),
+                );
             }
         }
         Rule::MinLen(min) => {
-            if let Some(len) = length_of(value) {
-                if len < *min {
-                    errors.add(
-                        field,
-                        format!("The {} must be at least {} long.", field, min),
-                    );
-                }
+            if let Some(len) = length_of(value)
+                && len < *min
+            {
+                errors.add(
+                    field,
+                    format!("The {} must be at least {} long.", field, min),
+                );
             }
         }
         Rule::MaxLen(max) => {
-            if let Some(len) = length_of(value) {
-                if len > *max {
-                    errors.add(
-                        field,
-                        format!("The {} must not be longer than {}.", field, max),
-                    );
-                }
+            if let Some(len) = length_of(value)
+                && len > *max
+            {
+                errors.add(
+                    field,
+                    format!("The {} must not be longer than {}.", field, max),
+                );
             }
         }
         Rule::In(allowed) => {
@@ -327,11 +323,7 @@ pub fn validate_schema(schema: &Json, value: &Json) -> Result<(), ValidationErro
 }
 
 fn path_label(path: &str) -> &str {
-    if path.is_empty() {
-        "value"
-    } else {
-        path
-    }
+    if path.is_empty() { "value" } else { path }
 }
 
 fn validate_node(schema: &Json, value: &Json, path: &str, errors: &mut ValidationErrors) {
@@ -355,48 +347,48 @@ fn validate_node(schema: &Json, value: &Json, path: &str, errors: &mut Validatio
         }
     }
 
-    if let Some(Json::Arr(allowed)) = schema.get("enum") {
-        if !allowed.iter().any(|a| a == value) {
-            let opts: Vec<String> = allowed.iter().map(|a| a.to_string()).collect();
-            errors.add(label, format!("must be one of: {}", opts.join(", ")));
-        }
+    if let Some(Json::Arr(allowed)) = schema.get("enum")
+        && !allowed.iter().any(|a| a == value)
+    {
+        let opts: Vec<String> = allowed.iter().map(|a| a.to_string()).collect();
+        errors.add(label, format!("must be one of: {}", opts.join(", ")));
     }
 
     match value {
         Json::Num(n) => {
-            if let Some(min) = schema.get("minimum").and_then(|j| j.as_f64()) {
-                if *n < min {
-                    errors.add(label, format!("must be >= {}", min));
-                }
+            if let Some(min) = schema.get("minimum").and_then(|j| j.as_f64())
+                && *n < min
+            {
+                errors.add(label, format!("must be >= {}", min));
             }
-            if let Some(max) = schema.get("maximum").and_then(|j| j.as_f64()) {
-                if *n > max {
-                    errors.add(label, format!("must be <= {}", max));
-                }
+            if let Some(max) = schema.get("maximum").and_then(|j| j.as_f64())
+                && *n > max
+            {
+                errors.add(label, format!("must be <= {}", max));
             }
         }
         Json::Str(s) => {
             let len = s.chars().count() as f64;
-            if let Some(min) = schema.get("minLength").and_then(|j| j.as_f64()) {
-                if len < min {
-                    errors.add(label, format!("must be at least {} characters", min));
-                }
+            if let Some(min) = schema.get("minLength").and_then(|j| j.as_f64())
+                && len < min
+            {
+                errors.add(label, format!("must be at least {} characters", min));
             }
-            if let Some(max) = schema.get("maxLength").and_then(|j| j.as_f64()) {
-                if len > max {
-                    errors.add(label, format!("must be at most {} characters", max));
-                }
+            if let Some(max) = schema.get("maxLength").and_then(|j| j.as_f64())
+                && len > max
+            {
+                errors.add(label, format!("must be at most {} characters", max));
             }
         }
         Json::Obj(_) => {
             // required
             if let Some(Json::Arr(required)) = schema.get("required") {
                 for field in required {
-                    if let Json::Str(name) = field {
-                        if value.get(name).is_none() {
-                            let child = join_path(path, name);
-                            errors.add(&child, "is required");
-                        }
+                    if let Json::Str(name) = field
+                        && value.get(name).is_none()
+                    {
+                        let child = join_path(path, name);
+                        errors.add(&child, "is required");
                     }
                 }
             }
@@ -579,7 +571,7 @@ mod tests {
         let errs = rules.validate(&bad).unwrap_err().to_json();
         assert!(errs.get("score").is_some());
         assert!(errs.get("tags").is_some()); // MaxLen counts array items
-                                             // In-bounds passes; MinLen also counts array length.
+        // In-bounds passes; MinLen also counts array length.
         let good = Json::obj(vec![
             ("score", Json::num(50)),
             ("tags", Json::arr(vec![Json::str("a")])),
@@ -608,12 +600,16 @@ mod tests {
             &[Rule::In(vec!["1".into(), "2".into(), "3".into()])],
         );
         // A numeric value stringifies and matches.
-        assert!(rules
-            .validate(&Json::obj(vec![("level", Json::num(2))]))
-            .is_ok());
-        assert!(rules
-            .validate(&Json::obj(vec![("level", Json::num(9))]))
-            .is_err());
+        assert!(
+            rules
+                .validate(&Json::obj(vec![("level", Json::num(2))]))
+                .is_ok()
+        );
+        assert!(
+            rules
+                .validate(&Json::obj(vec![("level", Json::num(9))]))
+                .is_err()
+        );
     }
 
     #[test]

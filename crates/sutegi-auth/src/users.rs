@@ -6,7 +6,7 @@
 //! comparable time on unknown emails so a missing account is not
 //! distinguishable from a wrong password by timing.
 
-use crate::password::{hash_password_with, needs_rehash, verify_password, DEFAULT_ITERATIONS};
+use crate::password::{DEFAULT_ITERATIONS, hash_password_with, needs_rehash, verify_password};
 use std::sync::OnceLock;
 use sutegi_json::Json;
 use sutegi_orm::{Backend, ColType, Column, TableSchema, Value};
@@ -205,13 +205,13 @@ impl<B: Backend> Users<B> {
                     // Work factor raised since this hash was made? Upgrade it
                     // while we hold the plaintext — best-effort, a rehash
                     // failure must never fail a valid login.
-                    if needs_rehash(hash, self.iterations) {
-                        if let Ok(fresh) = hash_password_with(password, self.iterations) {
-                            let _ = self.backend.execute(
-                                "UPDATE users SET password_hash = ? WHERE id = ?",
-                                &[Value::Text(fresh), Value::Int(user.id)],
-                            );
-                        }
+                    if needs_rehash(hash, self.iterations)
+                        && let Ok(fresh) = hash_password_with(password, self.iterations)
+                    {
+                        let _ = self.backend.execute(
+                            "UPDATE users SET password_hash = ? WHERE id = ?",
+                            &[Value::Text(fresh), Value::Int(user.id)],
+                        );
                     }
                     Ok(Some(user))
                 } else {
@@ -444,14 +444,18 @@ mod tests {
             .authenticate("eneko@example.com", "correct horse")
             .unwrap();
         assert_eq!(hit.unwrap().id, u.id);
-        assert!(users
-            .authenticate("eneko@example.com", "wrong pass!")
-            .unwrap()
-            .is_none());
-        assert!(users
-            .authenticate("nobody@example.com", "correct horse")
-            .unwrap()
-            .is_none());
+        assert!(
+            users
+                .authenticate("eneko@example.com", "wrong pass!")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            users
+                .authenticate("nobody@example.com", "correct horse")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -526,14 +530,18 @@ mod tests {
         let users = store();
         let u = users.register("a@b.co", "oldpassword").unwrap();
         users.set_password(u.id, "newpassword").unwrap();
-        assert!(users
-            .authenticate("a@b.co", "oldpassword")
-            .unwrap()
-            .is_none());
-        assert!(users
-            .authenticate("a@b.co", "newpassword")
-            .unwrap()
-            .is_some());
+        assert!(
+            users
+                .authenticate("a@b.co", "oldpassword")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            users
+                .authenticate("a@b.co", "newpassword")
+                .unwrap()
+                .is_some()
+        );
         assert!(users.set_password(999, "whatever12").is_err());
     }
 
@@ -541,20 +549,28 @@ mod tests {
     fn change_password_requires_current() {
         let users = store();
         let u = users.register("a@b.co", "oldpassword").unwrap();
-        assert!(!users
-            .change_password(u.id, "wrong-pass", "newpassword")
-            .unwrap());
-        assert!(users
-            .authenticate("a@b.co", "oldpassword")
-            .unwrap()
-            .is_some());
-        assert!(users
-            .change_password(u.id, "oldpassword", "newpassword")
-            .unwrap());
-        assert!(users
-            .authenticate("a@b.co", "newpassword")
-            .unwrap()
-            .is_some());
+        assert!(
+            !users
+                .change_password(u.id, "wrong-pass", "newpassword")
+                .unwrap()
+        );
+        assert!(
+            users
+                .authenticate("a@b.co", "oldpassword")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            users
+                .change_password(u.id, "oldpassword", "newpassword")
+                .unwrap()
+        );
+        assert!(
+            users
+                .authenticate("a@b.co", "newpassword")
+                .unwrap()
+                .is_some()
+        );
         assert!(users.change_password(999, "x", "whatever12").is_err());
     }
 

@@ -24,7 +24,7 @@
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, Data, DeriveInput, Fields, Type};
+use syn::{Data, DeriveInput, Fields, Type, parse_macro_input};
 
 #[derive(Clone, Copy)]
 enum Scalar {
@@ -161,14 +161,14 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 return Err(syn::Error::new_spanned(
                     &input,
                     "#[derive(Model)] requires named fields",
-                ))
+                ));
             }
         },
         _ => {
             return Err(syn::Error::new_spanned(
                 &input,
                 "#[derive(Model)] can only be applied to structs",
-            ))
+            ));
         }
     };
 
@@ -862,10 +862,10 @@ fn pluralize(word: &str) -> String {
 fn option_inner(ty: &Type) -> Option<&Type> {
     if let Type::Path(p) = ty {
         let seg = p.path.segments.last()?;
-        if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
-            if let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
-                return Some(inner);
-            }
+        if let syn::PathArguments::AngleBracketed(args) = &seg.arguments
+            && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
+        {
+            return Some(inner);
         }
     }
     None
@@ -889,14 +889,14 @@ fn expand_validate(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> 
                 return Err(syn::Error::new_spanned(
                     name,
                     "#[derive(Validate)] requires named fields",
-                ))
+                ));
             }
         },
         _ => {
             return Err(syn::Error::new_spanned(
                 name,
                 "#[derive(Validate)] can only be derived for structs",
-            ))
+            ));
         }
     };
 

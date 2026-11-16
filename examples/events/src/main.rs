@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sutegi::events::{
-    event, Aggregate, EventError, EventStore, Expected, Projections, StoredEvent,
+    Aggregate, EventError, EventStore, Expected, Projections, StoredEvent, event,
 };
 use sutegi::prelude::*;
 

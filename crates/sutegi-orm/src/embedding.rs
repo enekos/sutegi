@@ -25,8 +25,8 @@
 //! ```
 
 use crate::backend::{Backend, FromRow};
-use crate::builder::{valid_identifier, QueryBuilder};
-use crate::value::{vector_from_text, vector_to_text, Value};
+use crate::builder::{QueryBuilder, valid_identifier};
+use crate::value::{Value, vector_from_text, vector_to_text};
 use sutegi_json::Json;
 
 /// An embedding vector — a thin newtype over `Vec<f32>` with the vector algebra

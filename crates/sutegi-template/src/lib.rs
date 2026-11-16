@@ -220,7 +220,6 @@ fn lex(src: &str) -> Result<Vec<(Tok, usize)>, String> {
 }
 
 /// Try to lex a `@directive` at the start of `rest`.
-#[allow(clippy::type_complexity)]
 fn directive(rest: &str) -> Option<(Result<Tok, String>, usize)> {
     if !rest.starts_with('@') {
         return None;
@@ -417,7 +416,7 @@ fn render_nodes(
             Node::If { cond, then, els } => {
                 let mut truthy = is_truthy(&lookup(&cond.path, root, scopes));
                 if cond.negated {
-                    truthy = !truthy;
+                    truthy.toggle();
                 }
                 let branch = if truthy { then } else { els };
                 render_nodes(branch, root, scopes, registry, depth, out)?;
@@ -431,7 +430,7 @@ fn render_nodes(
                         return Err(format!(
                             "@foreach over non-array value ({})",
                             kind_of(&other)
-                        ))
+                        ));
                     }
                 };
                 let len = items.len();
@@ -611,10 +610,12 @@ mod tests {
         );
         // Missing collection renders nothing; scalars error.
         assert_eq!(render("@foreach(nope as x)x@endforeach", &ctx(vec![])), "");
-        assert!(Template::compile("@foreach(v as x)x@endforeach")
-            .unwrap()
-            .render(&ctx(vec![("v", Json::int(3))]))
-            .is_err());
+        assert!(
+            Template::compile("@foreach(v as x)x@endforeach")
+                .unwrap()
+                .render(&ctx(vec![("v", Json::int(3))]))
+                .is_err()
+        );
     }
 
     #[test]
@@ -638,10 +639,12 @@ mod tests {
         );
 
         // Includes without a registry, and unknown names, error clearly.
-        assert!(Template::compile("@include(x)")
-            .unwrap()
-            .render(&ctx(vec![]))
-            .is_err());
+        assert!(
+            Template::compile("@include(x)")
+                .unwrap()
+                .render(&ctx(vec![]))
+                .is_err()
+        );
         assert!(ts.render("nope", &ctx(vec![])).is_err());
     }
 

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **MSRV is now Rust 1.100** (was 1.75), and the workspace is on **edition 2024**. The toolchain is pinned in `rust-toolchain.toml`, so CI, the perf gate and local builds all use the same compiler.
+
+### Added
+
+- http: `Incoming` implements `Debug`.
+
+### Performance
+
+- Integers are now written with `format_into` into a stack buffer instead of going through `fmt`. This covers JSON numbers, every response's status line and `content-length`, Postgres `$n` placeholders and COPY literals. `to_pretty` no longer allocates a string per indented line. Measured on the shipped `opt-level = "z"` profile: `pg_placeholders` −34%, `json_pretty` −32%, `json_serialize_ints` −30%, `http_write_response` −16%, `json_serialize` −12%.
+- Percent-decoding and SQLite blob→text conversion keep the decoded buffer when it is valid UTF-8 instead of copying it.
+
 ## [0.14.0] - 2026-11-15
 
 The calls release: everything a WebRTC call server needs from the framework — bounded WebSocket sends, ordered callback pools, a shared drain lifecycle, streaming uploads and seekable range downloads — plus a complete two-browser call example.

@@ -40,9 +40,9 @@ use std::time::{Duration, Instant};
 
 use sutegi_http::{Lifecycle, Phase, Request};
 
-use crate::poller::{raise_nofile_limit, Poller, WakePipe};
+use crate::poller::{Poller, WakePipe, raise_nofile_limit};
 use crate::protocol::{
-    decode_frame, encode_close, encode_frame, parse_close, Opcode, ProtocolError,
+    Opcode, ProtocolError, decode_frame, encode_close, encode_frame, parse_close,
 };
 
 /// Reserved poller token for the shard's wake pipe.
@@ -453,17 +453,17 @@ impl Admission {
             self.total.fetch_sub(1, Ordering::AcqRel);
             return false;
         }
-        if self.max_per_ip > 0 {
-            if let Some(ip) = ip {
-                let mut map = self.per_ip.lock().unwrap();
-                let n = map.entry(ip.to_string()).or_insert(0);
-                if *n >= self.max_per_ip {
-                    drop(map);
-                    self.total.fetch_sub(1, Ordering::AcqRel);
-                    return false;
-                }
-                *n += 1;
+        if self.max_per_ip > 0
+            && let Some(ip) = ip
+        {
+            let mut map = self.per_ip.lock().unwrap();
+            let n = map.entry(ip.to_string()).or_insert(0);
+            if *n >= self.max_per_ip {
+                drop(map);
+                self.total.fetch_sub(1, Ordering::AcqRel);
+                return false;
             }
+            *n += 1;
         }
         true
     }
@@ -471,14 +471,14 @@ impl Admission {
     /// Release a previously reserved slot.
     fn release(&self, ip: Option<&str>) {
         self.total.fetch_sub(1, Ordering::AcqRel);
-        if self.max_per_ip > 0 {
-            if let Some(ip) = ip {
-                let mut map = self.per_ip.lock().unwrap();
-                if let Some(n) = map.get_mut(ip) {
-                    *n -= 1;
-                    if *n == 0 {
-                        map.remove(ip);
-                    }
+        if self.max_per_ip > 0
+            && let Some(ip) = ip
+        {
+            let mut map = self.per_ip.lock().unwrap();
+            if let Some(n) = map.get_mut(ip) {
+                *n -= 1;
+                if *n == 0 {
+                    map.remove(ip);
                 }
             }
         }

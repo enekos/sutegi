@@ -28,7 +28,10 @@ struct Todo {
 // No `#[model(table=...)]` → table name defaults to snake_case + pluralize.
 // Fields are exercised only through the generated impls, not read directly.
 #[derive(Model, Default)]
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "fields are exercised only through the generated impls"
+)]
 struct Category {
     #[model(primary)]
     id: i64,
@@ -70,7 +73,10 @@ fn default_table_name_is_snake_pluralized() {
 // Exercises the P1 schema-IR attributes: unique, index, default, and a
 // belongs_to relation projected into a foreign key with an ON DELETE action.
 #[derive(Model, Default)]
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "fields are exercised only through the generated impls"
+)]
 struct Article {
     #[model(primary)]
     id: i64,
@@ -231,7 +237,10 @@ fn save_inserts_and_lets_the_backend_assign_the_id() {
 
 #[cfg(feature = "validate")]
 #[derive(Validate)]
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "fields are exercised only through the generated impls"
+)]
 struct Signup {
     #[validate(required, str, min_len = 3, max_len = 20)]
     username: String,

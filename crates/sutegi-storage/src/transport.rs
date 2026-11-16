@@ -749,12 +749,14 @@ mod tests {
             b"abc"
         );
         assert!(parse("HTTP/1.1 200 OK\r\nContent-Length: +2\r\n\r\nok", false).is_err());
-        assert!(parse(
-            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\nok!",
-            false
-        )
-        .unwrap_err()
-        .contains("conflicting"));
+        assert!(
+            parse(
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\nok!",
+                false
+            )
+            .unwrap_err()
+            .contains("conflicting")
+        );
         let flood = "HTTP/1.1 100 Continue\r\n\r\n".repeat(50);
         assert!(parse(&flood, false).unwrap_err().contains("interim"));
         let trailers = format!(
@@ -839,10 +841,12 @@ mod tests {
         };
         let cfg = SystemCurl::new().config(&head, None);
         assert!(cfg.contains("head\n") && !cfg.contains("request ="));
-        assert!(SystemCurl::new()
-            .allow_http()
-            .config(&head, None)
-            .contains("proto = \"=https,http\"\n"));
+        assert!(
+            SystemCurl::new()
+                .allow_http()
+                .config(&head, None)
+                .contains("proto = \"=https,http\"\n")
+        );
     }
 
     #[test]
@@ -856,10 +860,12 @@ mod tests {
         let err = SystemCurl::new().send(&req).unwrap_err();
         assert!(err.contains("refuses http://"), "{err}");
         // …and there is no knob anywhere that disables certificate checking.
-        assert!(!SystemCurl::new()
-            .allow_http()
-            .config(&req, None)
-            .contains("insecure"));
+        assert!(
+            !SystemCurl::new()
+                .allow_http()
+                .config(&req, None)
+                .contains("insecure")
+        );
     }
 
     /// A stand-in `curl` that checks `-q` is first and prints what real curl

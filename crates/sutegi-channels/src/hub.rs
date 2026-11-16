@@ -14,12 +14,12 @@ use std::time::Instant;
 use sutegi_http::Request;
 use sutegi_json::Json;
 use sutegi_pubsub::{Broker, BrokerExt, PubSub};
-use sutegi_ws::{text_frame, Conn, Msg};
+use sutegi_ws::{Conn, Msg, text_frame};
 
 use crate::channel::{Channel, LeaveReason, Reply};
 use crate::protocol::{
-    self, error_payload, reply_payload, topic_matches, CONTROL_TOPIC, EV_CLOSE, EV_ERROR,
-    EV_HEARTBEAT, EV_JOIN, EV_LEAVE, EV_REPLY, RESERVED_PREFIX,
+    self, CONTROL_TOPIC, EV_CLOSE, EV_ERROR, EV_HEARTBEAT, EV_JOIN, EV_LEAVE, EV_REPLY,
+    RESERVED_PREFIX, error_payload, reply_payload, topic_matches,
 };
 
 /// The pre-101 handshake gate (see `Ws::authorize`).
@@ -435,12 +435,20 @@ impl ChannelHub {
                     (
                         "envelope",
                         Json::obj(vec![
-                            ("topic", Json::str("string — the concrete topic, e.g. room:7")),
+                            (
+                                "topic",
+                                Json::str("string — the concrete topic, e.g. room:7"),
+                            ),
                             ("event", Json::str("string")),
-                            ("ref", Json::str("string, optional — echoed in the stg:reply")),
+                            (
+                                "ref",
+                                Json::str("string, optional — echoed in the stg:reply"),
+                            ),
                             (
                                 "join_ref",
-                                Json::str("string, optional — the ref of the join that created the membership"),
+                                Json::str(
+                                    "string, optional — the ref of the join that created the membership",
+                                ),
                             ),
                             ("payload", Json::str("any JSON")),
                         ]),
@@ -460,14 +468,22 @@ impl ChannelHub {
                         Json::obj(vec![
                             ("topic", Json::str(CONTROL_TOPIC)),
                             ("event", Json::str(EV_HEARTBEAT)),
-                            ("doc", Json::str("send periodically with a ref; an ok reply proves liveness")),
+                            (
+                                "doc",
+                                Json::str(
+                                    "send periodically with a ref; an ok reply proves liveness",
+                                ),
+                            ),
                         ]),
                     ),
                     (
                         "reply_payload",
                         Json::obj(vec![
                             ("status", Json::str("\"ok\" | \"error\"")),
-                            ("response", Json::str("any JSON — the handler's reply value")),
+                            (
+                                "response",
+                                Json::str("any JSON — the handler's reply value"),
+                            ),
                         ]),
                     ),
                 ]),
@@ -787,22 +803,22 @@ impl HubInner {
         self.forget_member(conn.id(), topic);
         #[cfg(feature = "presence")]
         crate::presence::untrack_on_teardown(self, conn.id(), topic);
-        if let Some(channel) = self.channel_for(topic) {
-            if let Some(leave) = &channel.leave {
-                let socket = Socket {
-                    hub: ChannelHub {
-                        inner: self.strong(),
-                    },
-                    conn: conn.clone(),
-                    req: self.request_of(conn.id()),
-                    topic: topic.to_string(),
-                    join_ref: join.join_ref.clone(),
-                    assigns: join.assigns,
-                    live: join.live,
-                    pending: None,
-                };
-                leave(&socket, reason);
-            }
+        if let Some(channel) = self.channel_for(topic)
+            && let Some(leave) = &channel.leave
+        {
+            let socket = Socket {
+                hub: ChannelHub {
+                    inner: self.strong(),
+                },
+                conn: conn.clone(),
+                req: self.request_of(conn.id()),
+                topic: topic.to_string(),
+                join_ref: join.join_ref.clone(),
+                assigns: join.assigns,
+                live: join.live,
+                pending: None,
+            };
+            leave(&socket, reason);
         }
     }
 

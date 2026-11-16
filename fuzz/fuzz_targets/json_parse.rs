@@ -7,11 +7,11 @@ use libfuzzer_sys::fuzz_target;
 use sutegi_json::Json;
 
 fuzz_target!(|data: &[u8]| {
-    if let Ok(s) = std::str::from_utf8(data) {
-        if let Ok(v) = Json::parse(s) {
-            let once = v.to_string();
-            let reparsed = Json::parse(&once).expect("own serialization must re-parse");
-            assert_eq!(once, reparsed.to_string(), "serialization not idempotent");
-        }
+    if let Ok(s) = std::str::from_utf8(data)
+        && let Ok(v) = Json::parse(s)
+    {
+        let once = v.to_string();
+        let reparsed = Json::parse(&once).expect("own serialization must re-parse");
+        assert_eq!(once, reparsed.to_string(), "serialization not idempotent");
     }
 });

@@ -557,18 +557,22 @@ mod tests {
         assert!(Email::new().validate().is_err()); // no from
         assert!(Email::new().from("a@b.co").validate().is_err()); // no rcpt
         assert!(Email::new().from("a@b.co").to("t@b.co").validate().is_err()); // no body
-        assert!(Email::new()
-            .from("a@b.co")
-            .to("bad")
-            .text("x")
-            .validate()
-            .is_err());
-        assert!(Email::new()
-            .from("a@b.co")
-            .to("t@b.co")
-            .text("x")
-            .validate()
-            .is_ok());
+        assert!(
+            Email::new()
+                .from("a@b.co")
+                .to("bad")
+                .text("x")
+                .validate()
+                .is_err()
+        );
+        assert!(
+            Email::new()
+                .from("a@b.co")
+                .to("t@b.co")
+                .text("x")
+                .validate()
+                .is_ok()
+        );
     }
 
     #[test]

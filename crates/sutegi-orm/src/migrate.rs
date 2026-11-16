@@ -57,7 +57,7 @@
 //! must be written idempotently.
 
 use crate::backend::{Backend, CapScope, Isolation, LockGuard, Transactional};
-use crate::schema_diff::{apply, diff, render, Plan, SchemaOp};
+use crate::schema_diff::{Plan, SchemaOp, apply, diff, render};
 use crate::value::{Dialect, TableSchema, Value};
 use sutegi_json::Json;
 
@@ -386,7 +386,10 @@ impl Migrator {
 
     /// Register a migration (builder-style). Order of registration does not
     /// matter; migrations always run sorted by `version`.
-    #[allow(clippy::should_implement_trait)] // builder-style `add`, not `Add::add`
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "builder-style `add`, not `Add::add`"
+    )]
     pub fn add(mut self, migration: Migration) -> Migrator {
         self.migrations.push(migration);
         self
@@ -962,7 +965,7 @@ impl Migrator {
                         "migration {} ({}) is a closure — cannot fold it into a shadow schema; \
                          use shadow_via() with a scratch database to replay it",
                         m.version, m.name
-                    ))
+                    ));
                 }
             }
         }
@@ -1249,8 +1252,9 @@ pub fn status_json(statuses: &[MigrationStatus]) -> Json {
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
-    use crate::db::Db;
     use crate::QueryBuilder;
+    use crate::db::Db;
+    use std::assert_matches;
 
     fn migrator() -> Migrator {
         Migrator::new()
@@ -1441,7 +1445,7 @@ mod tests {
         assert_eq!(plan_a, plan_b);
         // And it's exactly the one new column.
         assert_eq!(plan_a.ops.len(), 1);
-        assert!(matches!(plan_a.ops[0], SchemaOp::AddColumn { .. }));
+        assert_matches!(plan_a.ops[0], SchemaOp::AddColumn { .. });
     }
 
     #[test]

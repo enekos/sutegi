@@ -1,6 +1,7 @@
 //! Schema primitives: the scalar [`Value`] type bound to query parameters, the
 //! column/table descriptors, and the DDL/JSON emitters derived from them.
 
+use std::fmt::Write as _;
 use sutegi_json::Json;
 
 /// A SQL value used as a bound parameter.
@@ -44,7 +45,7 @@ pub fn vector_to_text(v: &[f32]) -> String {
         if i > 0 {
             s.push(',');
         }
-        s.push_str(&x.to_string());
+        let _ = write!(s, "{x}"); // fmt::Write for String is infallible
     }
     s.push(']');
     s
@@ -373,7 +374,7 @@ pub fn parse_default_literal(raw: &str) -> Option<Value> {
     if s.eq_ignore_ascii_case("false") {
         return Some(Value::Bool(false));
     }
-    if let Some(inner) = s.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
+    if let Some(inner) = s.strip_circumfix('\'', '\'') {
         return Some(Value::Text(inner.replace("''", "'")));
     }
     if let Ok(i) = s.parse::<i64>() {
@@ -552,10 +553,10 @@ pub fn column_from_json(c: &Json) -> Result<Column, String> {
     if c.get("unique").and_then(Json::as_bool) == Some(true) {
         col = col.unique();
     }
-    if let Some(d) = c.get("default") {
-        if !matches!(d, Json::Null) {
-            col = col.default(value_from_json(d)?);
-        }
+    if let Some(d) = c.get("default")
+        && !matches!(d, Json::Null)
+    {
+        col = col.default(value_from_json(d)?);
     }
     Ok(col)
 }

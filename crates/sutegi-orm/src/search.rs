@@ -12,8 +12,8 @@
 //! never see them. On Postgres the artifact is an *expression* GIN index —
 //! no column is added to the user's table.
 
-use crate::backend::{unsupported, Backend};
-use crate::builder::{valid_identifier, QueryBuilder};
+use crate::backend::{Backend, unsupported};
+use crate::builder::{QueryBuilder, valid_identifier};
 use crate::embedding::{self, Metric};
 use crate::value::{Dialect, Value};
 use sutegi_json::Json;
@@ -106,11 +106,7 @@ impl SearchQuery {
             } else {
                 body
             };
-            if t.negated {
-                format!("!{body}")
-            } else {
-                body
-            }
+            if t.negated { format!("!{body}") } else { body }
         };
         self.groups
             .iter()
@@ -304,7 +300,10 @@ fn leg_size(k: usize) -> usize {
 /// vector leg (pgvector pushdown on Postgres, portable brute force on
 /// SQLite). Returns base-table rows with a `_score` column, best first —
 /// the modern RAG retrieval shape, one call.
-#[allow(clippy::too_many_arguments)] // a search call site reads better flat than through a params struct
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a search call site reads better flat than through a params struct"
+)]
 pub fn hybrid_search<B: Backend>(
     db: &B,
     table: &str,
@@ -504,9 +503,11 @@ mod tests {
             &[Value::Text("elixir channels".into()), Value::Int(id2)],
         )
         .unwrap();
-        assert!(search(&db, "docs", "id", &["title", "body"], "phoenix", 10)
-            .unwrap()
-            .is_empty());
+        assert!(
+            search(&db, "docs", "id", &["title", "body"], "phoenix", 10)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             search(&db, "docs", "id", &["title", "body"], "elixir", 10)
                 .unwrap()
@@ -517,9 +518,11 @@ mod tests {
         // ...and deletes drop out of the index.
         db.execute("DELETE FROM docs WHERE id = ?", &[Value::Int(id2)])
             .unwrap();
-        assert!(search(&db, "docs", "id", &["title", "body"], "elixir", 10)
-            .unwrap()
-            .is_empty());
+        assert!(
+            search(&db, "docs", "id", &["title", "body"], "elixir", 10)
+                .unwrap()
+                .is_empty()
+        );
 
         // The FTS artifacts stay out of schema introspection (drift-clean).
         let tables: Vec<String> = db

@@ -31,7 +31,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -276,10 +276,10 @@ fn worker<B: Backend>(backend: B, registry: Arc<Registry>, rx: Receiver<Feed>) {
             };
             let change = diff(&sub.table, &sub.snapshot, &next);
             sub.snapshot = next;
-            if let Some(change) = change {
-                if sub.out.send(change).is_err() {
-                    dead.push(*id); // subscriber dropped mid-flight
-                }
+            if let Some(change) = change
+                && sub.out.send(change).is_err()
+            {
+                dead.push(*id); // subscriber dropped mid-flight
             }
         }
         for id in dead {

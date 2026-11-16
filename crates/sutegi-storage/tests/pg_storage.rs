@@ -4,8 +4,8 @@
 
 #![cfg(feature = "db")]
 
-use sutegi_orm::pg::Pg;
 use sutegi_orm::Backend;
+use sutegi_orm::pg::Pg;
 use sutegi_storage::{DbStorage, Storage};
 
 fn pg() -> Option<Pg> {

@@ -1,0 +1,5 @@
+# Pure-formatting commits. GitHub's blame view skips these automatically;
+# locally: git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# rustfmt style edition 2024 (Rust 1.100 adoption)
+eb062036a2525dc3d0a2015d49338a2e39000938

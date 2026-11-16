@@ -8,10 +8,10 @@ use std::thread;
 use std::time::Duration;
 
 use sutegi_json::Json;
-use sutegi_orm::db::Db;
 use sutegi_orm::Backend;
+use sutegi_orm::db::Db;
 use sutegi_repl::Repl;
-use sutegi_web::{schema, App, Error};
+use sutegi_web::{App, Error, schema};
 
 /// The shared fixture: one route group, a unary tool, a streaming tool, and a
 /// `todos` table the tool writes to.
@@ -115,18 +115,20 @@ fn tool_call_route_and_data_commands_share_state() {
     assert!(listed.contains("ship the repl"), "{listed}");
 
     // ...and so does every flavor of data command against the same handle.
-    assert!(repl
-        .eval("sql select title from todos")
-        .contains("ship the repl"));
+    assert!(
+        repl.eval("sql select title from todos")
+            .contains("ship the repl")
+    );
     assert!(repl.eval("table todos").contains("ship the repl"));
     assert!(repl.eval("count todos").trim().ends_with('1'));
     let q = repl.eval("q todos select title where done = 0 order id desc limit 5");
     assert!(q.contains("ship the repl") && q.contains("(1 row)"), "{q}");
 
     // Write path + affected-count reporting.
-    assert!(repl
-        .eval("sql update todos set done = 1")
-        .contains("1 row affected"));
+    assert!(
+        repl.eval("sql update todos set done = 1")
+            .contains("1 row affected")
+    );
 
     // Validation failures surface as the tool's own 422.
     let invalid = repl.eval("call create_todo {}");
@@ -188,13 +190,15 @@ fn helpful_errors_without_a_db_or_on_bad_input() {
 
     let repl = Repl::new(build(db.clone())).db(db);
     assert!(repl.eval("nonsense").contains("unknown command"));
-    assert!(repl
-        .eval("call create_todo not-json")
-        .contains("must be valid JSON"));
+    assert!(
+        repl.eval("call create_todo not-json")
+            .contains("must be valid JSON")
+    );
     assert!(repl.eval("q todos frobnicate").contains("error:"));
-    assert!(repl
-        .eval("sql select * from missing_table")
-        .contains("error:"));
+    assert!(
+        repl.eval("sql select * from missing_table")
+            .contains("error:")
+    );
     // 404s are labeled, not silent.
     assert!(repl.eval("get /nope").contains("[404]"));
     // events/jobs degrade to the backend's own error when the tables aren't migrated.
@@ -219,9 +223,10 @@ fn remote_repl_drives_a_live_server() {
     }
 
     let repl = Repl::connect(addr);
-    assert!(repl
-        .eval("introspect")
-        .contains("\"framework\": \"sutegi\""));
+    assert!(
+        repl.eval("introspect")
+            .contains("\"framework\": \"sutegi\"")
+    );
     assert!(repl.eval("routes").contains("/todos"));
 
     let created = repl.eval(r#"call create_todo {"title": "over the wire"}"#);

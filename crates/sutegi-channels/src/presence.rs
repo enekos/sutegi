@@ -440,10 +440,12 @@ fn ensure_housekeeper(inner: &HubInner) {
     let interval = inner.presence.interval;
     let spawned = std::thread::Builder::new()
         .name("sutegi-presence".into())
-        .spawn(move || loop {
-            std::thread::sleep(interval);
-            let Some(hub) = weak.upgrade() else { return };
-            housekeep(&hub);
+        .spawn(move || {
+            loop {
+                std::thread::sleep(interval);
+                let Some(hub) = weak.upgrade() else { return };
+                housekeep(&hub);
+            }
         });
     if spawned.is_err() {
         *started = false; // retry on the next track

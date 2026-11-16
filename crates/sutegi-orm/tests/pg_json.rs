@@ -79,10 +79,12 @@ fn json_path_round_trips_on_jsonb() {
         projected[0].get("first_tag").and_then(Json::as_str),
         Some("rust")
     );
-    assert!(projected[2]
-        .get("first_tag")
-        .map(|j| j.is_null())
-        .unwrap_or(false));
+    assert!(
+        projected[2]
+            .get("first_tag")
+            .map(|j| j.is_null())
+            .unwrap_or(false)
+    );
 
     // count() rides the same dialect-aware path.
     assert_eq!(

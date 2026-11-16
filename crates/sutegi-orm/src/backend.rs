@@ -1036,9 +1036,10 @@ mod tests {
         assert_eq!(*rec.batches.borrow(), vec![1000, 1000, 402]);
 
         // Shape errors are caught before any statement runs.
-        assert!(rec
-            .insert_many("items", &["a", "b"], &[vec![Value::Int(1)]])
-            .is_err());
+        assert!(
+            rec.insert_many("items", &["a", "b"], &[vec![Value::Int(1)]])
+                .is_err()
+        );
         assert!(rec.insert_many("items; --", &["a"], &[]).is_err());
         assert_eq!(rec.insert_many("items", &["a", "b"], &[]).unwrap(), 0);
     }

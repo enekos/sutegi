@@ -130,7 +130,7 @@ impl std::str::FromStr for AuthMethods {
                 _ => {
                     return Err(format!(
                         "require_auth cannot mix negated and plain methods: {s}"
-                    ))
+                    ));
                 }
             };
             let slot = match name {
@@ -320,7 +320,7 @@ fn percent_decode(s: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    String::from_utf8_lossy_owned(out)
 }
 
 pub use protocol::Client;

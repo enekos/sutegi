@@ -48,8 +48,8 @@ exclude = ["benches", "fuzz", "differential"]
 
 [workspace.package]
 version = "0.14.0"
-edition = "2021"
-rust-version = "1.75"
+edition = "2024"
+rust-version = "1.100"
 license = "MIT"
 repository = "https://github.com/enekos/sutegi"
 authors = ["Eneko Sarasola"]
@@ -76,3 +76,4 @@ unsafe_op_in_unsafe_fn = "deny"
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"
 multiple_unsafe_ops_per_block = "deny"
+allow_attributes_without_reason = "deny"

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sutegi_http::{Method, Request};
-use sutegi_ws::{broadcast, text_frame, Conn, Handlers, Msg, WsConfig, WsRuntime};
+use sutegi_ws::{Conn, Handlers, Msg, WsConfig, WsRuntime, broadcast, text_frame};
 
 // ---- client-side wire helpers ----------------------------------------------
 

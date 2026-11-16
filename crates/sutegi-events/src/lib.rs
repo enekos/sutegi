@@ -57,7 +57,7 @@ mod projection;
 mod store;
 
 pub use projection::{ProjectionFn, ProjectionWorkers, Projections};
-pub use store::{append_tx, event, EventError, EventStore, Expected, NewEvent, StoredEvent};
+pub use store::{EventError, EventStore, Expected, NewEvent, StoredEvent, append_tx, event};
 
 /// Current state folded from a stream: start at `Default`, [`apply`]
 /// (Aggregate::apply) each stored event in order. Keep `apply` pure — it runs

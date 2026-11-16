@@ -310,15 +310,15 @@ impl Config {
 
     pub fn from_env() -> Config {
         let mut config = Config::default();
-        if let Ok(spec) = std::env::var(Config::FILTER_ENV) {
-            if let Ok(parsed) = config.clone().filter(&spec) {
-                config = parsed;
-            }
+        if let Ok(spec) = std::env::var(Config::FILTER_ENV)
+            && let Ok(parsed) = config.clone().filter(&spec)
+        {
+            config = parsed;
         }
-        if let Ok(format) = std::env::var(Config::FORMAT_ENV) {
-            if let Ok(format) = format.parse() {
-                config.format = format;
-            }
+        if let Ok(format) = std::env::var(Config::FORMAT_ENV)
+            && let Ok(format) = format.parse()
+        {
+            config.format = format;
         }
         config
     }

@@ -17,11 +17,12 @@
 //! database), so [`Db::memory`] pins the pool to size 1.
 
 use crate::backend::Backend;
-use crate::value::{create_table_sql, Dialect, TableSchema, Value};
-use rusqlite::{params_from_iter, types::Value as SqlValue, Connection};
+use crate::value::{Dialect, TableSchema, Value, create_table_sql};
+use rusqlite::{Connection, params_from_iter, types::Value as SqlValue};
 use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::sync::{Arc, Condvar, Mutex};
+use std::collections::{BTreeMap, BTreeSet};
+use std::mem::DropGuard;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use sutegi_json::Json;
 
 /// Where a pool's connections come from.
@@ -51,21 +52,13 @@ impl Source {
 /// live [`crate::backend::LockGuard`]s. SQLite has no server to coordinate
 /// through, so the reach is one OS process (`CapScope::Process`) — the honest
 /// analog of Postgres session locks for the single-node store.
-fn lock_registry() -> &'static Mutex<std::collections::HashSet<String>> {
-    use std::sync::OnceLock;
-    static REGISTRY: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
-}
+///
+/// A set of names is valid whatever a panicking holder was doing, so poison is
+/// recovered — the release runs in a drop, which must not panic again.
+static LOCK_REGISTRY: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
-/// Removes its registry entry on drop — the hold inside a SQLite lock guard.
-struct RegistryToken {
-    key: String,
-}
-
-impl Drop for RegistryToken {
-    fn drop(&mut self) {
-        lock_registry().lock().unwrap().remove(&self.key);
-    }
+fn lock_registry() -> MutexGuard<'static, BTreeSet<String>> {
+    LOCK_REGISTRY.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 struct Inner {
@@ -400,7 +393,7 @@ fn sqlite_coltype(decl: &str) -> crate::value::ColType {
 /// Reflect every user table's schema out of a SQLite connection via `PRAGMA`.
 /// Shared by [`Db`] and [`Tx`].
 fn introspect_sqlite(conn: &Connection) -> Result<Vec<TableSchema>, String> {
-    use crate::value::{parse_default_literal, Column, ForeignKey, Index};
+    use crate::value::{Column, ForeignKey, Index, parse_default_literal};
 
     let s = |j: &Json, k: &str| j.get(k).and_then(Json::as_str).unwrap_or("").to_string();
     let i = |j: &Json, k: &str| j.get(k).and_then(Json::as_i64).unwrap_or(0);
@@ -434,10 +427,10 @@ fn introspect_sqlite(conn: &Connection) -> Result<Vec<TableSchema>, String> {
             if is_pk {
                 col = col.primary();
             }
-            if let Some(d) = c.get("dflt_value").and_then(Json::as_str) {
-                if let Some(v) = parse_default_literal(d) {
-                    col = col.default(v);
-                }
+            if let Some(d) = c.get("dflt_value").and_then(Json::as_str)
+                && let Some(v) = parse_default_literal(d)
+            {
+                col = col.default(v);
             }
             schema.columns.push(col);
         }
@@ -552,14 +545,15 @@ impl Backend for Db {
     /// [`Source::lock_namespace`].
     fn try_lock(&self, name: &str) -> Result<Option<crate::backend::LockGuard>, String> {
         let key = format!("{}\u{1f}{name}", self.pool.lock_ns);
-        let mut held = lock_registry().lock().unwrap();
-        if held.contains(&key) {
+        if !lock_registry().insert(key.clone()) {
             return Ok(None);
         }
-        held.insert(key.clone());
+        let release = DropGuard::new(key, |key: String| {
+            lock_registry().remove(&key);
+        });
         Ok(Some(crate::backend::LockGuard::new(
             name,
-            Box::new(RegistryToken { key }),
+            Box::new(release),
         )))
     }
 }
@@ -659,7 +653,7 @@ fn sql_to_json(v: SqlValue) -> Json {
         SqlValue::Integer(i) => Json::int(i),
         SqlValue::Real(r) => Json::Num(r),
         SqlValue::Text(s) => Json::str(s),
-        SqlValue::Blob(b) => Json::str(String::from_utf8_lossy(&b).into_owned()),
+        SqlValue::Blob(b) => Json::str(String::from_utf8_lossy_owned(b)),
     }
 }
 
@@ -775,12 +769,14 @@ mod tests {
         assert_eq!(db.count(&QueryBuilder::table("todos")).unwrap(), 3);
 
         // for_update is a documented no-op on SQLite; skip_locked errors.
-        assert!(db
-            .select(&QueryBuilder::table("todos").for_update())
-            .is_ok());
-        assert!(db
-            .select(&QueryBuilder::table("todos").for_update().skip_locked())
-            .is_err());
+        assert!(
+            db.select(&QueryBuilder::table("todos").for_update())
+                .is_ok()
+        );
+        assert!(
+            db.select(&QueryBuilder::table("todos").for_update().skip_locked())
+                .is_err()
+        );
     }
 
     #[test]
@@ -976,12 +972,14 @@ mod tests {
             .unwrap();
         }
         assert_eq!(db.count(&QueryBuilder::table("todos")).unwrap(), 7);
-        assert!(db
-            .exists(&QueryBuilder::table("todos").filter("id", "=", Value::Int(3)))
-            .unwrap());
-        assert!(!db
-            .exists(&QueryBuilder::table("todos").filter("id", "=", Value::Int(99)))
-            .unwrap());
+        assert!(
+            db.exists(&QueryBuilder::table("todos").filter("id", "=", Value::Int(3)))
+                .unwrap()
+        );
+        assert!(
+            !db.exists(&QueryBuilder::table("todos").filter("id", "=", Value::Int(99)))
+                .unwrap()
+        );
 
         let page = db
             .paginate(&QueryBuilder::table("todos").order_by("id", false), 2, 3)

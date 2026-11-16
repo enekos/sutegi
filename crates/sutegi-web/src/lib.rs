@@ -9,8 +9,8 @@
 
 use std::any::{Any, TypeId};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use std::time::Duration;
 pub use sutegi_http::{
@@ -960,23 +960,22 @@ impl App {
                 ]),
             ),
         ];
-        #[allow(unused_mut)]
         let mut caps = self
             .capabilities
             .clone()
             .unwrap_or_else(|| Json::obj(vec![]));
         #[cfg(feature = "ws")]
-        if self.ws_runtime.is_some() {
-            if let Json::Obj(ref mut values) = caps {
-                values.insert("ws_backpressure".into(), Json::Bool(true));
-                values.insert("ws_handler_dispatch".into(), Json::str("opt-in"));
-                values.insert("ws_draining".into(), Json::Bool(true));
-            }
+        if self.ws_runtime.is_some()
+            && let Json::Obj(ref mut values) = caps
+        {
+            values.insert("ws_backpressure".into(), Json::Bool(true));
+            values.insert("ws_handler_dispatch".into(), Json::str("opt-in"));
+            values.insert("ws_draining".into(), Json::Bool(true));
         }
-        if self.routes.iter().any(|r| r.upload.is_some()) {
-            if let Json::Obj(ref mut values) = caps {
-                values.insert("streaming_uploads".into(), Json::Bool(true));
-            }
+        if self.routes.iter().any(|r| r.upload.is_some())
+            && let Json::Obj(ref mut values) = caps
+        {
+            values.insert("streaming_uploads".into(), Json::Bool(true));
         }
         if caps.as_object().is_some_and(|values| !values.is_empty()) {
             doc.push(("capabilities", caps));
@@ -1264,7 +1263,9 @@ impl App {
                     "  WARNING: ops surface (/__introspect /__metrics /__tools*) is PUBLIC — ops_public() with no ops_guard"
                 );
             } else {
-                println!("  ops surface closed (403) — no ops_guard set; only /__health /__ready are served");
+                println!(
+                    "  ops surface closed (403) — no ops_guard set; only /__health /__ready are served"
+                );
             }
         }
         if !self.listeners.is_empty() {
@@ -1364,7 +1365,13 @@ fn manifest_entry(name: &str, description: &str, parameters: Json, streaming: bo
 
 /// Validate `args` against a tool's declared schema (when the `validate` feature
 /// is on); returns a ready `422` [`Error`] on failure.
-#[allow(unused_variables)]
+#[cfg_attr(
+    not(feature = "validate"),
+    expect(
+        unused_variables,
+        reason = "the arguments are read only by the validator"
+    )
+)]
 fn validate_tool_args(schema: &Json, args: &Json) -> Result<(), Error> {
     #[cfg(feature = "validate")]
     if let Err(errs) = sutegi_validate::validate_schema(schema, args) {
@@ -1411,7 +1418,7 @@ fn tool_stream(defs: &Arc<Vec<ToolDef>>, c: &Ctx) -> Response {
     let def = match defs.iter().find(|d| d.name == name && d.is_stream()) {
         Some(d) => d,
         None => {
-            return Error::not_found(format!("unknown streaming tool '{name}'")).into_response()
+            return Error::not_found(format!("unknown streaming tool '{name}'")).into_response();
         }
     };
     if let Err(e) = validate_tool_args(&def.schema, &args) {
@@ -1424,10 +1431,10 @@ fn tool_stream(defs: &Arc<Vec<ToolDef>>, c: &Ctx) -> Response {
     };
     let defs = Arc::clone(defs);
     sse(move |sink| {
-        if let Some(def) = defs.iter().find(|d| d.name == name && d.is_stream()) {
-            if let ToolBody::Stream(f) = &def.body {
-                return f(&tctx, args, sink);
-            }
+        if let Some(def) = defs.iter().find(|d| d.name == name && d.is_stream())
+            && let ToolBody::Stream(f) = &def.body
+        {
+            return f(&tctx, args, sink);
         }
         Ok(())
     })
@@ -1435,7 +1442,7 @@ fn tool_stream(defs: &Arc<Vec<ToolDef>>, c: &Ctx) -> Response {
 
 /// SIGTERM/SIGINT handling for graceful shutdown (only with the `graceful` feature).
 #[cfg(feature = "graceful")]
-#[allow(unsafe_code)]
+#[expect(unsafe_code, reason = "installing a signal handler is a libc call")]
 mod signal {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, OnceLock};
@@ -1650,9 +1657,7 @@ pub fn logger() -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static
 
 /// A pre-middleware that answers CORS preflight (`OPTIONS`) with `204` and the
 /// permitted origin. Pair with [`cors`] (an after-middleware) for full CORS.
-pub fn cors_preflight(
-    origin: &str,
-) -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static {
+pub fn cors_preflight(origin: &str) -> impl Fn(&Request) -> Option<Response> + Send + Sync + use<> {
     let origin = origin.to_string();
     move |req: &Request| {
         if req.method == Method::Options {
@@ -1673,7 +1678,7 @@ pub fn cors_preflight(
 
 /// An after-middleware that stamps `Access-Control-Allow-Origin` onto every
 /// response. Register with [`App::after`].
-pub fn cors(origin: &str) -> impl Fn(&Request, Response) -> Response + Send + Sync + 'static {
+pub fn cors(origin: &str) -> impl Fn(&Request, Response) -> Response + Send + Sync + use<> {
     let origin = origin.to_string();
     move |_req: &Request, resp: Response| resp.with_header("access-control-allow-origin", &origin)
 }
@@ -1702,7 +1707,7 @@ pub fn cors(origin: &str) -> impl Fn(&Request, Response) -> Response + Send + Sy
 /// discards is the confusing half-configured state.
 pub fn cors_preflight_credentialed(
     origin: &str,
-) -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static {
+) -> impl Fn(&Request) -> Option<Response> + Send + Sync + use<> {
     let origin = origin.to_string();
     move |req: &Request| {
         if req.method != Method::Options {
@@ -1737,7 +1742,7 @@ pub fn cors_preflight_credentialed(
 /// server answers, and the browser refuses to hand the body to the page.
 pub fn cors_credentialed(
     origin: &str,
-) -> impl Fn(&Request, Response) -> Response + Send + Sync + 'static {
+) -> impl Fn(&Request, Response) -> Response + Send + Sync + use<> {
     let origin = origin.to_string();
     move |_req: &Request, resp: Response| {
         // Idempotent, because this also runs over the responses the preflight
@@ -1760,7 +1765,7 @@ pub fn cors_credentialed(
 
 /// A pre-middleware requiring `Authorization: Bearer <token>`; else `401`.
 /// The header is compared in constant time (no early exit on a mismatch).
-pub fn bearer(token: &str) -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static {
+pub fn bearer(token: &str) -> impl Fn(&Request) -> Option<Response> + Send + Sync + use<> {
     let expected = format!("Bearer {}", token);
     move |req: &Request| match req.header("authorization") {
         Some(h) if sutegi_crypto::constant_time_eq(h.as_bytes(), expected.as_bytes()) => None,
@@ -1772,7 +1777,7 @@ pub fn bearer(token: &str) -> impl Fn(&Request) -> Option<Response> + Send + Syn
 pub fn basic(
     user: &str,
     pass: &str,
-) -> impl Fn(&Request) -> Option<Response> + Send + Sync + 'static {
+) -> impl Fn(&Request) -> Option<Response> + Send + Sync + use<> {
     let expected = format!(
         "Basic {}",
         sutegi_crypto::base64_encode(format!("{}:{}", user, pass).as_bytes())
@@ -1961,7 +1966,7 @@ fn url_decode(s: &str) -> String {
             }
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    String::from_utf8_lossy_owned(out)
 }
 
 fn hex_val(b: u8) -> Option<u8> {
@@ -2118,10 +2123,11 @@ mod tests {
         assert_eq!(redirect("/login").status, 302);
         assert_eq!(no_content().status, 204);
         let h = html(200, "<p>hi</p>");
-        assert!(h
-            .headers
-            .iter()
-            .any(|(k, v)| k == "content-type" && v.contains("text/html")));
+        assert!(
+            h.headers
+                .iter()
+                .any(|(k, v)| k == "content-type" && v.contains("text/html"))
+        );
     }
 
     #[test]
@@ -2254,10 +2260,11 @@ mod tests {
     fn json_and_text_helpers_set_content_type() {
         let j = json(201, &Json::obj(vec![("ok", Json::Bool(true))]));
         assert_eq!(j.status, 201);
-        assert!(j
-            .headers
-            .iter()
-            .any(|(k, v)| k == "content-type" && v.contains("application/json")));
+        assert!(
+            j.headers
+                .iter()
+                .any(|(k, v)| k == "content-type" && v.contains("application/json"))
+        );
         assert_eq!(status(204).status, 204);
         assert_eq!(not_found().status, 404);
     }
@@ -2268,19 +2275,22 @@ mod tests {
         // OPTIONS is answered with 204 + allow-origin.
         let resp = pre(&req(Method::Options, b"")).unwrap();
         assert_eq!(resp.status, 204);
-        assert!(resp
-            .headers
-            .iter()
-            .any(|(k, v)| k == "access-control-allow-origin" && v == "https://join.com"));
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(k, v)| k == "access-control-allow-origin" && v == "https://join.com")
+        );
         // Non-OPTIONS passes through.
         assert!(pre(&req(Method::Get, b"")).is_none());
         // The after-middleware stamps the header on any response.
         let after = cors("*");
         let stamped = after(&req(Method::Get, b""), Response::new(200));
-        assert!(stamped
-            .headers
-            .iter()
-            .any(|(k, v)| k == "access-control-allow-origin" && v == "*"));
+        assert!(
+            stamped
+                .headers
+                .iter()
+                .any(|(k, v)| k == "access-control-allow-origin" && v == "*")
+        );
     }
 
     /// The header a credentialed frontend cannot work without, on **both**
@@ -2343,14 +2353,16 @@ mod tests {
             "content-type".into(),
         ));
         let resp = cors_preflight_credentialed("https://app.hirusta.io")(&r).unwrap();
-        assert!(resp
-            .headers
-            .iter()
-            .any(|(k, v)| k == "access-control-allow-headers" && v == "content-type"));
-        assert!(resp
-            .headers
-            .iter()
-            .any(|(k, v)| k == "access-control-allow-headers" && v != "*"));
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(k, v)| k == "access-control-allow-headers" && v == "content-type")
+        );
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(k, v)| k == "access-control-allow-headers" && v != "*")
+        );
     }
 
     #[test]
@@ -2372,10 +2384,12 @@ mod tests {
         // Wrong / missing creds → 401 with a Basic challenge.
         let denied = guard(&req(Method::Get, b"")).unwrap();
         assert_eq!(denied.status, 401);
-        assert!(denied
-            .headers
-            .iter()
-            .any(|(k, v)| k == "www-authenticate" && v.contains("Basic")));
+        assert!(
+            denied
+                .headers
+                .iter()
+                .any(|(k, v)| k == "www-authenticate" && v.contains("Basic"))
+        );
         // base64("user:pass") == "dXNlcjpwYXNz".
         let mut r = req(Method::Get, b"");
         r.headers
@@ -2442,9 +2456,11 @@ mod tests {
         });
         let rid = header_of(&resp, REQUEST_ID_HEADER).expect("rid stamped");
         assert_eq!(records.len(), 2);
-        assert!(records
-            .iter()
-            .all(|r| r.field("rid").map(|v| v.to_string()) == Some(rid.clone())));
+        assert!(
+            records
+                .iter()
+                .all(|r| r.field("rid").map(|v| v.to_string()) == Some(rid.clone()))
+        );
         let access = &records[1];
         assert_eq!(
             (access.target.as_str(), access.msg.as_str()),

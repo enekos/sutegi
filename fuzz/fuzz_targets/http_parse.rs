@@ -5,7 +5,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use std::io::BufReader;
-use sutegi_http::{parse_request, Limits};
+use sutegi_http::{Limits, parse_request};
 
 fuzz_target!(|data: &[u8]| {
     let limits = Limits::default();

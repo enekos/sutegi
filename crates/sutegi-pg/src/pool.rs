@@ -2,6 +2,7 @@
 //! `max_size`; a checked-out connection is returned to the pool on drop unless
 //! it went bad, in which case it is discarded and the slot frees up.
 
+use std::mem::DropGuard;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
@@ -58,12 +59,12 @@ impl Pool {
     /// is one whose `f` panicked — its slot is released either way.
     pub fn with<T>(&self, f: impl FnOnce(&mut Client) -> Result<T, String>) -> Result<T, String> {
         let mut client = self.checkout()?;
-        let slot = Slot::reserve(self);
+        let slot = self.reserve_slot();
         let result = f(&mut client);
         if result.is_err() && !client.ping() {
             drop(slot);
         } else {
-            slot.keep();
+            DropGuard::dismiss(slot);
             self.checkin(client);
         }
         result
@@ -109,9 +110,9 @@ impl Pool {
                 // slot rolls back on drop, so neither an error nor a panic in
                 // `connect` leaks the reservation.
                 drop(inner);
-                let slot = Slot::reserve(self);
+                let slot = self.reserve_slot();
                 let client = connect(&self.cfg)?;
-                slot.keep();
+                DropGuard::dismiss(slot);
                 return Ok(client);
             }
             // Pool is full: wait for a connection to be returned.
@@ -139,6 +140,13 @@ impl Pool {
         self.state.1.notify_one();
     }
 
+    /// One reserved unit of `open`. Dropping the guard — on an error path or
+    /// while unwinding — gives the slot back and wakes a waiter; dismissing it
+    /// hands the slot to a live connection.
+    fn reserve_slot(&self) -> DropGuard<&Pool, fn(&Pool)> {
+        DropGuard::new(self, Pool::discard)
+    }
+
     fn discard(&self) {
         let mut inner = self.lock();
         inner.open = inner.open.saturating_sub(1);
@@ -147,34 +155,9 @@ impl Pool {
 
     /// Poison is recovered, not propagated: `Inner` is a counter and a stack of
     /// idle connections, valid whatever a panicking holder was doing — and the
-    /// [`Slot`] drop that runs during unwinding must not panic again.
+    /// slot guard that runs during unwinding must not panic again.
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.state.0.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-/// One reserved unit of `open`. Dropping it gives the slot back (and wakes a
-/// waiter); [`Slot::keep`] hands ownership of the slot to a live connection.
-struct Slot<'p> {
-    pool: &'p Pool,
-    armed: bool,
-}
-
-impl<'p> Slot<'p> {
-    fn reserve(pool: &'p Pool) -> Slot<'p> {
-        Slot { pool, armed: true }
-    }
-
-    fn keep(mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for Slot<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            self.pool.discard();
-        }
     }
 }
 

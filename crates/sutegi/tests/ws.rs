@@ -96,9 +96,11 @@ fn full_handshake_and_echo() {
             .any(|l| l.eq_ignore_ascii_case("sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")),
         "{lines:?}"
     );
-    assert!(!lines
-        .iter()
-        .any(|l| l.to_ascii_lowercase().starts_with("content-")));
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.to_ascii_lowercase().starts_with("content-"))
+    );
 
     stream.write_all(&client_text(b"hello")).unwrap();
     assert_eq!(read_text(&mut stream), b"echo:hello");

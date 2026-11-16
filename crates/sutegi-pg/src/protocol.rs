@@ -222,7 +222,7 @@ impl Client {
                     return Err(format!(
                         "unexpected message {:?} during authentication",
                         other as char
-                    ))
+                    ));
                 }
             }
         }

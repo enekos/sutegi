@@ -186,12 +186,11 @@ fn unmask(payload: &mut [u8], mask: [u8; 4]) {
     let m64 = u64::from_ne_bytes([
         mask[0], mask[1], mask[2], mask[3], mask[0], mask[1], mask[2], mask[3],
     ]);
-    let mut chunks = payload.chunks_exact_mut(8);
-    for chunk in &mut chunks {
-        let v = u64::from_ne_bytes(chunk.try_into().unwrap()) ^ m64;
-        chunk.copy_from_slice(&v.to_ne_bytes());
+    let (words, rest) = payload.as_chunks_mut::<8>();
+    for word in words {
+        *word = (u64::from_ne_bytes(*word) ^ m64).to_ne_bytes();
     }
-    for (i, b) in chunks.into_remainder().iter_mut().enumerate() {
+    for (i, b) in rest.iter_mut().enumerate() {
         // The remainder starts at an offset divisible by 8, so the mask
         // rotation is still aligned to `i & 3`.
         *b ^= mask[i & 3];

@@ -169,7 +169,7 @@ pub fn parse_dotenv(contents: &str) -> Vec<(String, String)> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let line = line.strip_prefix("export ").unwrap_or(line);
+        let line = line.trim_prefix("export ");
         let (key, value) = match line.split_once('=') {
             Some(kv) => kv,
             None => continue,

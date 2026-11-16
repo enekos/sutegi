@@ -13,7 +13,7 @@
 
 use sutegi::channels::JS_CLIENT;
 use sutegi::prelude::*;
-use sutegi::pubsub::{sutegi_pg, PgPubSub};
+use sutegi::pubsub::{PgPubSub, sutegi_pg};
 
 fn room() -> Channel {
     Channel::new("room:*")

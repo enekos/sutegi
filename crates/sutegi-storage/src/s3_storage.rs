@@ -36,7 +36,7 @@
 
 use crate::s3::{civil_from_days, days_from_civil, encode_query, now_secs};
 use crate::transport::{HttpRequest, HttpResponse, HttpTransport};
-use crate::{content_type_of, validate_key, ObjectMeta, S3Store, Storage};
+use crate::{ObjectMeta, S3Store, Storage, content_type_of, validate_key};
 use sutegi_crypto::{hex, md5};
 
 /// Objects requested per `ListObjectsV2` page (the S3 maximum).
@@ -358,7 +358,7 @@ fn percent_decode(s: &str) -> String {
         out.push(b[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    String::from_utf8_lossy_owned(out)
 }
 
 /// `Fri, 24 May 2013 00:00:00 GMT` (RFC 7231 IMF-fixdate) → unix seconds.
@@ -507,9 +507,10 @@ mod tests {
             sent.header("x-amz-content-sha256"),
             hex(&sutegi_crypto::sha256(b"hello"))
         );
-        assert!(sent
-            .header("authorization")
-            .starts_with("AWS4-HMAC-SHA256 Credential=AK/"));
+        assert!(
+            sent.header("authorization")
+                .starts_with("AWS4-HMAC-SHA256 Credential=AK/")
+        );
         assert_eq!(sent.header("host"), "acct.r2.cloudflarestorage.com");
     }
 
@@ -643,9 +644,11 @@ mod tests {
              ?encoding-type=url&list-type=2&max-keys=1000&prefix=logs%2F"
         );
         // The continuation token is sorted first and URI-encoded.
-        assert!(seen[1]
-            .url
-            .contains("?continuation-token=tok%2F2%2Bx&encoding-type=url"));
+        assert!(
+            seen[1]
+                .url
+                .contains("?continuation-token=tok%2F2%2Bx&encoding-type=url")
+        );
     }
 
     #[test]

@@ -21,16 +21,16 @@ use std::net::TcpStream;
 use std::thread;
 use std::time::Duration;
 
-use aatxe_bench::{bench, keep, Suite};
+use aatxe_bench::{Suite, bench, keep};
 
-use sutegi::http::{parse_request, Limits, Method};
+use sutegi::http::{Limits, Method, Response, parse_request, write_response};
 use sutegi::json::Json;
 use sutegi::orm::db::Db;
 use sutegi::orm::{QueryBuilder, UpdateBuilder, Value};
 use sutegi::prelude::*;
-use sutegi::validate::{validate_schema, Rule, Ruleset};
-use sutegi::ws::protocol::{decode_frame, encode_frame, Opcode};
+use sutegi::validate::{Rule, Ruleset, validate_schema};
 use sutegi::ws::accept_key;
+use sutegi::ws::protocol::{Opcode, decode_frame, encode_frame};
 
 const ADDR: &str = "127.0.0.1:18099";
 
@@ -52,6 +52,32 @@ fn main() {
     });
     bench(&mut suite, "json_pretty", || {
         keep(value.to_pretty());
+    });
+
+    // Integer-heavy payload (an id list + paging envelope): isolates the
+    // integer path of the serializer from string escaping.
+    let ids = Json::parse(&format!(
+        "{{\"total\":12345,\"page\":7,\"ids\":[{}]}}",
+        (100_000..100_064)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    ))
+    .unwrap();
+    bench(&mut suite, "json_serialize_ints", || {
+        keep(ids.to_string());
+    });
+
+    // --- HTTP/1.1 response head + small body, into a reused buffer ---
+    let mut sink: Vec<u8> = Vec::with_capacity(1024);
+    bench(&mut suite, "http_write_response", || {
+        sink.clear();
+        let resp = Response::new(200)
+            .with_header("content-type", "application/json")
+            .with_header("x-request-id", "a1b2c3d400000001")
+            .with_body(&br#"{"ok":true}"#[..]);
+        write_response(&mut sink, resp, true).unwrap();
+        keep(sink.len());
     });
 
     // --- HTTP/1.1 request parsing ---
@@ -81,6 +107,21 @@ fn main() {
             .unwrap();
         keep(built);
     });
+
+    // --- `?` → `$n` placeholder rewrite (every Postgres query goes through it) ---
+    #[cfg(feature = "postgres")]
+    {
+        let sql = QueryBuilder::table("events")
+            .filter("kind", "=", Value::Text("x".into()))
+            .filter_in("id", (0..12).map(Value::Int).collect())
+            .limit(20)
+            .build()
+            .unwrap()
+            .0;
+        bench(&mut suite, "pg_placeholders", || {
+            keep(sutegi::orm::pg::to_pg_placeholders(&sql));
+        });
+    }
 
     // --- ORM update-builder emission ---
     bench(&mut suite, "update_builder", || {

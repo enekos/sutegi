@@ -8,8 +8,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::{
-    spawn_on_shared, Actor, ActorRef, ActorStatus, Envelope, Exit, ExitReason, ExitSink, Registry,
-    Shared,
+    Actor, ActorRef, ActorStatus, Envelope, Exit, ExitReason, ExitSink, Registry, Shared,
+    spawn_on_shared,
 };
 
 /// When a child is (re)started after exiting.
@@ -63,10 +63,10 @@ impl ChildSpec {
             restart: Restart::Permanent,
             backoff: Duration::ZERO,
             mailbox: 1024,
-            start: Box::new(move |shared, gen, sink| {
+            start: Box::new(move |shared, generation, sink| {
                 let mailbox = shared.mailbox_cap();
                 let actor = factory();
-                let (aref, join) = spawn_on_shared(actor, shared, mailbox, gen, Some(sink));
+                let (aref, join) = spawn_on_shared(actor, shared, mailbox, generation, Some(sink));
                 let stop_tx = aref.tx.clone();
                 let stop: StopFn = Box::new(move || {
                     let _ = stop_tx.send(Envelope::Stop);
@@ -110,20 +110,23 @@ struct Child {
     entry: Arc<ChildEntry>,
     stop: Option<StopFn>,
     join: Option<JoinHandle<()>>,
-    /// Incremented on every start; matched against [`Exit::gen`].
-    gen: u64,
+    /// Incremented on every start; matched against [`Exit::generation`].
+    generation: u64,
 }
 
 impl Child {
     /// (Re)start this child: fresh actor from the factory, same Shared (so
     /// restart counts accumulate in the registry).
     fn start(&mut self, sink: &ExitSink) {
-        if self.gen > 0 {
+        if self.generation > 0 {
             self.entry.shared.reset_for_restart();
         }
-        self.gen += 1;
-        let (tx, stop, join) =
-            (self.spec.start)(Arc::clone(&self.entry.shared), self.gen, sink.clone());
+        self.generation += 1;
+        let (tx, stop, join) = (self.spec.start)(
+            Arc::clone(&self.entry.shared),
+            self.generation,
+            sink.clone(),
+        );
         *self.entry.tx.lock().unwrap() = Some(tx);
         self.stop = Some(stop);
         self.join = Some(join);
@@ -396,7 +399,7 @@ fn run_supervisor(
             entry,
             stop: None,
             join: None,
-            gen: 0,
+            generation: 0,
         })
         .collect();
     for child in &mut children {
@@ -409,10 +412,9 @@ fn run_supervisor(
         match msg {
             SupMsg::Shutdown => break,
             SupMsg::Exit(exit) => {
-                let Some(idx) = children
-                    .iter()
-                    .position(|c| c.entry.shared.id() == exit.id && c.gen == exit.gen)
-                else {
+                let Some(idx) = children.iter().position(|c| {
+                    c.entry.shared.id() == exit.id && c.generation == exit.generation
+                }) else {
                     continue; // stale exit from a generation we already replaced
                 };
                 // Reap the dead thread.
@@ -719,11 +721,12 @@ mod tests {
             .child(ChildSpec::new("bomber", || AlwaysBombs))
             .start();
         wait_for(|| sup.status().state == SupervisorState::Failed);
-        assert!(sup
-            .status()
-            .children
-            .iter()
-            .all(|c| c.state != ActorState::Running));
+        assert!(
+            sup.status()
+                .children
+                .iter()
+                .all(|c| c.state != ActorState::Running)
+        );
     }
 
     #[test]

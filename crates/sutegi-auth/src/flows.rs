@@ -19,7 +19,7 @@
 //! ```
 
 use crate::links::Links;
-use crate::users::{now_secs, User, Users};
+use crate::users::{User, Users, now_secs};
 use std::sync::Arc;
 use sutegi_mail::{Mailer, Theme};
 use sutegi_orm::Backend;
@@ -255,10 +255,11 @@ mod tests {
             .unwrap();
         assert!(confirmed.is_verified());
         // Idempotent, and garbage tokens are just None.
-        assert!(mail
-            .confirm_email(&users, &token_of(&url))
-            .unwrap()
-            .is_some());
+        assert!(
+            mail.confirm_email(&users, &token_of(&url))
+                .unwrap()
+                .is_some()
+        );
         assert!(mail.confirm_email(&users, "junk").unwrap().is_none());
     }
 
@@ -273,24 +274,31 @@ mod tests {
 
         let reset = mail.reset_password(&users, &token, "newpassword1").unwrap();
         assert!(reset.is_some());
-        assert!(users
-            .authenticate("r@a.co", "newpassword1")
-            .unwrap()
-            .is_some());
-        assert!(users
-            .authenticate("r@a.co", "oldpassword")
-            .unwrap()
-            .is_none());
+        assert!(
+            users
+                .authenticate("r@a.co", "newpassword1")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            users
+                .authenticate("r@a.co", "oldpassword")
+                .unwrap()
+                .is_none()
+        );
 
         // The same link is dead now — the hash binding changed.
-        assert!(mail
-            .reset_password(&users, &token, "another-pass1")
-            .unwrap()
-            .is_none());
-        assert!(users
-            .authenticate("r@a.co", "newpassword1")
-            .unwrap()
-            .is_some());
+        assert!(
+            mail.reset_password(&users, &token, "another-pass1")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            users
+                .authenticate("r@a.co", "newpassword1")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -312,10 +320,11 @@ mod tests {
             ..mail
         };
         let url = mail.send_verification(&user).unwrap();
-        assert!(mail
-            .confirm_email(&users, &token_of(&url))
-            .unwrap()
-            .is_none());
+        assert!(
+            mail.confirm_email(&users, &token_of(&url))
+                .unwrap()
+                .is_none()
+        );
         assert!(!users.find(user.id).unwrap().unwrap().is_verified());
     }
 

@@ -11,10 +11,11 @@ mod lifecycle;
 pub use lifecycle::{Lifecycle, Phase};
 
 use std::borrow::Cow;
+use std::fmt::NumBuffer;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -112,10 +113,10 @@ impl Request {
         let header = self.header("cookie")?;
         for pair in header.split(';') {
             let pair = pair.trim();
-            if let Some((k, v)) = pair.split_once('=') {
-                if k.trim() == name {
-                    return Some(v.trim().to_string());
-                }
+            if let Some((k, v)) = pair.split_once('=')
+                && k.trim() == name
+            {
+                return Some(v.trim().to_string());
             }
         }
         None
@@ -349,6 +350,7 @@ impl Default for Limits {
 }
 
 /// The outcome of parsing one request off the connection.
+#[derive(Debug)]
 pub enum Incoming {
     /// A well-formed request, ready to hand to the handler.
     Request(Request),
@@ -618,7 +620,7 @@ fn read_buffered_body<R: Read>(
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "incomplete request body",
-                ))
+                ));
             }
             Ok(n) => filled += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -656,6 +658,12 @@ pub fn write_response<W: Write>(w: &mut W, resp: Response, keep_alive: bool) -> 
     write_head_and_body(w, resp, keep_alive, false)
 }
 
+fn push_content_length(head: &mut String, length: u64) {
+    head.push_str("content-length: ");
+    head.push_str(length.format_into(&mut NumBuffer::new()));
+    head.push_str("\r\n");
+}
+
 /// Like [`write_response`], but when `head_only` is set (a `HEAD` request) the
 /// status line and headers — including the exact `Content-Length` a `GET` would
 /// have produced — are written and the body bytes (or stream producer) are
@@ -666,12 +674,14 @@ fn write_head_and_body<W: Write>(
     keep_alive: bool,
     head_only: bool,
 ) -> io::Result<()> {
-    use std::fmt::Write as _;
-
-    let reason = status_reason(resp.status);
-    // One growable buffer for the whole head — no per-header `format!` allocs.
+    // One growable buffer for the whole head — no per-header `format!` allocs,
+    // and numbers go through `format_into` rather than the `fmt` machinery.
     let mut head = String::with_capacity(256);
-    let _ = write!(head, "HTTP/1.1 {} {}\r\n", resp.status, reason);
+    head.push_str("HTTP/1.1 ");
+    head.push_str(resp.status.format_into(&mut NumBuffer::new()));
+    head.push(' ');
+    head.push_str(status_reason(resp.status));
+    head.push_str("\r\n");
     let mut has_content_type = false;
     // Upgrade heads are written verbatim (the app's `connection: upgrade` is
     // the point); every other body's framing belongs to the server.
@@ -704,7 +714,7 @@ fn write_head_and_body<W: Write>(
 
     match resp.body {
         Body::Full(bytes) => {
-            let _ = write!(head, "content-length: {}\r\n", bytes.len());
+            push_content_length(&mut head, bytes.len() as u64);
             head.push_str(if keep_alive {
                 "connection: keep-alive\r\n\r\n"
             } else {
@@ -729,7 +739,7 @@ fn write_head_and_body<W: Write>(
             w.flush()
         }
         Body::Reader { reader, length } => {
-            let _ = write!(head, "content-length: {length}\r\n");
+            push_content_length(&mut head, length);
             head.push_str(if keep_alive {
                 "connection: keep-alive\r\n\r\n"
             } else {
@@ -1034,21 +1044,23 @@ fn spawn_accept_waker(local: std::net::SocketAddr, lifecycle: Lifecycle) {
     }
     let _ = thread::Builder::new()
         .name("sutegi-http-accept-waker".into())
-        .spawn(move || loop {
-            match lifecycle.phase() {
-                Phase::Stopped => {
-                    let _ = TcpStream::connect_timeout(&target, Duration::from_secs(1));
-                    return;
-                }
-                Phase::Draining => {
-                    let left = lifecycle.deadline().map_or(Duration::ZERO, |d| {
-                        d.saturating_duration_since(Instant::now())
-                    });
-                    let _ = rx.recv_timeout(left.max(Duration::from_millis(1)));
-                }
-                Phase::Running => {
-                    if rx.recv().is_err() {
+        .spawn(move || {
+            loop {
+                match lifecycle.phase() {
+                    Phase::Stopped => {
+                        let _ = TcpStream::connect_timeout(&target, Duration::from_secs(1));
                         return;
+                    }
+                    Phase::Draining => {
+                        let left = lifecycle.deadline().map_or(Duration::ZERO, |d| {
+                            d.saturating_duration_since(Instant::now())
+                        });
+                        let _ = rx.recv_timeout(left.max(Duration::from_millis(1)));
+                    }
+                    Phase::Running => {
+                        if rx.recv().is_err() {
+                            return;
+                        }
                     }
                 }
             }
@@ -1150,8 +1162,8 @@ where
                     write_upgrade_head(&mut writer, resp.status, &resp.headers)?;
                     let leftover = reader.buffer().to_vec();
                     drop(reader); // closes the try_clone'd read handle
-                                  // Upgraded sockets are event-loop-managed; per-op
-                                  // timeouts belong to the blocking HTTP path.
+                    // Upgraded sockets are event-loop-managed; per-op
+                    // timeouts belong to the blocking HTTP path.
                     let _ = writer.set_read_timeout(None);
                     let _ = writer.set_write_timeout(None);
                     // Panic isolation: the takeover is app code too. A panic
@@ -1271,20 +1283,22 @@ impl ThreadPool {
             let queued = Arc::clone(&queued);
             let worker = thread::Builder::new()
                 .name(format!("sutegi-http-{i}"))
-                .spawn(move || loop {
-                    let job = receiver
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .recv();
-                    match job {
-                        Ok(job) => {
-                            queued.fetch_sub(1, Ordering::AcqRel);
-                            if cancel.load(Ordering::Acquire) {
-                                continue;
+                .spawn(move || {
+                    loop {
+                        let job = receiver
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .recv();
+                        match job {
+                            Ok(job) => {
+                                queued.fetch_sub(1, Ordering::AcqRel);
+                                if cancel.load(Ordering::Acquire) {
+                                    continue;
+                                }
+                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
                             }
-                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                            Err(_) => break,
                         }
-                        Err(_) => break,
                     }
                 })
                 .expect("spawn http worker thread");
@@ -1359,6 +1373,7 @@ impl Drop for ThreadPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[test]
     fn sized_readers_frame_head_and_reject_truncation() {
@@ -1420,10 +1435,10 @@ mod tests {
             max_body: 100,
             ..Limits::default()
         };
-        assert!(matches!(
+        assert_matches!(
             parse_request(&mut reader, &limits).unwrap(),
             Some(Incoming::TooLarge)
-        ));
+        );
     }
 
     #[test]
@@ -1520,18 +1535,20 @@ mod tests {
             max_header_bytes: 100,
             ..Limits::default()
         };
-        assert!(matches!(
+        assert_matches!(
             parse_request(&mut reader, &limits).unwrap(),
             Some(Incoming::TooLarge)
-        ));
+        );
     }
 
     #[test]
     fn empty_stream_yields_none() {
         let mut reader = BufReader::new(&b""[..]);
-        assert!(parse_request(&mut reader, &Limits::default())
-            .unwrap()
-            .is_none());
+        assert!(
+            parse_request(&mut reader, &Limits::default())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1647,10 +1664,10 @@ mod tests {
                 let n = stream.read(&mut chunk).unwrap();
                 assert!(n > 0, "connection closed mid-response");
                 buf.extend_from_slice(&chunk[..n]);
-                if let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                    if buf.len() >= head_end + 4 + 2 {
-                        return String::from_utf8_lossy(&buf).into_owned();
-                    }
+                if let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                    && buf.len() >= head_end + 4 + 2
+                {
+                    return String::from_utf8_lossy(&buf).into_owned();
                 }
             }
         };
@@ -1871,8 +1888,7 @@ mod tests {
         // parsed as a 0-length-body request whose chunk data leaks into the
         // next request on keep-alive (request smuggling, CWE-444). Chunked
         // decoding is intentionally not implemented.
-        let raw =
-            "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let raw = "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
         let mut reader = BufReader::new(raw.as_bytes());
         match parse_request(&mut reader, &Limits::default()).unwrap() {
             Some(Incoming::Reject { status }) => assert_eq!(status, 501),

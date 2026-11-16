@@ -3,10 +3,11 @@
 //! (CI provides a postgres:16 service). One sequential test fn: the store
 //! tables are shared fixtures, so the phases must not interleave.
 
+use std::assert_matches;
 use std::sync::Arc;
 use std::thread;
 
-use sutegi_events::{append_tx, event, EventError, EventStore, Expected, Projections};
+use sutegi_events::{EventError, EventStore, Expected, Projections, append_tx, event};
 use sutegi_json::Json;
 use sutegi_orm::pg::Pg;
 use sutegi_orm::{Backend, Transactional, Value};
@@ -45,10 +46,10 @@ fn event_sourcing_over_postgres() {
             .unwrap(),
         1
     );
-    assert!(matches!(
+    assert_matches!(
         store.append("account:1", Expected::Version(0), &[deposited(1)]),
         Err(EventError::Conflict { actual: 1, .. })
-    ));
+    );
     assert_eq!(
         store
             .append("account:1", Expected::Version(1), &[deposited(5)])

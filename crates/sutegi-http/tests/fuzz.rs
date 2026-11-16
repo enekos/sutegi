@@ -8,7 +8,7 @@
 //! Deterministic (fixed-seed splitmix64) for reproducibility in CI.
 
 use std::io::BufReader;
-use sutegi_http::{parse_request, Incoming, Limits};
+use sutegi_http::{Incoming, Limits, parse_request};
 
 fn splitmix(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);

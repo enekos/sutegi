@@ -341,7 +341,10 @@ fn open_ws(port: u16, src_port: u16) -> std::io::Result<TcpStream> {
 /// Answers pings inline; returns text payloads.
 /// `socket(2)` + `SO_REUSEADDR`/`SO_REUSEPORT` + `bind(2)` to a chosen source
 /// port + `connect(2)` — what `TcpStream::connect` can't express.
-#[allow(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "raw socket setup the load generator needs; std has no setsockopt"
+)]
 fn connect_bound(src_port: u16, dst_port: u16) -> std::io::Result<TcpStream> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     // SAFETY: plain integer arguments.
