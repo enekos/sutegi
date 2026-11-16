@@ -40,7 +40,9 @@ fn gen_value(seed: &mut u64, depth: u32) -> SVal {
                 SVal::from(n)
             } else {
                 let n = ((splitmix(seed) % 20_000) as f64) / 100.0;
-                serde_json::Number::from_f64(n).map(SVal::Number).unwrap_or(SVal::Null)
+                serde_json::Number::from_f64(n)
+                    .map(SVal::Number)
+                    .unwrap_or(SVal::Null)
             }
         }
         3 => SVal::String(gen_string(seed)),

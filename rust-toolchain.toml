@@ -1,0 +1,9 @@
+# The one toolchain CI, the perf gate and contributors build with. Pinned to an
+# exact release rather than `stable`, so clippy's lint set and codegen only move
+# in a reviewed PR and the bench gate always compares like with like. Bump it
+# together with `rust-version` in Cargo.toml (the fuzz targets keep using
+# `cargo +nightly`).
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

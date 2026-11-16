@@ -8,7 +8,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
+  # Warnings from workspace crates fail the build (Cargo's `build.warnings`).
+  # Unlike RUSTFLAGS="-D warnings" this leaves dependencies alone and doesn't
+  # change the rustc flags, so it doesn't bust the build cache.
+  CARGO_BUILD_WARNINGS: deny
 
 jobs:
   ci:
@@ -40,10 +43,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The exact toolchain and components come from rust-toolchain.toml.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+        run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2
 
@@ -85,6 +87,20 @@ jobs:
       - name: Build (zero-dep core, no default features)
         run: cargo build --no-default-features
 
+  # Early warning for the next toolchain bump: the same lints on the newest
+  # stable. Non-blocking — red here means "new lints or breakage to absorb when
+  # rust-toolchain.toml moves", not "this PR is broken".
+  stable-canary:
+    name: clippy on latest stable (canary)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install latest stable
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - name: Clippy (latest stable)
+        run: cargo +stable clippy --all-targets --all-features -- -D warnings
+
   # Statistical perf gate: run the aatxe bench suite on HEAD and on the base
   # ref, on the same runner, and fail (exit 2) when any bench regresses past
   # the noise gate. PRs only — a single-sided run on a shared runner has no
@@ -105,8 +121,11 @@ jobs:
           repository: enekos/aatxe
           path: aatxe
 
+      # Pinned by sutegi/rust-toolchain.toml, so HEAD and base bench on the
+      # same compiler (once the base ref carries the file too).
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        working-directory: sutegi
+        run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2
         with:

@@ -76,3 +76,4 @@ unsafe_op_in_unsafe_fn = "deny"
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"
 multiple_unsafe_ops_per_block = "deny"
+allow_attributes_without_reason = "deny"

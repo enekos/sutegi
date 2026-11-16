@@ -22,6 +22,9 @@ Three design goals, held simultaneously:
 Markdown, including the [overview](docs/OVERVIEW.md), [Todo tutorial](docs/TUTORIAL.md),
 and 53 reference topics with previous/next navigation.
 
+Requires **Rust 1.100** or newer (edition 2024). Inside this repo, `rustup`
+picks the pinned toolchain from `rust-toolchain.toml` automatically.
+
 ```bash
 OPS_TOKEN=dev-token cargo run -p todo-example -- 127.0.0.1:8080
 ```

@@ -21,16 +21,16 @@ use std::net::TcpStream;
 use std::thread;
 use std::time::Duration;
 
-use aatxe_bench::{bench, keep, Suite};
+use aatxe_bench::{Suite, bench, keep};
 
-use sutegi::http::{parse_request, write_response, Limits, Method, Response};
+use sutegi::http::{Limits, Method, Response, parse_request, write_response};
 use sutegi::json::Json;
 use sutegi::orm::db::Db;
 use sutegi::orm::{QueryBuilder, UpdateBuilder, Value};
 use sutegi::prelude::*;
-use sutegi::validate::{validate_schema, Rule, Ruleset};
-use sutegi::ws::protocol::{decode_frame, encode_frame, Opcode};
+use sutegi::validate::{Rule, Ruleset, validate_schema};
 use sutegi::ws::accept_key;
+use sutegi::ws::protocol::{Opcode, decode_frame, encode_frame};
 
 const ADDR: &str = "127.0.0.1:18099";
 
@@ -58,7 +58,10 @@ fn main() {
     // integer path of the serializer from string escaping.
     let ids = Json::parse(&format!(
         "{{\"total\":12345,\"page\":7,\"ids\":[{}]}}",
-        (100_000..100_064).map(|i| i.to_string()).collect::<Vec<_>>().join(",")
+        (100_000..100_064)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
     ))
     .unwrap();
     bench(&mut suite, "json_serialize_ints", || {
