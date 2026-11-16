@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-16
+
 ### Changed
 
 - **MSRV is now Rust 1.100** (was 1.75), and the workspace is on **edition 2024**. The toolchain is pinned in `rust-toolchain.toml`, so CI, the perf gate and local builds all use the same compiler.
