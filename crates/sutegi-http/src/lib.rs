@@ -112,10 +112,10 @@ impl Request {
         let header = self.header("cookie")?;
         for pair in header.split(';') {
             let pair = pair.trim();
-            if let Some((k, v)) = pair.split_once('=') {
-                if k.trim() == name {
-                    return Some(v.trim().to_string());
-                }
+            if let Some((k, v)) = pair.split_once('=')
+                && k.trim() == name
+            {
+                return Some(v.trim().to_string());
             }
         }
         None
@@ -1653,10 +1653,10 @@ mod tests {
                 let n = stream.read(&mut chunk).unwrap();
                 assert!(n > 0, "connection closed mid-response");
                 buf.extend_from_slice(&chunk[..n]);
-                if let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                    if buf.len() >= head_end + 4 + 2 {
-                        return String::from_utf8_lossy(&buf).into_owned();
-                    }
+                if let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                    && buf.len() >= head_end + 4 + 2
+                {
+                    return String::from_utf8_lossy(&buf).into_owned();
                 }
             }
         };

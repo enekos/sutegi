@@ -121,12 +121,11 @@ impl Sha256 {
         }
 
         // Whole blocks straight from the input, no copy.
-        let mut chunks = data.chunks_exact(64);
-        for block in &mut chunks {
-            sha256_compress(&mut self.h, block.try_into().unwrap());
+        let (blocks, rest) = data.as_chunks::<64>();
+        for block in blocks {
+            sha256_compress(&mut self.h, block);
         }
 
-        let rest = chunks.remainder();
         self.buf[..rest.len()].copy_from_slice(rest);
         self.buf_len = rest.len();
     }
@@ -280,7 +279,7 @@ pub fn sha1(data: &[u8]) -> [u8; 20] {
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
 
-    for block in msg.chunks_exact(64) {
+    for block in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 80];
         for (i, word) in w.iter_mut().enumerate().take(16) {
             let j = i * 4;
@@ -361,7 +360,7 @@ pub fn md5(data: &[u8]) -> [u8; 16] {
     }
     msg.extend_from_slice(&bit_len.to_le_bytes());
 
-    for block in msg.chunks_exact(64) {
+    for block in msg.as_chunks::<64>().0 {
         let mut m = [0u32; 16];
         for (i, word) in m.iter_mut().enumerate() {
             let j = i * 4;
@@ -409,7 +408,7 @@ pub fn hex(bytes: &[u8]) -> String {
 /// Lowercase hex decoding (the inverse of [`hex`]). `None` on odd length or a
 /// non-hex character.
 pub fn from_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())

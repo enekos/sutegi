@@ -351,11 +351,11 @@ pub fn raise_nofile_limit() -> u64 {
 fn max_files_per_proc() -> Option<libc::rlim_t> {
     let mut maxfiles: libc::c_int = 0;
     let mut len = std::mem::size_of::<libc::c_int>();
-    // SAFETY: the name is NUL-terminated; `maxfiles` and `len` describe one
+    // SAFETY: the name is a C string literal; `maxfiles` and `len` describe one
     // writable c_int; no new value is set (null, 0).
     let rc = unsafe {
         libc::sysctlbyname(
-            b"kern.maxfilesperproc\0".as_ptr() as *const libc::c_char,
+            c"kern.maxfilesperproc".as_ptr(),
             &mut maxfiles as *mut libc::c_int as *mut libc::c_void,
             &mut len,
             std::ptr::null_mut(),

@@ -862,10 +862,10 @@ fn pluralize(word: &str) -> String {
 fn option_inner(ty: &Type) -> Option<&Type> {
     if let Type::Path(p) = ty {
         let seg = p.path.segments.last()?;
-        if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
-            if let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
-                return Some(inner);
-            }
+        if let syn::PathArguments::AngleBracketed(args) = &seg.arguments
+            && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
+        {
+            return Some(inner);
         }
     }
     None

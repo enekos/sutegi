@@ -453,17 +453,17 @@ impl Admission {
             self.total.fetch_sub(1, Ordering::AcqRel);
             return false;
         }
-        if self.max_per_ip > 0 {
-            if let Some(ip) = ip {
-                let mut map = self.per_ip.lock().unwrap();
-                let n = map.entry(ip.to_string()).or_insert(0);
-                if *n >= self.max_per_ip {
-                    drop(map);
-                    self.total.fetch_sub(1, Ordering::AcqRel);
-                    return false;
-                }
-                *n += 1;
+        if self.max_per_ip > 0
+            && let Some(ip) = ip
+        {
+            let mut map = self.per_ip.lock().unwrap();
+            let n = map.entry(ip.to_string()).or_insert(0);
+            if *n >= self.max_per_ip {
+                drop(map);
+                self.total.fetch_sub(1, Ordering::AcqRel);
+                return false;
             }
+            *n += 1;
         }
         true
     }
@@ -471,14 +471,14 @@ impl Admission {
     /// Release a previously reserved slot.
     fn release(&self, ip: Option<&str>) {
         self.total.fetch_sub(1, Ordering::AcqRel);
-        if self.max_per_ip > 0 {
-            if let Some(ip) = ip {
-                let mut map = self.per_ip.lock().unwrap();
-                if let Some(n) = map.get_mut(ip) {
-                    *n -= 1;
-                    if *n == 0 {
-                        map.remove(ip);
-                    }
+        if self.max_per_ip > 0
+            && let Some(ip) = ip
+        {
+            let mut map = self.per_ip.lock().unwrap();
+            if let Some(n) = map.get_mut(ip) {
+                *n -= 1;
+                if *n == 0 {
+                    map.remove(ip);
                 }
             }
         }

@@ -498,14 +498,15 @@ fn diff_table(cur: &TableSchema, want: &TableSchema, dialect: Dialect, plan: &mu
     }
     // Changed columns present on both sides.
     for want_col in &want.columns {
-        if let Some(cur_col) = cur.col(&want_col.name) {
-            if !columns_match(cur_col, want_col, dialect) {
-                let op = SchemaOp::AlterColumn {
-                    table: table.clone(),
-                    from: cur_col.clone(),
-                    to: want_col.clone(),
-                };
-                match op.safety() {
+        if let Some(cur_col) = cur.col(&want_col.name)
+            && !columns_match(cur_col, want_col, dialect)
+        {
+            let op = SchemaOp::AlterColumn {
+                table: table.clone(),
+                from: cur_col.clone(),
+                to: want_col.clone(),
+            };
+            match op.safety() {
                     Safety::Destructive => plan.warnings.push(format!(
                         "column `{}.{}` change may lose data or fail on existing rows",
                         table, want_col.name
@@ -516,8 +517,7 @@ fn diff_table(cur: &TableSchema, want: &TableSchema, dialect: Dialect, plan: &mu
                     )),
                     Safety::Safe => {}
                 }
-                plan.ops.push(op);
-            }
+            plan.ops.push(op);
         }
     }
 

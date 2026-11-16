@@ -205,13 +205,13 @@ impl<B: Backend> Users<B> {
                     // Work factor raised since this hash was made? Upgrade it
                     // while we hold the plaintext — best-effort, a rehash
                     // failure must never fail a valid login.
-                    if needs_rehash(hash, self.iterations) {
-                        if let Ok(fresh) = hash_password_with(password, self.iterations) {
-                            let _ = self.backend.execute(
-                                "UPDATE users SET password_hash = ? WHERE id = ?",
-                                &[Value::Text(fresh), Value::Int(user.id)],
-                            );
-                        }
+                    if needs_rehash(hash, self.iterations)
+                        && let Ok(fresh) = hash_password_with(password, self.iterations)
+                    {
+                        let _ = self.backend.execute(
+                            "UPDATE users SET password_hash = ? WHERE id = ?",
+                            &[Value::Text(fresh), Value::Int(user.id)],
+                        );
                     }
                     Ok(Some(user))
                 } else {

@@ -276,10 +276,10 @@ fn worker<B: Backend>(backend: B, registry: Arc<Registry>, rx: Receiver<Feed>) {
             };
             let change = diff(&sub.table, &sub.snapshot, &next);
             sub.snapshot = next;
-            if let Some(change) = change {
-                if sub.out.send(change).is_err() {
-                    dead.push(*id); // subscriber dropped mid-flight
-                }
+            if let Some(change) = change
+                && sub.out.send(change).is_err()
+            {
+                dead.push(*id); // subscriber dropped mid-flight
             }
         }
         for id in dead {

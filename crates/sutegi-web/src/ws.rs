@@ -174,17 +174,16 @@ pub(crate) fn upgrade_response(
         if !ok {
             return Response::new(403).with_body(&b"origin not allowed"[..]);
         }
-    } else if !handlers.allow_any_origin {
-        if let Some(origin) = req.header("origin") {
-            if !same_origin(origin, req.header("host")) {
-                return Response::new(403).with_body(&b"cross-origin upgrade not allowed"[..]);
-            }
-        }
+    } else if !handlers.allow_any_origin
+        && let Some(origin) = req.header("origin")
+        && !same_origin(origin, req.header("host"))
+    {
+        return Response::new(403).with_body(&b"cross-origin upgrade not allowed"[..]);
     }
-    if let Some(authorize) = &handlers.authorize {
-        if !authorize(req) {
-            return Response::new(403).with_body(&b"forbidden"[..]);
-        }
+    if let Some(authorize) = &handlers.authorize
+        && !authorize(req)
+    {
+        return Response::new(403).with_body(&b"forbidden"[..]);
     }
     let existing = handlers.admit_during_drain.as_ref().is_some_and(|f| f(req));
     if runtime.lifecycle().phase() == sutegi_http::Phase::Stopped

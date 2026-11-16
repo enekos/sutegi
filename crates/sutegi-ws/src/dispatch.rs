@@ -209,10 +209,10 @@ fn worker(shared: Arc<Shared>) {
                 }
             }
             Event::Message(msg) => {
-                if !conn.is_closed() {
-                    if let Some(f) = &shared.handlers.on_message {
-                        f(&conn, msg);
-                    }
+                if !conn.is_closed()
+                    && let Some(f) = &shared.handlers.on_message
+                {
+                    f(&conn, msg);
                 }
             }
             Event::Close(code) => {

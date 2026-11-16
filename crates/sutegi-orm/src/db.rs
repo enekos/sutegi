@@ -434,10 +434,10 @@ fn introspect_sqlite(conn: &Connection) -> Result<Vec<TableSchema>, String> {
             if is_pk {
                 col = col.primary();
             }
-            if let Some(d) = c.get("dflt_value").and_then(Json::as_str) {
-                if let Some(v) = parse_default_literal(d) {
-                    col = col.default(v);
-                }
+            if let Some(d) = c.get("dflt_value").and_then(Json::as_str)
+                && let Some(v) = parse_default_literal(d)
+            {
+                col = col.default(v);
             }
             schema.columns.push(col);
         }

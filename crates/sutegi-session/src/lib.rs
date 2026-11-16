@@ -113,21 +113,19 @@ impl Sessions {
     /// Load and verify the session from the request cookie; returns an empty
     /// session if absent, tampered, or malformed.
     pub fn load(&self, req: &Request) -> Session {
-        if let Some(raw) = req.cookie(&self.cookie) {
-            if let Some((payload_hex, sig)) = raw.split_once('.') {
-                if let Some(bytes) = from_hex(payload_hex) {
-                    let expected = self.sign(SESSION_DOMAIN, &bytes);
-                    if constant_time_eq(expected.as_bytes(), sig.as_bytes()) {
-                        if let Ok(s) = std::str::from_utf8(&bytes) {
-                            if let Ok(Json::Obj(map)) = Json::parse(s) {
-                                return Session {
-                                    data: map,
-                                    dirty: false,
-                                };
-                            }
-                        }
-                    }
-                }
+        if let Some(raw) = req.cookie(&self.cookie)
+            && let Some((payload_hex, sig)) = raw.split_once('.')
+            && let Some(bytes) = from_hex(payload_hex)
+        {
+            let expected = self.sign(SESSION_DOMAIN, &bytes);
+            if constant_time_eq(expected.as_bytes(), sig.as_bytes())
+                && let Ok(s) = std::str::from_utf8(&bytes)
+                && let Ok(Json::Obj(map)) = Json::parse(s)
+            {
+                return Session {
+                    data: map,
+                    dirty: false,
+                };
             }
         }
         Session {

@@ -211,7 +211,7 @@ fn list(b: &Bucket, query: &str) -> Vec<u8> {
         .objects
         .keys()
         .filter(|k| k.starts_with(&want))
-        .filter(|k| after.as_ref().map_or(true, |a| *k > a))
+        .filter(|k| after.as_ref().is_none_or(|a| *k > a))
         .collect();
     let page: Vec<&&String> = matching.iter().take(max).collect();
     let truncated = matching.len() > page.len();

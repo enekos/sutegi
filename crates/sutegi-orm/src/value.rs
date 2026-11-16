@@ -552,10 +552,10 @@ pub fn column_from_json(c: &Json) -> Result<Column, String> {
     if c.get("unique").and_then(Json::as_bool) == Some(true) {
         col = col.unique();
     }
-    if let Some(d) = c.get("default") {
-        if !matches!(d, Json::Null) {
-            col = col.default(value_from_json(d)?);
-        }
+    if let Some(d) = c.get("default")
+        && !matches!(d, Json::Null)
+    {
+        col = col.default(value_from_json(d)?);
     }
     Ok(col)
 }

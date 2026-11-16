@@ -966,17 +966,17 @@ impl App {
             .clone()
             .unwrap_or_else(|| Json::obj(vec![]));
         #[cfg(feature = "ws")]
-        if self.ws_runtime.is_some() {
-            if let Json::Obj(ref mut values) = caps {
-                values.insert("ws_backpressure".into(), Json::Bool(true));
-                values.insert("ws_handler_dispatch".into(), Json::str("opt-in"));
-                values.insert("ws_draining".into(), Json::Bool(true));
-            }
+        if self.ws_runtime.is_some()
+            && let Json::Obj(ref mut values) = caps
+        {
+            values.insert("ws_backpressure".into(), Json::Bool(true));
+            values.insert("ws_handler_dispatch".into(), Json::str("opt-in"));
+            values.insert("ws_draining".into(), Json::Bool(true));
         }
-        if self.routes.iter().any(|r| r.upload.is_some()) {
-            if let Json::Obj(ref mut values) = caps {
-                values.insert("streaming_uploads".into(), Json::Bool(true));
-            }
+        if self.routes.iter().any(|r| r.upload.is_some())
+            && let Json::Obj(ref mut values) = caps
+        {
+            values.insert("streaming_uploads".into(), Json::Bool(true));
         }
         if caps.as_object().is_some_and(|values| !values.is_empty()) {
             doc.push(("capabilities", caps));
@@ -1426,10 +1426,10 @@ fn tool_stream(defs: &Arc<Vec<ToolDef>>, c: &Ctx) -> Response {
     };
     let defs = Arc::clone(defs);
     sse(move |sink| {
-        if let Some(def) = defs.iter().find(|d| d.name == name && d.is_stream()) {
-            if let ToolBody::Stream(f) = &def.body {
-                return f(&tctx, args, sink);
-            }
+        if let Some(def) = defs.iter().find(|d| d.name == name && d.is_stream())
+            && let ToolBody::Stream(f) = &def.body
+        {
+            return f(&tctx, args, sink);
         }
         Ok(())
     })

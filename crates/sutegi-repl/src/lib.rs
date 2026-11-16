@@ -403,10 +403,10 @@ impl Repl {
                     .map_err(|e| e.to_string())?;
                 let text = String::from_utf8_lossy(&buf);
                 let text = text.trim();
-                if let Some(status) = text.strip_prefix('[').and_then(|t| t.split(']').next()) {
-                    if text.starts_with('[') && status.chars().all(|c| c.is_ascii_digit()) {
-                        return Err(format!("GET {target} -> {status}"));
-                    }
+                if let Some(status) = text.strip_prefix('[').and_then(|t| t.split(']').next())
+                    && status.bytes().all(|b| b.is_ascii_digit())
+                {
+                    return Err(format!("GET {target} -> {status}"));
                 }
                 Json::parse(text)
             }
@@ -510,10 +510,10 @@ fn header(headers: &[(String, String)], name: &str) -> Option<String> {
 
 fn print_body(out: &mut dyn Write, content_type: &str, bytes: &[u8]) -> io::Result<()> {
     let text = String::from_utf8_lossy(bytes);
-    if content_type.contains("application/json") {
-        if let Ok(j) = Json::parse(&text) {
-            return writeln!(out, "{}", j.to_pretty());
-        }
+    if content_type.contains("application/json")
+        && let Ok(j) = Json::parse(&text)
+    {
+        return writeln!(out, "{}", j.to_pretty());
     }
     writeln!(out, "{}", text.trim_end())
 }

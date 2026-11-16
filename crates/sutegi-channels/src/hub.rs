@@ -803,22 +803,22 @@ impl HubInner {
         self.forget_member(conn.id(), topic);
         #[cfg(feature = "presence")]
         crate::presence::untrack_on_teardown(self, conn.id(), topic);
-        if let Some(channel) = self.channel_for(topic) {
-            if let Some(leave) = &channel.leave {
-                let socket = Socket {
-                    hub: ChannelHub {
-                        inner: self.strong(),
-                    },
-                    conn: conn.clone(),
-                    req: self.request_of(conn.id()),
-                    topic: topic.to_string(),
-                    join_ref: join.join_ref.clone(),
-                    assigns: join.assigns,
-                    live: join.live,
-                    pending: None,
-                };
-                leave(&socket, reason);
-            }
+        if let Some(channel) = self.channel_for(topic)
+            && let Some(leave) = &channel.leave
+        {
+            let socket = Socket {
+                hub: ChannelHub {
+                    inner: self.strong(),
+                },
+                conn: conn.clone(),
+                req: self.request_of(conn.id()),
+                topic: topic.to_string(),
+                join_ref: join.join_ref.clone(),
+                assigns: join.assigns,
+                live: join.live,
+                pending: None,
+            };
+            leave(&socket, reason);
         }
     }
 
