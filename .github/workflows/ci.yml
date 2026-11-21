@@ -87,6 +87,31 @@ jobs:
       - name: Build (zero-dep core, no default features)
         run: cargo build --no-default-features
 
+  # sutegi-pgext end to end: build the demo extension with `sutegi pgext`,
+  # load it into a real PostgreSQL 16 and run its SQL tests (errors, panics,
+  # SPI, sets, cancellation, LATIN1 refusal). The unit tests swap the C
+  # runtime for a Rust fake; this is the only job that runs the real one.
+  pgext:
+    name: pgext integration (PostgreSQL 16)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install PostgreSQL 16 with server development files
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-16 postgresql-server-dev-16
+
+      - name: Build, install and test the demo extension
+        run: scripts/pgext-test.sh /usr/lib/postgresql/16/bin/pg_config
+        env:
+          PGEXT_SUDO: sudo
+
   # Early warning for the next toolchain bump: the same lints on the newest
   # stable. Non-blocking — red here means "new lints or breakage to absorb when
   # rust-toolchain.toml moves", not "this PR is broken".

@@ -1,0 +1,22 @@
+[package]
+name = "pgext-demo"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "sutegi-pgext demo: scalars, NULLs, errors, sets, SPI and logging from Rust"
+
+# `sutegi pgext build examples/pgext-demo` links the extension from this
+# static library; it has no Rust tests of its own (scripts/pgext-test.sh runs
+# test.sql against a real server).
+[lib]
+crate-type = ["staticlib"]
+test = false
+doctest = false
+
+[dependencies]
+sutegi-pgext = { path = "../../crates/sutegi-pgext" }
+
+[lints]
+workspace = true
