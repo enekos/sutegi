@@ -100,13 +100,14 @@ fn main() -> std::io::Result<()> {
 | `sutegi-web`  | Router, `App` builder, middleware, groups, extractors, streaming (`sse`/`stream`), `/__introspect`, and the agent tool surface (`App::tool`/`stream_tool`, `schema` helpers, `ToolCtx`, `/__tools`). |
 | `sutegi-orm`  | Typed schema, fluent parameterized query builder, one `Backend` trait, a JSON key/value store, and two runnable backends: **SQLite** (`sqlite`, single-node) and **Postgres** (`postgres`, multi-pod). |
 | `sutegi-pg`   | Pure-`std` PostgreSQL driver: wire protocol v3 over blocking TCP, SCRAM-SHA-256 auth, connection pool. No async runtime, no C library. |
+| `sutegi-pgext` | PostgreSQL extensions in plain Rust: `#[pg_function]` + `sutegi pgext build` (C glue, `CREATE FUNCTION` script, control file, PGXS link). Experimental — see [docs/PGEXT.md](docs/PGEXT.md). |
 | `sutegi-storage` | File/object storage behind one `Storage` trait: local fs, database blobs (over `Backend`), and S3/R2 buckets over a pluggable HTTP transport — plus a pure-`std` SigV4 presigner. |
 | `sutegi-macros` | `#[derive(Model)]` (schema, hydration, `save`, `from_input`) and `#[derive(Validate)]` (field-attr rulesets). Compile-time only (syn/quote never reach your binary). |
 | `sutegi-validate` | Fluent `Validator`-style rule sets **and** a JSON Schema subset validator, with structured errors. |
 | `sutegi-queue` | Durable job queue over the `Backend` seam — same SQL on SQLite or Postgres (`UPDATE … RETURNING` claim, `SKIP LOCKED` where the backend has it, visibility-timeout retries, priorities, named queues, dedupe keys, dead-letter). |
 | `sutegi-hexagon`  | Opinionated hexagonal/clean-architecture primitives: `AppError`, `UseCase` ports, `respond` adapter glue. |
 | `sutegi`      | Facade crate + `prelude`. |
-| `sutegi-cli`  | The `sutegi` command: scaffold apps/models/routes, `introspect` a live app. |
+| `sutegi-cli`  | The `sutegi` command: scaffold apps/models/routes, `introspect` a live app, build PostgreSQL extensions (`pgext`). |
 
 ## Compile only what you ship
 
