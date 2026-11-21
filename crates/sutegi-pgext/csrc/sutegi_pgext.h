@@ -43,7 +43,11 @@ typedef struct sx_call sx_call;
 
 typedef void (*sx_rustfn) (sx_call *call);
 
-/* A copied SPI result, palloc'd in the calling function's memory context. */
+/*
+ * A copied SPI result. It lives in its own memory context (cxt), which
+ * sx_spi_free deletes once Rust has copied it, so a loop of queries doesn't
+ * grow the calling function's memory.
+ */
 typedef struct sx_spi_result
 {
 	uint64		nrows;
@@ -51,7 +55,11 @@ typedef struct sx_spi_result
 	uint64		processed;
 	char	  **names;
 	sx_value   *values;			/* nrows * ncols, row-major, kind SX_TEXT */
+	void	   *cxt;
 } sx_spi_result;
+
+/* Rust's out-of-memory hook: never returns. */
+typedef void (*sx_oom_fn) (size_t size);
 
 extern Datum sx_invoke(FunctionCallInfo fcinfo, sx_rustfn fn);
 
@@ -69,5 +77,11 @@ extern bool sx_check_interrupts(sx_call *call);
 extern bool sx_spi_exec(sx_call *call, const char *sql, size_t sql_len,
 						int32 nparams, const sx_value *params, int64 limit,
 						sx_spi_result **out);
+extern void sx_spi_free(sx_spi_result *res);
+extern bool sx_stack_too_deep(void);
+
+/* Defined by the Rust crate; _PG_init hands it the out-of-memory hook. */
+extern void sutegi_pgext_on_load(sx_oom_fn oom);
+extern void _PG_init(void);
 
 #endif

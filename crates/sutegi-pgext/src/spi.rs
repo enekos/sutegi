@@ -14,8 +14,9 @@
 //! A failed query returns an [`Error`](crate::Error) that
 //! [`is_postgres_error`](crate::Error::is_postgres_error): propagate it.
 
-use crate::error::Result;
-use crate::ffi::current;
+use crate::SqlState;
+use crate::error::{Error, Result};
+use crate::ffi::with_current;
 use crate::value::ToSql;
 
 /// Rows returned by [`query`], every value in its text form.
@@ -95,9 +96,8 @@ impl<'r> Row<'r> {
 }
 
 fn exec(sql: &str, params: &[&dyn ToSql], limit: i64) -> Result<Rows> {
-    let call = current()?;
     let raw: Vec<_> = params.iter().map(|p| p.to_raw()).collect();
-    let res = call.spi_exec(sql, &raw, limit)?;
+    let res = with_current(|call| call.spi_exec(sql, &raw, limit))?;
     Ok(Rows {
         columns: res.columns,
         cells: res.cells,
@@ -115,13 +115,22 @@ pub fn query(sql: &str, params: &[&dyn ToSql]) -> Result<Rows> {
     exec(sql, params, 0)
 }
 
-/// Like [`query`], but stops after `limit` rows.
+/// Like [`query`], but stops executing after `limit` rows, like a `LIMIT`
+/// clause. That includes a data-modifying statement with `RETURNING`:
+/// `INSERT … SELECT … RETURNING` writes at most `limit` rows. Use [`query`]
+/// or [`execute`] for those.
 ///
 /// # Errors
 ///
-/// As [`query`].
+/// As [`query`]; `invalid_parameter_value` when `limit` is 0.
 pub fn query_limit(sql: &str, params: &[&dyn ToSql], limit: u32) -> Result<Rows> {
-    exec(sql, params, i64::from(limit.max(1)))
+    if limit == 0 {
+        return Err(Error::new(
+            SqlState::INVALID_PARAMETER_VALUE,
+            "query_limit needs a limit of at least 1",
+        ));
+    }
+    exec(sql, params, i64::from(limit))
 }
 
 /// Runs a statement and returns how many rows it processed.
@@ -134,13 +143,15 @@ pub fn execute(sql: &str, params: &[&dyn ToSql]) -> Result<u64> {
 }
 
 /// Runs `sql` and returns the first column of the first row, `None` when
-/// there is no row or the value is `NULL`.
+/// there is no row or the value is `NULL`. The statement runs to completion
+/// (an `INSERT … RETURNING` writes every row), and the rows past the first
+/// are discarded.
 ///
 /// # Errors
 ///
 /// As [`query`].
 pub fn query_scalar(sql: &str, params: &[&dyn ToSql]) -> Result<Option<String>> {
-    let rows = exec(sql, params, 1)?;
+    let rows = exec(sql, params, 0)?;
     Ok(rows.first().and_then(|r| r.get(0)).map(str::to_owned))
 }
 
@@ -177,6 +188,30 @@ mod tests {
             total.into_return(call)
         });
         assert_eq!(out, Outcome::Value(Val::Int(3)));
+    }
+
+    #[test]
+    fn every_result_is_freed_after_copying() {
+        let before = crate::fake::spi_freed();
+        let out = FakeCall::new(vec![])
+            .with_spi(vec!["n"], vec![vec![Some("7")]])
+            .invoke("q", 0, |call| {
+                for _ in 0..3 {
+                    query("select 7", &[])?;
+                }
+                query_scalar("select 7", &[])?.into_return(call)
+            });
+        assert_eq!(out, Outcome::Value(Val::Text("7".into())));
+        assert_eq!(crate::fake::spi_freed() - before, 4);
+    }
+
+    #[test]
+    fn query_limit_rejects_zero() {
+        let out = FakeCall::new(vec![]).invoke("q", 0, |call| {
+            query_limit("select 1", &[], 0)?;
+            ().into_return(call)
+        });
+        assert!(matches!(out, Outcome::Error(s, _) if s == "22023"));
     }
 
     #[test]

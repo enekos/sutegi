@@ -18,6 +18,7 @@ impl SqlState {
     pub const INSUFFICIENT_PRIVILEGE: SqlState = SqlState::new("42501");
     pub const FEATURE_NOT_SUPPORTED: SqlState = SqlState::new("0A000");
     pub const PROGRAM_LIMIT_EXCEEDED: SqlState = SqlState::new("54000");
+    pub const STATEMENT_TOO_COMPLEX: SqlState = SqlState::new("54001");
     pub const INTERNAL_ERROR: SqlState = SqlState::new("XX000");
 
     /// Parses a code such as `"22023"`.

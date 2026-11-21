@@ -128,7 +128,9 @@ fn lex(src: &str) -> Result<Vec<Token>, (usize, String)> {
             });
         } else if c == '\'' {
             if at(i + 1) == Some('\\') {
-                i += 2;
+                // Skip the quote, the backslash and the escaped character
+                // (which may itself be a quote: '\''), then up to the close.
+                i += 3;
                 while at(i).is_some_and(|c| c != '\'') {
                     i += 1;
                 }
@@ -160,7 +162,21 @@ fn lex(src: &str) -> Result<Vec<Token>, (usize, String)> {
             }
             let word: String = chars[start..i].iter().collect();
             let raw_prefix = matches!(word.as_str(), "r" | "br" | "cr");
-            if raw_prefix && matches!(at(i), Some('"' | '#')) && word != "r#" {
+            if word == "r"
+                && at(i) == Some('#')
+                && at(i + 1).is_some_and(|c| c.is_alphabetic() || c == '_')
+            {
+                // A raw identifier, r#type: the identifier is what follows.
+                i += 1;
+                let begin = i;
+                while at(i).is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                    i += 1;
+                }
+                out.push(Token {
+                    tok: Tok::Ident(chars[begin..i].iter().collect()),
+                    line,
+                });
+            } else if raw_prefix && matches!(at(i), Some('"' | '#')) {
                 let mut hashes = 0;
                 while at(i) == Some('#') {
                     hashes += 1;
@@ -578,6 +594,11 @@ fn signature(p: &mut Parser<'_>, opts: Options, doc: String) -> Result<Function,
             line: chunk[colon].line,
             message: format!("parameter '{name}' has an unsupported type; {TYPES_HINT}"),
         })?;
+        let name = if params.iter().any(|p: &Param| p.name == name) {
+            format!("arg{}", index + 1)
+        } else {
+            name
+        };
         params.push(Param {
             name,
             sql_type,
@@ -786,6 +807,75 @@ mod tests {
         assert!(fails("#[pg_function(rows = 3)] fn f() -> i32 {}").contains("rows = N"));
         assert!(fails("#[pg_function(bogus)] fn f() {}").contains("unknown pg_function option"));
         assert!(fails("#[pg_function] struct S;").contains("plain fn"));
+    }
+
+    #[test]
+    fn raw_identifiers_and_escaped_quotes() {
+        let f = one("const Q: char = '\\''; #[pg_function] fn r#type(r#match: &str) -> i32 { 0 }");
+        assert_eq!(
+            (f.rust_name.as_str(), f.params[0].name.as_str()),
+            ("type", "match")
+        );
+        assert_eq!(
+            one("const B: u8 = b'\\\\'; #[pg_function] fn g() {}").rust_name,
+            "g"
+        );
+    }
+
+    #[test]
+    fn duplicate_parameter_names_get_positional_ones() {
+        let f = one("#[pg_function] fn f(_a: i32, a: i32) {}");
+        let names: Vec<_> = f.params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["a", "arg2"]);
+    }
+
+    #[test]
+    fn foreign_error_types_map_like_result() {
+        assert_eq!(
+            one("#[pg_function] fn f(s: &str) -> Result<i32, std::num::ParseIntError> {}").returns,
+            "integer"
+        );
+    }
+
+    /// Mutates a representative source with a tiny deterministic PRNG and
+    /// checks the scanner never panics, whatever it's fed.
+    #[test]
+    fn mutated_sources_never_panic() {
+        let base = r##"
+            //! crate docs
+            use sutegi_pgext::{pg_function, SetOf, Result};
+            /// Doc "quoted" 'x' /* not a comment */
+            #[pg_function(immutable, parallel_safe, name = "x_y", cost = 3, rows = 9)]
+            pub(crate) fn f<'a>(r#in: &'a str, b: Option<Vec<u8>>, c: &[u8]) -> Result<SetOf<Option<String>>> {
+                let s = r#"raw "str" "#; let c = '\''; let b = b"bytes\"";
+                /* nested /* block */ */ todo!()
+            }
+        "##;
+        let bytes: Vec<char> = base.chars().collect();
+        let alphabet: Vec<char> = "#[](){}<>&'\"/*!:;,=-r_ab\n\\".chars().collect();
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..20_000 {
+            let mut src = bytes.clone();
+            for _ in 0..(next() % 6 + 1) {
+                let at = usize::try_from(next() % (src.len() as u64 + 1)).unwrap_or(0);
+                let pick = alphabet[usize::try_from(next() % alphabet.len() as u64).unwrap_or(0)];
+                match next() % 3 {
+                    0 if at < src.len() => {
+                        src.remove(at);
+                    }
+                    1 if at < src.len() => src[at] = pick,
+                    _ => src.insert(at, pick),
+                }
+            }
+            let text: String = src.into_iter().collect();
+            let _ = scan("fuzz.rs", &text);
+        }
     }
 
     #[test]

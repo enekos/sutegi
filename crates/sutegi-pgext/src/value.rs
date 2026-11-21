@@ -10,7 +10,7 @@
 //! | `Option<T>`                  | `T`, `NULL` ⇄ `None` |
 //! | `()` (result only)           | `void`             |
 //! | `SetOf<T>` (result only)     | `SETOF T`          |
-//! | `Result<T>` (result only)    | `T`, `Err` raises  |
+//! | `Result<T, E>` (result only) | `T`, `Err` raises (`E: Into<Error>`) |
 
 use crate::SqlState;
 use crate::error::{Error, Result};
@@ -35,20 +35,48 @@ fn null_arg(index: i32) -> Error {
 
 /// Reads one argument of a SQL function. Implemented for the types in the
 /// module table; the `#[pg_function]` wrapper calls it per parameter.
-pub trait FromArg<'a>: Sized {
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// Marks the types this crate converts; the traits below are sealed, as the
+/// C runtime trusts what they hand it.
+macro_rules! sealed {
+    ($($t:ty),*) => {$( impl sealed::Sealed for $t {} )*};
+}
+
+sealed!(
+    bool,
+    i16,
+    i32,
+    i64,
+    f32,
+    f64,
+    String,
+    str,
+    [u8],
+    Vec<u8>,
+    ()
+);
+impl<T: sealed::Sealed + ?Sized> sealed::Sealed for &T {}
+impl<T: sealed::Sealed> sealed::Sealed for Option<T> {}
+impl<T, E> sealed::Sealed for std::result::Result<T, E> {}
+impl<T> sealed::Sealed for SetOf<T> {}
+
+pub trait FromArg<'a>: Sized + sealed::Sealed {
     #[doc(hidden)]
     fn from_arg(call: Call<'a>, index: i32) -> Result<Self>;
 }
 
 /// Hands a Rust result back to PostgreSQL.
-pub trait IntoReturn {
+pub trait IntoReturn: sealed::Sealed {
     #[doc(hidden)]
     fn into_return(self, call: Call<'_>) -> Result<()>;
 }
 
 /// One value of a scalar SQL type, used for results, set rows and SPI
 /// parameters.
-pub trait ToSql {
+pub trait ToSql: sealed::Sealed {
     #[doc(hidden)]
     fn kind(&self) -> Kind;
     #[doc(hidden)]
@@ -233,7 +261,7 @@ impl<T: ToSql + ?Sized> ToSql for &T {
 }
 
 /// The SQL kind of a value type, known without a value (for `NULL`s).
-pub trait SqlKind {
+pub trait SqlKind: sealed::Sealed {
     #[doc(hidden)]
     const KIND: Kind;
 }
@@ -289,60 +317,90 @@ impl IntoReturn for () {
     }
 }
 
-impl<T: IntoReturn> IntoReturn for Result<T> {
+impl<T: IntoReturn, E: Into<Error>> IntoReturn for std::result::Result<T, E> {
     fn into_return(self, call: Call<'_>) -> Result<()> {
-        self?.into_return(call)
+        self.map_err(Into::into)?.into_return(call)
     }
 }
 
-/// The rows of a set-returning function (`RETURNS SETOF T`), materialized
-/// into a tuplestore when the function returns. `T` is a scalar type or an
-/// `Option` of one (`NULL` rows).
+/// The rows of a set-returning function (`RETURNS SETOF T`). `T` is a scalar
+/// type or an `Option` of one (`NULL` rows).
+///
+/// [`SetOf::new`] takes any iterator and pulls it row by row into
+/// PostgreSQL's tuplestore, which spills to disk past `work_mem`: a huge
+/// or unbounded set never sits in Rust memory, and cancellation is checked
+/// as it goes. `collect()` and `From<Vec<T>>` build the rows first, which
+/// also works for rows borrowed from the arguments.
 ///
 /// ```ignore
 /// #[pg_function(immutable)]
 /// fn series(n: i64) -> SetOf<i64> {
-///     (1..=n).collect()
+///     SetOf::new(1..=n)
 /// }
 /// ```
-#[derive(Debug, Clone, PartialEq)]
-pub struct SetOf<T>(Vec<T>);
+pub struct SetOf<T> {
+    rows: Rows<T>,
+}
+
+enum Rows<T> {
+    Eager(Vec<T>),
+    Lazy(Box<dyn Iterator<Item = T>>),
+}
 
 impl<T> SetOf<T> {
+    /// A set produced lazily by `rows`.
     #[must_use]
-    pub fn new(rows: Vec<T>) -> SetOf<T> {
-        SetOf(rows)
-    }
-
-    #[must_use]
-    pub fn into_inner(self) -> Vec<T> {
-        self.0
+    pub fn new(rows: impl IntoIterator<Item = T> + 'static) -> SetOf<T>
+    where
+        T: 'static,
+    {
+        SetOf {
+            rows: Rows::Lazy(Box::new(rows.into_iter())),
+        }
     }
 }
 
 impl<T> From<Vec<T>> for SetOf<T> {
     fn from(rows: Vec<T>) -> SetOf<T> {
-        SetOf(rows)
+        SetOf {
+            rows: Rows::Eager(rows),
+        }
     }
 }
 
 impl<T> FromIterator<T> for SetOf<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> SetOf<T> {
-        SetOf(iter.into_iter().collect())
+        SetOf::from(iter.into_iter().collect::<Vec<T>>())
+    }
+}
+
+impl<T> std::fmt::Debug for SetOf<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.rows {
+            Rows::Eager(v) => write!(f, "SetOf({} rows)", v.len()),
+            Rows::Lazy(_) => f.write_str("SetOf(lazy)"),
+        }
     }
 }
 
 const INTERRUPT_CHECK_EVERY: usize = 1024;
 
+fn push_rows<T: ToSql>(call: Call<'_>, rows: impl Iterator<Item = T>) -> Result<()> {
+    for (i, row) in rows.enumerate() {
+        if i % INTERRUPT_CHECK_EVERY == INTERRUPT_CHECK_EVERY - 1 {
+            call.check_interrupts()?;
+        }
+        call.srf_push(&row.to_raw())?;
+    }
+    Ok(())
+}
+
 impl<T: ToSql + SqlKind> IntoReturn for SetOf<T> {
     fn into_return(self, call: Call<'_>) -> Result<()> {
         call.srf_begin(T::KIND)?;
-        for (i, row) in self.0.iter().enumerate() {
-            if i % INTERRUPT_CHECK_EVERY == INTERRUPT_CHECK_EVERY - 1 {
-                call.check_interrupts()?;
-            }
-            call.srf_push(&row.to_raw())?;
+        match self.rows {
+            Rows::Eager(v) => push_rows(call, v.into_iter()),
+            Rows::Lazy(it) => push_rows(call, it),
         }
-        Ok(())
     }
 }
