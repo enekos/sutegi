@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "The sutegi command-line tool: scaffold apps, models, and routes; introspect or REPL into a running app."
+description = "The sutegi command-line tool: scaffold apps, models, and routes; introspect or REPL into a running app; build PostgreSQL extensions."
 
 [[bin]]
 name = "sutegi"
@@ -16,6 +16,8 @@ path = "src/main.rs"
 sutegi-json = { path = "../sutegi-json", version = "0.15.0" }
 # Remote-only REPL (no `orm`): data lives behind the running app's surface.
 sutegi-repl = { path = "../sutegi-repl", version = "0.15.0" }
+# `sutegi pgext`: the extension build pipeline (scan, codegen, cargo + PGXS).
+sutegi-pgext = { path = "../sutegi-pgext", version = "0.15.0", features = ["build"] }
 
 [lints]
 workspace = true

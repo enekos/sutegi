@@ -87,6 +87,40 @@ jobs:
       - name: Build (zero-dep core, no default features)
         run: cargo build --no-default-features
 
+  # sutegi-pgext end to end: build the demo extension with `sutegi pgext`,
+  # load it into a real PostgreSQL 17 and run its SQL tests (errors,
+  # panics, SPI, sets, cancellation, LATIN1 refusal). The unit tests swap
+  # the C runtime for a Rust fake; this is the only job that runs the real
+  # one.
+  pgext:
+    name: pgext integration (PostgreSQL 17)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      # From the PostgreSQL project's own apt repository (PGDG): the
+      # runner image's preinstalled client packages clash with Ubuntu's
+      # server-dev ones, and Ubuntu's versioned package names change
+      # between releases. PGDG keeps every supported major for every
+      # release.
+      - name: Install PostgreSQL 17 with server development files
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y postgresql-17 postgresql-server-dev-17
+          echo "PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config" >> "$GITHUB_ENV"
+
+      - name: Build, install and test the demo extension
+        run: scripts/pgext-test.sh "$PG_CONFIG"
+        env:
+          PGEXT_SUDO: sudo
+
   # Early warning for the next toolchain bump: the same lints on the newest
   # stable. Non-blocking — red here means "new lints or breakage to absorb when
   # rust-toolchain.toml moves", not "this PR is broken".

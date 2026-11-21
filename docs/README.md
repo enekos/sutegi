@@ -109,6 +109,7 @@ Long-form guides, maintained by hand and linked from the reference page they ext
 - [Advisory locks](LOCKS.md)
 - [Logging — one line format for the framework and the app](LOGGING.md)
 - [Migrations](MIGRATIONS.md)
+- [PostgreSQL extensions in Rust](PGEXT.md)
 - [Reactive queries](REACTIVE.md)
 - [Realtime: WebSockets, PubSub, Channels, Presence](REALTIME.md)
 - [Full-text + hybrid search](SEARCH.md)
