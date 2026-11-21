@@ -88,11 +88,11 @@ jobs:
         run: cargo build --no-default-features
 
   # sutegi-pgext end to end: build the demo extension with `sutegi pgext`,
-  # load it into a real PostgreSQL 16 and run its SQL tests (errors, panics,
-  # SPI, sets, cancellation, LATIN1 refusal). The unit tests swap the C
+  # load it into the runner distro's PostgreSQL and run its SQL tests
+  # (errors, panics, SPI, sets, cancellation, LATIN1 refusal). The unit tests swap the C
   # runtime for a Rust fake; this is the only job that runs the real one.
   pgext:
-    name: pgext integration (PostgreSQL 16)
+    name: pgext integration (PostgreSQL)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -102,13 +102,18 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install PostgreSQL 16 with server development files
+      # The distro's default major version (versioned package names like
+      # postgresql-16 come and go between Ubuntu releases).
+      - name: Install PostgreSQL with server development files
         run: |
           sudo apt-get update
-          sudo apt-get install -y postgresql-16 postgresql-server-dev-16
+          sudo apt-get install -y postgresql postgresql-server-dev-all
+          pg_config=$(ls /usr/lib/postgresql/*/bin/pg_config | sort -V | tail -1)
+          "$pg_config" --version
+          echo "PG_CONFIG=$pg_config" >> "$GITHUB_ENV"
 
       - name: Build, install and test the demo extension
-        run: scripts/pgext-test.sh /usr/lib/postgresql/16/bin/pg_config
+        run: scripts/pgext-test.sh "$PG_CONFIG"
         env:
           PGEXT_SUDO: sudo
 
