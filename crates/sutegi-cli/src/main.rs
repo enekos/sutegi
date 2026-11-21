@@ -23,6 +23,7 @@ fn main() -> ExitCode {
         "make:route" => cmd_make_route(args.get(1)),
         "introspect" => cmd_introspect(args.get(1)),
         "repl" => cmd_repl(args.get(1)),
+        "pgext" => cmd_pgext(&args[1..]),
         "version" | "--version" | "-V" => {
             println!("sutegi {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -62,11 +63,94 @@ COMMANDS:
                           (default url: http://127.0.0.1:8080/__introspect)
     repl [addr]           Interactive REPL against a running app's HTTP surface
                           (default addr: 127.0.0.1:8080)
+    pgext new <dir> [--path <sutegi checkout>]
+                          Scaffold a PostgreSQL extension crate
+    pgext build [dir] [--pg-config <path>] [--debug]
+                          Build the extension in dir (default .) with PGXS
+    pgext install [dir] [--pg-config <path>] [--debug]
+                          Build, then install it into that PostgreSQL
     version               Print the version
     help                  Show this help
 "#,
         ver = env!("CARGO_PKG_VERSION")
     );
+}
+
+// ---- pgext ----------------------------------------------------------------
+
+fn flag_value<'a>(args: &'a [String], flag: &str) -> Result<Option<&'a String>, String> {
+    match args.iter().position(|a| a == flag) {
+        Some(i) => args
+            .get(i + 1)
+            .map(Some)
+            .ok_or_else(|| format!("{flag} needs a value")),
+        None => Ok(None),
+    }
+}
+
+fn positional(args: &[String]) -> Option<&String> {
+    let mut skip = false;
+    args.iter().find(|a| {
+        if skip {
+            skip = false;
+            return false;
+        }
+        if matches!(a.as_str(), "--path" | "--pg-config") {
+            skip = true;
+            return false;
+        }
+        !a.starts_with("--")
+    })
+}
+
+fn cmd_pgext(args: &[String]) -> Result<(), String> {
+    use sutegi_pgext::build;
+
+    const USAGE: &str = "usage: sutegi pgext <new|build|install> ...";
+    let sub = args.first().ok_or(USAGE)?;
+    let rest = &args[1..];
+    match sub.as_str() {
+        "new" => {
+            let dir = positional(rest)
+                .ok_or("usage: sutegi pgext new <dir> [--path <sutegi checkout>]")?;
+            let dep = match flag_value(rest, "--path")? {
+                Some(p) => build::Dependency::Path(
+                    Path::new(p)
+                        .canonicalize()
+                        .map_err(|e| format!("{p}: {e}"))?,
+                ),
+                None => build::Dependency::Git,
+            };
+            let name = build::new_project(Path::new(dir), &dep)?;
+            println!("created PostgreSQL extension '{name}'");
+            println!("  sutegi pgext install {dir}");
+            println!("  psql -c 'CREATE EXTENSION {name}' -c \"SELECT hello('world')\"");
+            Ok(())
+        }
+        "build" | "install" => {
+            let pg_config = match flag_value(rest, "--pg-config")? {
+                Some(p) => p.clone(),
+                None => std::env::var("PG_CONFIG").unwrap_or_else(|_| "pg_config".into()),
+            };
+            let opts = build::Options {
+                dir: positional(rest).map_or_else(|| ".".into(), Into::into),
+                pg_config,
+                release: !rest.iter().any(|a| a == "--debug"),
+                install: sub == "install",
+            };
+            let built = build::build(&opts)?;
+            println!(
+                "{} {} {}: {} function(s) in {}",
+                if opts.install { "installed" } else { "built" },
+                built.name,
+                built.version,
+                built.functions.len(),
+                built.work_dir.display()
+            );
+            Ok(())
+        }
+        other => Err(format!("unknown pgext command '{other}'\n{USAGE}")),
+    }
 }
 
 // ---- new ------------------------------------------------------------------

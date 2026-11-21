@@ -22,6 +22,8 @@
 //! }
 //! ```
 
+mod pg_function;
+
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{Data, DeriveInput, Fields, Type, parse_macro_input};
@@ -112,6 +114,21 @@ fn rel_kind(path: &syn::Path) -> Option<RelKind> {
 pub fn derive_model(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     match expand(input) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// `#[pg_function(...)]` — expose a Rust function as a PostgreSQL SQL
+/// function in a sutegi-pgext extension. Re-exported as
+/// `sutegi_pgext::pg_function`; see that crate for the type mapping.
+///
+/// Options: `immutable` / `stable` / `volatile`, `parallel_safe` /
+/// `parallel_restricted` / `parallel_unsafe`, `leakproof`,
+/// `security_definer`, `name = "sql_name"`, `cost = N`, `rows = N`.
+#[proc_macro_attribute]
+pub fn pg_function(attr: TokenStream, item: TokenStream) -> TokenStream {
+    match pg_function::expand(attr.into(), item.into()) {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
     }
