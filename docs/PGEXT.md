@@ -179,7 +179,7 @@ server's directories need root. The script then starts a throwaway cluster
 and runs every `test*.sql` in its own database with `ON_ERROR_STOP`, and
 tests assert by raising. A `test-latin1*.sql` runs in a `LATIN1` database.
 Any `TRAP:`/`PANIC:`/crashed backend in the server log fails the run. CI runs
-it against the runner distro's PostgreSQL.
+it against PostgreSQL 17.
 
 The Rust side (marshalling, errors, sets, SPI, the scanner and the code
 generator) is unit-tested without a server. Under `cargo test` a Rust stand-in
