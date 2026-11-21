@@ -1,19 +1,22 @@
 #!/bin/sh
 # Integration test for sutegi-pgext extensions against a real PostgreSQL.
 #
-#   scripts/pgext-test.sh [pg_config] [project ...]   (default: examples/pgext-demo)
+#   scripts/pgext-test.sh [pg_config] [project ...]   (default: examples/pgext-*)
 #
 # Builds each project with `sutegi pgext build`, installs it into the server
 # pg_config points at (set PGEXT_SUDO=sudo when its directories need root),
 # starts a throwaway cluster and runs every test*.sql in its own database with
 # ON_ERROR_STOP: tests assert by raising. A file named test-latin1*.sql runs
-# in a LATIN1 database. Any TRAP:/PANIC:/crashed backend/Rust-unwind warning
-# in the server log fails the run.
+# in a LATIN1 database; a *.fatal.sql file must end its own session (psql
+# exit 2) with a FATAL, leaving the server up. Every project is installed
+# before any test runs, so a test may load several extensions. Any
+# TRAP:/PANIC:/crashed backend/Rust-unwind warning in the server log fails
+# the run.
 set -eu
 
 PG_CONFIG=${1:-pg_config}
 [ $# -gt 0 ] && shift
-[ $# -gt 0 ] || set -- examples/pgext-demo
+[ $# -gt 0 ] || set -- examples/pgext-demo examples/pgext-mini
 SUDO=${PGEXT_SUDO:-}
 PORT=${PGEXT_PORT:-5497}
 BIN=$("$PG_CONFIG" --bindir)
@@ -50,11 +53,23 @@ for project in "$@"; do
 		test-latin1*) "$BIN/createdb" -h "$TMP" -p "$PORT" -U postgres -E LATIN1 -T template0 --locale=C "$db" ;;
 		*) "$BIN/createdb" -h "$TMP" -p "$PORT" -U postgres "$db" ;;
 		esac
-		if "$BIN/psql" -X -q -h "$TMP" -p "$PORT" -U postgres -d "$db" \
-			-v ON_ERROR_STOP=1 -c 'SET client_min_messages = warning' -f "$test"; then
+		set +e
+		"$BIN/psql" -X -q -h "$TMP" -p "$PORT" -U postgres -d "$db" \
+			-v ON_ERROR_STOP=1 -c 'SET client_min_messages = warning' -f "$test" >"$TMP/out" 2>&1
+		rc=$?
+		set -e
+		case $test in
+		*.fatal.sql) want=2 ;;
+		*) want=0 ;;
+		esac
+		if [ $want -eq 2 ] && ! grep -q 'FATAL:' "$TMP/server.log"; then
+			rc="$rc, no FATAL in the server log"
+		fi
+		if [ "$rc" = "$want" ] && "$BIN/psql" -X -q -h "$TMP" -p "$PORT" -U postgres -d postgres -c 'SELECT 1' >/dev/null 2>&1; then
 			echo "ok   $test"
 		else
-			echo "FAIL $test"
+			echo "FAIL $test (psql exit $rc, want $want)"
+			cat "$TMP/out"
 			failed=1
 		fi
 	done

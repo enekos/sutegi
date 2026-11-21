@@ -20,10 +20,16 @@ fn safe_div(a: i64, b: i64) -> Result<i64> {
     })
 }
 
-/// Counts from 1 to n.
+/// Counts from 1 to n, lazily: rows stream into the tuplestore.
 #[pg_function(immutable, parallel_safe, rows = 10)]
 fn count_to(n: i64) -> SetOf<i64> {
-    (1..=n).collect()
+    SetOf::new(1..=n)
+}
+
+/// Never ends; only cancellation stops it.
+#[pg_function(volatile)]
+fn forever() -> SetOf<i64> {
+    SetOf::new(0..)
 }
 
 /// Splits s on sep; empty pieces come back as NULL.
@@ -120,4 +126,68 @@ fn spin() -> Result<()> {
         sutegi_pgext::check_for_interrupts()?;
         std::hint::spin_loop();
     }
+}
+
+/// Allocates n bytes: a request too large to satisfy ends the session with
+/// FATAL instead of crashing the server.
+#[pg_function(volatile)]
+fn alloc_bytes(n: i64) -> Result<i64> {
+    let v = std::hint::black_box(vec![1u8; usize::try_from(n)?]);
+    Ok(i64::try_from(v.len())? + i64::from(v[v.len() / 2]) - 1)
+}
+
+/// Returns text with a NUL byte, which PostgreSQL text can't hold.
+#[pg_function(immutable)]
+fn nul_text() -> String {
+    "a\0b".to_owned()
+}
+
+/// Runs n queries through SPI and returns how much this backend's memory
+/// grew meanwhile, in bytes.
+#[pg_function(volatile)]
+fn spi_growth(n: i32, payload: i32) -> Result<i64> {
+    let total = || -> Result<i64> {
+        let v = spi::query_scalar(
+            "SELECT sum(total_bytes) FROM pg_backend_memory_contexts",
+            &[],
+        )?;
+        Ok(v.unwrap_or_default().parse()?)
+    };
+    let s = "x".repeat(usize::try_from(payload)?);
+    let before = total()?;
+    for _ in 0..n {
+        spi::query("SELECT $1::text", &[&s.as_str()])?;
+    }
+    Ok(total()? - before)
+}
+
+/// Inserts n rows into demo_log through query_scalar with RETURNING and
+/// returns the first id: every row must be written.
+#[pg_function(volatile)]
+fn insert_many(n: i32) -> Result<Option<String>> {
+    spi::query_scalar(
+        "INSERT INTO demo_log(msg) SELECT 'bulk ' || g FROM generate_series(1, $1) g RETURNING id",
+        &[&n],
+    )
+}
+
+/// Recurses n deep in pure Rust, guarded by check_stack_depth.
+#[pg_function(immutable)]
+fn deep(n: i64) -> Result<i64> {
+    fn go(n: i64) -> Result<i64> {
+        sutegi_pgext::check_stack_depth()?;
+        let pad = std::hint::black_box([0u8; 256]);
+        if n == 0 {
+            Ok(i64::from(pad[0]))
+        } else {
+            Ok(go(n - 1)? + 1 + i64::from(pad[255]))
+        }
+    }
+    go(n)
+}
+
+/// The search_path a SECURITY DEFINER function runs with.
+#[pg_function(stable, security_definer)]
+fn definer_search_path() -> Result<Option<String>> {
+    spi::query_scalar("SELECT current_setting('search_path')", &[])
 }

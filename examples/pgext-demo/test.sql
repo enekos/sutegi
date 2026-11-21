@@ -101,3 +101,58 @@ BEGIN
   EXCEPTION WHEN internal_error THEN NULL;
   END;
 END $$;
+
+-- hardening (sutegi-pgext battle test)
+SET statement_timeout = '200ms';
+DO $$
+BEGIN
+  PERFORM count(*) FROM forever();
+  RAISE 'forever was not cancelled';
+EXCEPTION WHEN query_canceled THEN NULL;
+END $$;
+RESET statement_timeout;
+
+DO $$
+DECLARE
+  before bigint;
+  growth bigint;
+BEGIN
+  -- lazy sets: a million rows without holding them in Rust
+  ASSERT (SELECT count(*) FROM count_to(1000000)) = 1000000, 'lazy set';
+  ASSERT (SELECT array_agg(x) FROM (SELECT count_to(3) AS x) s)::text = '{1,2,3}', 'set in target list';
+
+  -- text can't carry NUL
+  BEGIN
+    PERFORM nul_text();
+    RAISE 'nul_text did not fail';
+  EXCEPTION WHEN character_not_in_repertoire THEN NULL;
+  END;
+
+  -- SPI results are freed per query: 2000 x 100 kB must not pile up
+  growth := spi_growth(2000, 100000);
+  ASSERT growth < 10000000, 'SPI memory grew by ' || growth;
+
+  -- query_scalar runs the statement to completion
+  before := (SELECT count(*) FROM demo_log);
+  PERFORM insert_many(5);
+  ASSERT (SELECT count(*) FROM demo_log) = before + 5, 'insert_many wrote every row';
+
+  -- deep Rust recursion stops at max_stack_depth instead of SIGSEGV
+  ASSERT deep(100) = 100, 'shallow recursion';
+  BEGIN
+    PERFORM deep(100000000);
+    RAISE 'deep did not fail';
+  EXCEPTION WHEN statement_too_complex THEN NULL;
+  END;
+
+  -- SECURITY DEFINER pins search_path
+  ASSERT definer_search_path() = 'pg_catalog, pg_temp', 'definer search_path';
+
+  -- a bad size is an ordinary ERROR
+  BEGIN
+    PERFORM alloc_bytes(-1);
+    RAISE 'alloc_bytes(-1) did not fail';
+  EXCEPTION WHEN raise_exception THEN NULL;
+  END;
+  ASSERT alloc_bytes(1000) = 1000, 'small allocation';
+END $$;
