@@ -32,8 +32,14 @@ BEGIN
   ASSERT count_above('t', 2) = 3, 'count_above';
   ASSERT log_message('a') = 1 AND log_message('b') = 2, 'log_message';
   ASSERT hello_via_spi('nested') = 'Hello, nested!', 'nested';
+  ASSERT empty_projection(3) = 3 AND empty_projection(0) = 0, 'zero-column rows';
 
   -- errors carry SQLSTATE, detail and hint
+  BEGIN
+    PERFORM safe_div('-9223372036854775808'::bigint, -1);
+    RAISE 'expected bigint overflow';
+  EXCEPTION WHEN numeric_value_out_of_range THEN NULL;
+  END;
   BEGIN
     PERFORM safe_div(1, 0);
     RAISE 'safe_div did not fail';

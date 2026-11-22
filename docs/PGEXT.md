@@ -24,7 +24,7 @@ psql -c 'CREATE EXTENSION hello' -c "SELECT hello('world')"
 ```
 
 ```rust
-use sutegi_pgext::{Error, Result, SetOf, SqlState, pg_function, spi};
+use sutegi_pgext::{Error, Result, SetOf, SqlState, pg_function};
 
 /// Returns a greeting for name.
 #[pg_function(immutable, parallel_safe)]
@@ -35,22 +35,17 @@ fn hello(name: &str) -> String {
 /// Divides a by b, raising division_by_zero instead of panicking.
 #[pg_function(immutable, parallel_safe)]
 fn safe_div(a: i64, b: i64) -> Result<i64> {
-    a.checked_div(b).ok_or_else(|| {
-        Error::new(SqlState::DIVISION_BY_ZERO, "division by zero").hint("Pass a non-zero divisor.")
-    })
+    if b == 0 {
+        return Err(Error::new(SqlState::DIVISION_BY_ZERO, "division by zero"));
+    }
+    a.checked_div(b)
+        .ok_or_else(|| Error::new(SqlState::NUMERIC_VALUE_OUT_OF_RANGE, "bigint out of range"))
 }
 
 /// Counts from 1 to n, streaming the rows.
 #[pg_function(immutable, rows = 10)]
 fn count_to(n: i64) -> SetOf<i64> {
     SetOf::new(1..=n)
-}
-
-/// Counts the rows of items above a price, through SPI.
-#[pg_function(stable)]
-fn expensive(min: i32) -> Result<i64> {
-    let n = spi::query_scalar("SELECT count(*) FROM items WHERE price > $1", &[&min])?;
-    Ok(n.as_deref().unwrap_or("0").parse()?)
 }
 ```
 
@@ -72,6 +67,80 @@ crate version. The control file's comment is the crate description. SQL files
 under `sql/` are appended to the install script in name order, after the
 generated functions. Use them for tables, views, casts and anything else
 that's plain SQL.
+
+## Reserve stock and build a reorder list
+
+A checkout service needs to reserve stock without direct write access to the
+inventory table. A purchasing clerk needs to see up to 50 low-stock SKUs.
+The inventory example implements both operations against the same table.
+From the repository root, run its role and transaction tests on a disposable
+PostgreSQL cluster with this command.
+
+```sh
+scripts/pgext-test.sh "$(command -v pg_config)" examples/pgext-inventory
+```
+
+To try the functions interactively, use a local test server matching
+`pg_config`. The setup creates a database schema for the API, a separate
+warehouse schema, and three cluster-wide roles. Run it once as an administrator
+in a fresh test database on a cluster where those role names are available.
+
+```sh
+cargo run -p sutegi-cli -- pgext install examples/pgext-inventory
+createdb inventory_example
+psql -X -v ON_ERROR_STOP=1 -d inventory_example -f examples/pgext-inventory/setup.sql
+psql -X -d inventory_example
+```
+
+```sql
+SET ROLE order_clerk;
+BEGIN;
+SELECT inventory_api.reserve_stock('TEA', 3);   -- 7 remaining
+SELECT inventory_api.reserve_stock('TEA', 8);   -- NULL (insufficient stock)
+ROLLBACK;
+RESET ROLE;
+
+SET ROLE stock_reader;
+SELECT * FROM inventory_api.low_stock(2);       -- COFFEE
+RESET ROLE;
+```
+
+**Reserve stock.** The Rust function binds the SKU and quantity to one
+conditional `UPDATE … RETURNING available`. PostgreSQL checks the available
+balance as part of the write, so concurrent checkouts cannot both reserve
+the same last units. A missing SKU or insufficient stock returns SQL `NULL`.
+A nonpositive quantity raises `22023`. A successful reservation commits or
+rolls back with the order. Each additional committed call is a new reservation.
+
+**List low stock.** The reporting function uses its caller's read permissions.
+It binds the threshold, orders by balance and SKU, and applies `LIMIT 50` in
+SQL before copying the rows into Rust. It returns `SETOF text`, so callers
+can join the SKUs against their own purchase orders. [Rust functions](../examples/pgext-inventory/src/lib.rs) · [Table and role setup](../examples/pgext-inventory/setup.sql) · [SQL assertions](../examples/pgext-inventory/test.sql)
+
+### Grant access to a definer function
+
+On a **fresh install**, the generated script revokes `EXECUTE` from `PUBLIC`
+for each `security_definer` function, in the same transaction that creates it.
+Grant the specific signature to the roles that need it. The example makes
+`inventory_writer` a no-login function owner with only the column privileges
+needed for the update. The order clerk gets schema `USAGE` and this grant.
+
+```sql
+GRANT EXECUTE ON FUNCTION inventory_api.reserve_stock(text, integer) TO order_clerk;
+```
+
+For **existing installations**, rebuilding or copying the library leaves the
+database's function privileges in place. Apply the following in a migration
+for each affected signature, using your schema and intended roles. Review
+explicit role grants and role memberships alongside the `PUBLIC` grant.
+[PostgreSQL's definer-function guidance](https://www.postgresql.org/docs/17/sql-createfunction.html#SQL-CREATEFUNCTION-SECURITY)
+
+```sql
+BEGIN;
+REVOKE EXECUTE ON FUNCTION inventory_api.reserve_stock(text, integer) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION inventory_api.reserve_stock(text, integer) TO order_clerk;
+COMMIT;
+```
 
 ## SQL functions
 
@@ -158,6 +227,10 @@ A panic needs `panic = "unwind"` to become an `ERROR`. A crate built with
   and that includes `INSERT … RETURNING`, which then writes at most `n` rows.
 - Each query's copy of its result is freed as soon as Rust has read it, so a
   loop of a million queries runs in constant memory.
+- `Rows::len()` counts returned tuples, including rows with zero columns
+  (e.g. `SELECT FROM warehouse.stock`). An `UPDATE` without `RETURNING`
+  has zero result rows. Use `Rows::processed()` or `spi::execute` for its
+  affected-row count.
 - `notice`, `info`, `warning`, `log`, `debug` emit at that level.
 - `check_for_interrupts()` belongs in long loops: on cancel or
   `statement_timeout` it returns the cancel error.
@@ -212,14 +285,14 @@ context that's reset once the tuplestore has its copy.
 ## Testing
 
 `scripts/pgext-test.sh [pg_config] [project ...]` builds and installs every
-project first (default `examples/pgext-demo` and `examples/pgext-mini`), so a
+project first (the demo, mini and inventory examples by default), so a
 test may load several extensions. Set `PGEXT_SUDO=sudo` when the server's
 directories need root. The script then starts a throwaway cluster and runs
 every `test*.sql` in its own database with `ON_ERROR_STOP`, and tests assert
 by raising. A `test-latin1*.sql` runs in a `LATIN1` database. A `*.fatal.sql`
 must end its own session with a `FATAL` (psql exit 2) while the server stays
 up. Any `TRAP:`/`PANIC:`/crashed backend in the server log fails the run. CI
-runs it against PostgreSQL 17.
+runs it against PostgreSQL 14, 17 and 19.
 
 The Rust side (marshalling, errors, sets, SPI, the scanner and the code
 generator) is unit-tested without a server. Under `cargo test` a Rust stand-in

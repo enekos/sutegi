@@ -13,11 +13,13 @@ fn hello(name: &str) -> String {
 /// Divides a by b, raising division_by_zero instead of panicking.
 #[pg_function(immutable, parallel_safe)]
 fn safe_div(a: i64, b: i64) -> Result<i64> {
-    a.checked_div(b).ok_or_else(|| {
-        Error::new(SqlState::DIVISION_BY_ZERO, "division by zero")
+    if b == 0 {
+        return Err(Error::new(SqlState::DIVISION_BY_ZERO, "division by zero")
             .detail(format!("{a} / {b}"))
-            .hint("Pass a non-zero divisor.")
-    })
+            .hint("Pass a non-zero divisor."));
+    }
+    a.checked_div(b)
+        .ok_or_else(|| Error::new(SqlState::NUMERIC_VALUE_OUT_OF_RANGE, "bigint out of range"))
 }
 
 /// Counts from 1 to n, lazily: rows stream into the tuplestore.
@@ -96,6 +98,13 @@ fn log_message(msg: &str) -> Result<i64> {
 #[pg_function(stable)]
 fn hello_via_spi(name: &str) -> Result<Option<String>> {
     spi::query_scalar("SELECT hello($1)", &[&name])
+}
+
+/// Counts rows in a SELECT with an empty target list.
+#[pg_function(stable)]
+fn empty_projection(n: i32) -> Result<i64> {
+    let rows = spi::query("SELECT FROM generate_series(1, $1)", &[&n])?;
+    Ok(i64::try_from(rows.len())?)
 }
 
 /// Runs a query that fails: the PostgreSQL error comes back unchanged.

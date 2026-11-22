@@ -16,12 +16,12 @@ set -eu
 
 PG_CONFIG=${1:-pg_config}
 [ $# -gt 0 ] && shift
-[ $# -gt 0 ] || set -- examples/pgext-demo examples/pgext-mini
+[ $# -gt 0 ] || set -- examples/pgext-demo examples/pgext-mini examples/pgext-inventory
 SUDO=${PGEXT_SUDO:-}
 PORT=${PGEXT_PORT:-5497}
 BIN=$("$PG_CONFIG" --bindir)
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-TMP=$(mktemp -d)
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/pgext.XXXXXXXX")
 
 cleanup() {
 	"$BIN/pg_ctl" -D "$TMP/data" -m immediate stop >/dev/null 2>&1 || true
@@ -46,7 +46,10 @@ failed=0
 n=0
 for project in "$@"; do
 	for test in "$project"/test*.sql; do
-		[ -e "$test" ] || continue
+		if [ ! -f "$test" ]; then
+			echo "expected a test*.sql file in $project" >&2
+			exit 1
+		fi
 		n=$((n + 1))
 		db=t$n
 		case $(basename "$test") in
@@ -62,8 +65,8 @@ for project in "$@"; do
 		*.fatal.sql) want=2 ;;
 		*) want=0 ;;
 		esac
-		if [ $want -eq 2 ] && ! grep -q 'FATAL:' "$TMP/server.log"; then
-			rc="$rc, no FATAL in the server log"
+		if [ $want -eq 2 ] && ! grep -q 'FATAL:' "$TMP/out"; then
+			rc="$rc, no FATAL in this session's output"
 		fi
 		if [ "$rc" = "$want" ] && "$BIN/psql" -X -q -h "$TMP" -p "$PORT" -U postgres -d postgres -c 'SELECT 1' >/dev/null 2>&1; then
 			echo "ok   $test"

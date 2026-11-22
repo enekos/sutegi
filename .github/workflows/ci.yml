@@ -88,13 +88,19 @@ jobs:
         run: cargo build --no-default-features
 
   # sutegi-pgext end to end: build the demo extension with `sutegi pgext`,
-  # load it into a real PostgreSQL 17 and run its SQL tests (errors,
+  # load it into PostgreSQL and run its SQL tests (errors,
   # panics, SPI, sets, cancellation, LATIN1 refusal). The unit tests swap
   # the C runtime for a Rust fake; this is the only job that runs the real
   # one.
   pgext:
-    name: pgext integration (PostgreSQL 17)
+    name: pgext integration (PostgreSQL ${{ matrix.postgres }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: [14, 17, 19]
+    env:
+      PG_MAJOR: ${{ matrix.postgres }}
     steps:
       - uses: actions/checkout@v4
 
@@ -108,15 +114,15 @@ jobs:
       # server-dev ones, and Ubuntu's versioned package names change
       # between releases. PGDG keeps every supported major for every
       # release.
-      - name: Install PostgreSQL 17 with server development files
+      - name: Install PostgreSQL with server development files
         run: |
           sudo apt-get update
           sudo apt-get install -y postgresql-common
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
-          sudo apt-get install -y postgresql-17 postgresql-server-dev-17
-          echo "PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config" >> "$GITHUB_ENV"
+          sudo apt-get install -y "postgresql-$PG_MAJOR" "postgresql-server-dev-$PG_MAJOR"
+          echo "PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config" >> "$GITHUB_ENV"
 
-      - name: Build, install and test the demo extension
+      - name: Build, install and test the example extensions
         run: scripts/pgext-test.sh "$PG_CONFIG"
         env:
           PGEXT_SUDO: sudo

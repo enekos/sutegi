@@ -1,0 +1,19 @@
+[package]
+name = "pgext-inventory"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Reserve inventory and report low-stock items with sutegi-pgext"
+
+[lib]
+crate-type = ["staticlib"]
+test = false
+doctest = false
+
+[dependencies]
+sutegi-pgext = { path = "../../crates/sutegi-pgext" }
+
+[lints]
+workspace = true

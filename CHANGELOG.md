@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- pgext now revokes `PUBLIC EXECUTE` on newly installed `security_definer` functions. Existing installations need an explicit privilege migration. [Migration SQL and example grants](docs/PGEXT.md#grant-access-to-a-definer-function)
+
 ## [0.15.0] - 2026-11-16
 
 ### Changed

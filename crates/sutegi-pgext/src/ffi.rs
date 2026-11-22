@@ -33,13 +33,6 @@ pub(crate) fn with_current<R>(f: impl for<'a> FnOnce(Call<'a>) -> Result<R>) -> 
     f(unsafe { Call::from_raw(raw) })
 }
 
-/// Whether PostgreSQL's `max_stack_depth` is exceeded.
-pub(crate) fn stack_too_deep() -> bool {
-    // SAFETY: a plain read of the stack pointer against PostgreSQL's limit;
-    // it never raises.
-    unsafe { sx_stack_too_deep() }
-}
-
 /// Restores the previous running call when dropped, so a nested call (SPI
 /// running SQL that calls back into this extension) and unwinding leave
 /// CURRENT right.
@@ -309,6 +302,11 @@ impl<'a> Call<'a> {
         ok(unsafe { sx_check_interrupts(self.raw) })
     }
 
+    pub(crate) fn stack_too_deep(self) -> bool {
+        // SAFETY: a live Call confines this non-raising check to the backend thread.
+        unsafe { sx_stack_too_deep() }
+    }
+
     /// Runs `sql` through SPI and copies the whole result into Rust.
     pub(crate) fn spi_exec(self, sql: &str, params: &[RawValue], limit: i64) -> Result<SpiResult> {
         let nparams = i32::try_from(params.len())
@@ -357,6 +355,7 @@ pub(crate) enum Arg<'a> {
 
 /// An SPI result copied into Rust-owned memory.
 pub(crate) struct SpiResult {
+    pub(crate) nrows: usize,
     pub(crate) processed: u64,
     pub(crate) columns: Vec<String>,
     pub(crate) cells: Vec<Option<String>>,
@@ -411,6 +410,7 @@ unsafe fn read_spi(res: *const RawSpiResult) -> Result<SpiResult> {
         cells.push(Some(crate::value::utf8(bytes)?.to_owned()));
     }
     Ok(SpiResult {
+        nrows,
         processed: res.processed,
         columns,
         cells,
