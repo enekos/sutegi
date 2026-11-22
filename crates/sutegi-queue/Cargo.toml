@@ -21,6 +21,7 @@ postgres = ["sutegi-orm/postgres"]
 
 [dev-dependencies]
 sutegi-orm = { path = "../sutegi-orm", version = "0.15.0", features = ["sqlite"] }
+zin-spec = { git = "https://github.com/enekos/zin.git", rev = "ac519cf47d35445a8610b26e7914da1f66cb5be4" }
 
 [lints]
 workspace = true

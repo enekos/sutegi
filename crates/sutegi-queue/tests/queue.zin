@@ -1,0 +1,48 @@
+system "Durable queue lifecycle"
+
+state
+  status is one of empty, ready, failed
+  attempts is an integer from 0 to 2
+
+initially
+  status is empty
+  attempts is 0
+
+always
+  status is empty implies attempts is 0
+  status is failed implies attempts is 2
+
+action dispatch
+  attempts becomes if status is ready then attempts else 0
+  status becomes ready
+
+action run(result is one of success, failure)
+  requires status is ready
+  status becomes if result is success then empty else if attempts is 1 then failed else ready
+  attempts becomes if result is success then 0 else attempts + 1
+
+action retry
+  requires status is failed
+  status becomes ready
+  attempts becomes 0
+
+action purge
+  status becomes if status is failed then empty else status
+  attempts becomes if status is failed then 0 else attempts
+
+sometimes
+  status is failed
+
+scenario "A fresh dispatch has a full attempt budget"
+  dispatch
+  expect status is ready and attempts is 0
+
+scenario "Only a dead letter can retry with a fresh budget"
+  reject retry
+  dispatch
+  reject retry
+  run(failure)
+  reject retry
+  run(failure)
+  retry
+  expect status is ready and attempts is 0
