@@ -81,6 +81,12 @@ pub(crate) fn sql_script(
         if let Some(r) = f.rows {
             attrs.push(format!("ROWS {r}"));
         }
+        // A SECURITY DEFINER function runs SPI queries with its owner's
+        // rights: pin search_path, or a caller could shadow a table or
+        // operator with an object in a schema they control.
+        if f.security_definer {
+            attrs.push("SET search_path = pg_catalog, pg_temp".into());
+        }
         emit!(out, "{};", attrs.join(" "));
         if !f.doc.is_empty() {
             emit!(
@@ -160,7 +166,7 @@ pub(crate) fn control(ext: &str, version: &str, comment: &str) -> String {
 /// (each with its own copy of `sx_invoke` and of Rust's std) can be loaded
 /// into one backend.
 pub(crate) fn exports(functions: &[Function], macos: bool) -> String {
-    let mut syms = vec!["Pg_magic_func".to_owned()];
+    let mut syms = vec!["Pg_magic_func".to_owned(), "_PG_init".to_owned()];
     for f in functions {
         let sym = c_symbol(f);
         syms.push(format!("pg_finfo_{sym}"));
@@ -202,7 +208,9 @@ pub(crate) fn makefile(m: &MakefileInput<'_>) -> String {
          DATA = {ext}--{version}.sql\n\
          PG_CONFIG = {pg_config}\n\
          PGXS := $(shell $(PG_CONFIG) --pgxs)\n\
-         include $(PGXS)\n",
+         include $(PGXS)\n\
+         # Relink when the Rust library changes, not only the C objects.\n\
+         $(shlib): {lib}\n",
         ext = m.ext,
         version = m.version,
         lib = m.staticlib,
@@ -255,7 +263,7 @@ COMMENT ON FUNCTION \"hello\"(text) IS 'It''s a greeting.';
 CREATE FUNCTION \"maybe_double\"(\"x\" bigint, \"order\" integer)
 RETURNS bigint
 AS 'MODULE_PATHNAME', 'sx_fn_maybe'
-LANGUAGE C VOLATILE LEAKPROOF SECURITY DEFINER;
+LANGUAGE C VOLATILE LEAKPROOF SECURITY DEFINER SET search_path = pg_catalog, pg_temp;
 
 -- sql/extra.sql
 SELECT 1;

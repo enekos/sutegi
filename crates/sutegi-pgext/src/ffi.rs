@@ -17,9 +17,10 @@ thread_local! {
     static CURRENT: Cell<*mut RawCall> = const { Cell::new(std::ptr::null_mut()) };
 }
 
-/// The call running on this thread, for the helpers (`notice`, `spi::…`)
-/// that don't take one.
-pub(crate) fn current() -> Result<Call<'static>> {
+/// Runs `f` with the call running on this thread, for the helpers
+/// (`notice`, `spi::…`) that don't take one. The `Call` gets a fresh
+/// lifetime that can't outlive `f`, so nothing borrowed from it escapes.
+pub(crate) fn with_current<R>(f: impl for<'a> FnOnce(Call<'a>) -> Result<R>) -> Result<R> {
     let raw = CURRENT.with(Cell::get);
     if raw.is_null() {
         return Err(Error::new(
@@ -28,8 +29,15 @@ pub(crate) fn current() -> Result<Call<'static>> {
         ));
     }
     // SAFETY: CURRENT is non-null only while `invoke` runs on this thread,
-    // and the helpers use the `Call` and drop it inside that window.
-    Ok(unsafe { Call::from_raw(raw) })
+    // and `f` returns before `invoke` does.
+    f(unsafe { Call::from_raw(raw) })
+}
+
+/// Whether PostgreSQL's `max_stack_depth` is exceeded.
+pub(crate) fn stack_too_deep() -> bool {
+    // SAFETY: a plain read of the stack pointer against PostgreSQL's limit;
+    // it never raises.
+    unsafe { sx_stack_too_deep() }
 }
 
 /// Restores the previous running call when dropped, so a nested call (SPI
@@ -128,9 +136,10 @@ pub(crate) struct RawSpiResult {
     pub(crate) processed: u64,
     pub(crate) names: *const *const c_char,
     pub(crate) values: *const RawValue,
+    pub(crate) cxt: *mut std::ffi::c_void,
 }
 
-const _: () = assert!(std::mem::size_of::<RawSpiResult>() == 40);
+const _: () = assert!(std::mem::size_of::<RawSpiResult>() == 48);
 
 /// The SQL types a value can have on the boundary (`sx_kind`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,12 +184,14 @@ unsafe extern "C" {
         limit: i64,
         out: *mut *const RawSpiResult,
     ) -> bool;
+    fn sx_spi_free(res: *const RawSpiResult);
+    fn sx_stack_too_deep() -> bool;
 }
 
 #[cfg(test)]
 use crate::fake::{
-    sx_arg, sx_check_interrupts, sx_log, sx_nargs, sx_ret, sx_set_error, sx_spi_exec, sx_srf_begin,
-    sx_srf_push,
+    sx_arg, sx_check_interrupts, sx_log, sx_nargs, sx_ret, sx_set_error, sx_spi_exec, sx_spi_free,
+    sx_srf_begin, sx_srf_push, sx_stack_too_deep,
 };
 
 /// A live PostgreSQL function call.
@@ -264,6 +275,11 @@ impl<'a> Call<'a> {
         detail: Option<&str>,
         hint: Option<&str>,
     ) {
+        let message = without_nul(message);
+        let detail = detail.map(without_nul);
+        let hint = hint.map(without_nul);
+        let detail = detail.as_deref();
+        let hint = hint.as_deref();
         let (dp, dl) = detail.map_or((std::ptr::null(), 0), |d| (d.as_ptr().cast(), d.len()));
         let (hp, hl) = hint.map_or((std::ptr::null(), 0), |h| (h.as_ptr().cast(), h.len()));
         // SAFETY: every pointer/length pair is a live Rust slice (or null
@@ -283,6 +299,7 @@ impl<'a> Call<'a> {
     }
 
     pub(crate) fn log(self, level: i32, message: &str) -> Result<()> {
+        let message = without_nul(message);
         // SAFETY: `message` is a live slice; the C side copies it.
         ok(unsafe { sx_log(self.raw, level, message.as_ptr().cast(), message.len()) })
     }
@@ -310,9 +327,23 @@ impl<'a> Call<'a> {
                 &mut out,
             )
         })?;
-        // SAFETY: on success `out` points at a result palloc'd in the call's
-        // memory context; read_spi copies everything out of it.
-        unsafe { read_spi(out) }
+        // SAFETY: on success `out` points at a result in its own memory
+        // context; read_spi copies everything out of it.
+        let copied = unsafe { read_spi(out) };
+        // SAFETY: `out` came from sx_spi_exec and nothing borrows it any
+        // more: read_spi returned owned values.
+        unsafe { sx_spi_free(out) };
+        copied
+    }
+}
+
+/// C copies messages as NUL-terminated strings: show an embedded NUL rather
+/// than silently cutting the message at it.
+fn without_nul(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.contains('\0') {
+        std::borrow::Cow::Owned(s.replace('\0', "\\0"))
+    } else {
+        std::borrow::Cow::Borrowed(s)
     }
 }
 

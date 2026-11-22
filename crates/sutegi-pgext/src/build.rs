@@ -62,6 +62,12 @@ struct Package {
     target_dir: PathBuf,
 }
 
+/// The cargo running us (when invoked through `cargo run`), else the one on
+/// PATH.
+fn cargo() -> Command {
+    Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+}
+
 fn run_capture(cmd: &mut Command) -> Result<String, String> {
     let out = cmd
         .stderr(Stdio::inherit())
@@ -126,8 +132,14 @@ fn package(manifest: &Path) -> Result<Package, String> {
     let lib = pkg
         .get("targets")
         .and_then(Json::as_array)
-        .and_then(|ts| ts.iter().find(|t| has_kind(t, "staticlib")))
-        .ok_or("the crate must build a static library: add `[lib] crate-type = [\"staticlib\"]` to Cargo.toml")?;
+        .and_then(|ts| {
+            ts.iter().find(|t| {
+                ["lib", "rlib", "staticlib", "cdylib", "dylib"]
+                    .iter()
+                    .any(|k| has_kind(t, k))
+            })
+        })
+        .ok_or("the crate has no library target: add src/lib.rs")?;
     let src_path = str_field(lib, "src_path").ok_or("the lib target has no src_path")?;
     Ok(Package {
         name: str_field(pkg, "name")
@@ -195,6 +207,22 @@ pub fn scan_dir(root: &Path, src_dir: &Path) -> Result<Vec<Function>, String> {
                     f.file, f.line, f.rust_name, prev.file, prev.line
                 ));
             }
+            let types = |g: &Function| g.params.iter().map(|p| p.sql_type).collect::<Vec<_>>();
+            if let Some(prev) = functions
+                .iter()
+                .find(|g| g.sql_name == f.sql_name && types(g) == types(&f))
+            {
+                return Err(format!(
+                    "{}:{}: SQL function {}({}) is already defined by {} at {}:{}",
+                    f.file,
+                    f.line,
+                    f.sql_name,
+                    types(&f).join(", "),
+                    prev.rust_name,
+                    prev.file,
+                    prev.line
+                ));
+            }
             functions.push(f);
         }
     }
@@ -246,7 +274,7 @@ fn cargo_build(
     lib_name: &str,
     release: bool,
 ) -> Result<(PathBuf, String), String> {
-    let mut cmd = Command::new("cargo");
+    let mut cmd = cargo();
     cmd.args([
         "rustc",
         "--lib",
@@ -300,6 +328,52 @@ fn cargo_build(
         staticlib,
         native.unwrap_or_else(|| default_native_libs().to_owned()),
     ))
+}
+
+/// Checks that every scanned function's wrapper made it into the static
+/// library. A `#[pg_function]` in a file outside the module tree, or behind a
+/// `cfg` that's off, is scanned but never compiled; on Linux the module
+/// would still link (undefined symbols are allowed in a shared object) and
+/// fail only at `CREATE EXTENSION`.
+fn check_wrappers(staticlib: &Path, functions: &[Function]) -> Result<(), String> {
+    // Apple's nm exits 1 on the LLVM bitcode in Rust's compiler_builtins
+    // while still listing every other member, so the exit status is no
+    // signal: an empty listing is.
+    let out = Command::new("nm")
+        .arg("-g")
+        .arg(staticlib)
+        .stderr(Stdio::null())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    if !out.contains("sutegi_pgext_fn_") && !out.contains("rust_begin_unwind") {
+        eprintln!(
+            "warning: couldn't list the static library with nm; skipping the check that every pg_function was compiled"
+        );
+        return Ok(());
+    }
+    let defined: std::collections::HashSet<&str> = out
+        .lines()
+        .filter_map(|l| {
+            // `[address] T symbol`; macOS prefixes C symbols with `_`.
+            let mut fields = l.split_whitespace().rev();
+            let (symbol, kind) = (fields.next()?, fields.next()?);
+            (kind == "T").then(|| symbol.strip_prefix('_').unwrap_or(symbol))
+        })
+        .collect();
+    let missing: Vec<String> = functions
+        .iter()
+        .filter(|f| !defined.contains(format!("sutegi_pgext_fn_{}", f.rust_name).as_str()))
+        .map(|f| format!("  {} ({}:{})", f.rust_name, f.file, f.line))
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "these #[pg_function]s were scanned but not compiled — is their module declared, and not cfg'd out?\n{}",
+            missing.join("\n")
+        ))
+    }
 }
 
 fn valid_ext_name(name: &str) -> bool {
@@ -368,6 +442,7 @@ pub fn build(opts: &Options) -> Result<Built, String> {
     let functions = scan_dir(&root, &pkg.src_dir)?;
     let extra = extra_sql(&root)?;
     let (staticlib, native_libs) = cargo_build(&manifest, &pkg.lib_name, opts.release)?;
+    check_wrappers(&staticlib, &functions)?;
 
     let work = pkg.target_dir.join("sutegi-pgext").join(&ext);
     std::fs::create_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
@@ -527,10 +602,10 @@ fn safe_div(a: i64, b: i64) -> Result<i64> {
         .ok_or_else(|| Error::new(SqlState::DIVISION_BY_ZERO, "division by zero"))
 }
 
-/// Counts from 1 to n.
+/// Counts from 1 to n, streaming the rows.
 #[pg_function(immutable, parallel_safe, rows = 10)]
 fn count_to(n: i64) -> SetOf<i64> {
-    (1..=n).collect()
+    SetOf::new(1..=n)
 }
 "#;
 
@@ -569,6 +644,25 @@ mod tests {
         assert!(make_safe(Path::new("/tmp/a b")).is_err());
         assert!(make_safe(Path::new("/tmp/a$b")).is_err());
         assert!(make_safe(Path::new("/tmp/ok-path_1")).is_ok());
+    }
+
+    #[test]
+    fn duplicate_sql_signatures_are_refused_at_build_time() {
+        let dir = std::env::temp_dir().join(format!("sutegi-pgext-dup-{}", std::process::id()));
+        let src = dir.join("src");
+        std::fs::create_dir_all(src.join("m")).unwrap();
+        std::fs::write(src.join("lib.rs"), "#[pg_function] fn a(x: i32) {}\n").unwrap();
+        std::fs::write(
+            src.join("m/b.rs"),
+            "#[pg_function(name = \"a\")] fn b(y: i32) {}\n",
+        )
+        .unwrap();
+        let err = scan_dir(&dir, &src).unwrap_err();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            err.contains("SQL function a(integer) is already defined by a"),
+            "{err}"
+        );
     }
 
     #[test]

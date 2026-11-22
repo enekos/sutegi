@@ -3,6 +3,7 @@
 //! C side's contract: a failing helper parks an error and poisons the call.
 #![allow(unsafe_code, reason = "stands in for the C side of the FFI boundary")]
 
+use std::cell::Cell;
 use std::ffi::CString;
 use std::os::raw::c_char;
 
@@ -311,6 +312,7 @@ pub(crate) unsafe fn sx_spi_exec(
         processed: rows.len() as u64,
         names: name_ptrs.as_ptr(),
         values: values.as_ptr(),
+        cxt: std::ptr::null_mut(),
     };
     let store = f.spi_store.insert(SpiStore {
         _names: names,
@@ -322,4 +324,26 @@ pub(crate) unsafe fn sx_spi_exec(
     // SAFETY: `out` is a valid out-pointer; the store lives in the FakeCall.
     unsafe { out.write(&raw const store.result) };
     true
+}
+
+thread_local! {
+    static SPI_FREED: Cell<usize> = const { Cell::new(0) };
+    static STACK_TOO_DEEP: Cell<bool> = const { Cell::new(false) };
+}
+
+/// How many SPI results have been freed on this thread.
+pub(crate) fn spi_freed() -> usize {
+    SPI_FREED.with(Cell::get)
+}
+
+pub(crate) fn set_stack_too_deep(deep: bool) {
+    STACK_TOO_DEEP.with(|c| c.set(deep));
+}
+
+pub(crate) unsafe fn sx_spi_free(_res: *const RawSpiResult) {
+    SPI_FREED.with(|c| c.set(c.get() + 1));
+}
+
+pub(crate) unsafe fn sx_stack_too_deep() -> bool {
+    STACK_TOO_DEEP.with(Cell::get)
 }

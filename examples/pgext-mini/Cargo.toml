@@ -1,0 +1,21 @@
+[package]
+name = "pgext-mini"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "sutegi-pgext fixture: a second extension sharing a backend with pgext-demo"
+
+# Defines the same Rust function names as pgext-demo, so loading both into
+# one backend proves each module keeps its runtime and Rust symbols private.
+[lib]
+crate-type = ["staticlib"]
+test = false
+doctest = false
+
+[dependencies]
+sutegi-pgext = { path = "../../crates/sutegi-pgext" }
+
+[lints]
+workspace = true

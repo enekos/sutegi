@@ -31,7 +31,7 @@
 StaticAssertDecl(sizeof(sx_value) == 40, "sx_value layout");
 StaticAssertDecl(offsetof(sx_value, i) == 8, "sx_value layout");
 StaticAssertDecl(offsetof(sx_value, ptr) == 24, "sx_value layout");
-StaticAssertDecl(sizeof(sx_spi_result) == 40, "sx_spi_result layout");
+StaticAssertDecl(sizeof(sx_spi_result) == 48, "sx_spi_result layout");
 
 struct sx_call
 {
@@ -49,6 +49,7 @@ struct sx_call
 	Oid			srf_type;
 	Tuplestorestate *tupstore;
 	TupleDesc	tupdesc;
+	MemoryContext rowcxt;
 };
 
 static void
@@ -169,7 +170,14 @@ sx_to_datum(const sx_value *v)
 				bytea	   *out;
 
 				if (v->kind == SX_TEXT)
+				{
 					sx_require_utf8();
+					if (v->len > 0 && memchr(v->ptr, '\0', v->len) != NULL)
+						ereport(ERROR,
+								(errcode(ERRCODE_CHARACTER_NOT_IN_REPERTOIRE),
+								 errmsg("invalid byte sequence for encoding \"UTF8\": 0x00"),
+								 errdetail("A text value from Rust contains a NUL byte, which PostgreSQL text can't hold.")));
+				}
 				if (v->len > MaxAllocSize - VARHDRSZ)
 					ereport(ERROR,
 							(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
@@ -362,6 +370,9 @@ sx_srf_begin(sx_call *call, int32 kind)
 		call->tupstore = tuplestore_begin_heap((rsinfo->allowedModes & SFRM_Materialize_Random) != 0,
 											   false, work_mem);
 		MemoryContextSwitchTo(old);
+		/* Each row's Datum is built here and dropped once the tuplestore copied it. */
+		call->rowcxt = AllocSetContextCreate(CurrentMemoryContext, "sutegi-pgext set row",
+											 ALLOCSET_SMALL_SIZES);
 
 		rsinfo->returnMode = SFRM_Materialize;
 		rsinfo->setResult = call->tupstore;
@@ -383,14 +394,18 @@ sx_srf_push(sx_call *call, const sx_value *value)
 	SX_GUARD(call, ok, {
 		Datum		d = (Datum) 0;
 		bool		isnull = value->isnull != 0;
+		MemoryContext old;
 
 		if (!call->srf || value->kind != call->srf_type)
 			ereport(ERROR,
 					(errcode(ERRCODE_INTERNAL_ERROR),
 					 errmsg_internal("sutegi-pgext: set row pushed outside a set")));
+		old = MemoryContextSwitchTo(call->rowcxt);
 		if (!isnull)
 			d = sx_to_datum(value);
 		tuplestore_putvalues(call->tupstore, call->tupdesc, &d, &isnull);
+		MemoryContextSwitchTo(old);
+		MemoryContextReset(call->rowcxt);
 	});
 	return ok;
 }
@@ -494,7 +509,8 @@ sx_spi_exec(sx_call *call, const char *sql, size_t sql_len,
 		return false;
 
 	SX_GUARD(call, ok, {
-		char	   *query = pnstrdup(sql, sql_len);
+		MemoryContext cxt;
+		char	   *query;
 		Oid		   *types = NULL;
 		Datum	   *values = NULL;
 		char	   *nulls = NULL;
@@ -505,6 +521,19 @@ sx_spi_exec(sx_call *call, const char *sql, size_t sql_len,
 			ereport(ERROR,
 					(errcode(ERRCODE_INTERNAL_ERROR),
 					 errmsg_internal("sutegi-pgext: bad SPI arguments")));
+		if (sql_len > 0 && memchr(sql, '\0', sql_len) != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_CHARACTER_NOT_IN_REPERTOIRE),
+					 errmsg("sutegi-pgext: the query string contains a NUL byte")));
+
+		/*
+		 * Everything this query keeps (the query text, parameters and the
+		 * copied result) lives in cxt, deleted by sx_spi_free; on an error
+		 * it's left to the function's memory context, a parent.
+		 */
+		cxt = AllocSetContextCreate(caller, "sutegi-pgext SPI result", ALLOCSET_DEFAULT_SIZES);
+		MemoryContextSwitchTo(cxt);
+		query = pnstrdup(sql, sql_len);
 		if (nparams > 0)
 		{
 			types = palloc(sizeof(Oid) * nparams);
@@ -533,7 +562,8 @@ sx_spi_exec(sx_call *call, const char *sql, size_t sql_len,
 					(errcode(ERRCODE_INTERNAL_ERROR),
 					 errmsg("sutegi-pgext: SPI_execute failed: %s", SPI_result_code_string(rc))));
 
-		res = MemoryContextAllocZero(caller, sizeof(sx_spi_result));
+		res = MemoryContextAllocZero(cxt, sizeof(sx_spi_result));
+		res->cxt = cxt;
 		res->processed = SPI_processed;
 		if (SPI_tuptable != NULL)
 		{
@@ -541,10 +571,10 @@ sx_spi_exec(sx_call *call, const char *sql, size_t sql_len,
 
 			res->nrows = SPI_processed;
 			res->ncols = desc->natts;
-			res->names = MemoryContextAllocZero(caller, mul_size(sizeof(char *), Max(desc->natts, 1)));
+			res->names = MemoryContextAllocZero(cxt, mul_size(sizeof(char *), Max(desc->natts, 1)));
 			for (int c = 0; c < desc->natts; c++)
-				res->names[c] = MemoryContextStrdup(caller, NameStr(TupleDescAttr(desc, c)->attname));
-			res->values = MemoryContextAllocHuge(caller,
+				res->names[c] = MemoryContextStrdup(cxt, NameStr(TupleDescAttr(desc, c)->attname));
+			res->values = MemoryContextAllocHuge(cxt,
 												 mul_size(mul_size(sizeof(sx_value), Max(res->nrows, 1)),
 														  Max(desc->natts, 1)));
 			for (uint64 r = 0; r < res->nrows; r++)
@@ -563,14 +593,52 @@ sx_spi_exec(sx_call *call, const char *sql, size_t sql_len,
 					else
 					{
 						v->len = strlen(text);
-						v->ptr = MemoryContextStrdup(caller, text);
+						v->ptr = MemoryContextStrdup(cxt, text);
 						pfree(text);
 					}
 				}
 			}
 		}
 		SPI_finish();
+		MemoryContextSwitchTo(caller);
 		*out = res;
 	});
 	return ok;
+}
+
+void
+sx_spi_free(sx_spi_result *res)
+{
+	if (res != NULL)
+		MemoryContextDelete((MemoryContext) res->cxt);
+}
+
+bool
+sx_stack_too_deep(void)
+{
+	return stack_is_too_deep();
+}
+
+/*
+ * Rust's global allocator calls this when malloc fails. Rust would abort the
+ * process, and PostgreSQL treats a backend killed by a signal as a crash: it
+ * resets every session and replays WAL. Raising FATAL instead ends only this
+ * session, through the normal exit path (transaction aborted, locks
+ * released). It runs while Rust code is mid-allocation, so it must not
+ * return and must not longjmp: FATAL calls proc_exit.
+ */
+static void
+sx_oom(size_t size)
+{
+	ereport(FATAL,
+			(errcode(ERRCODE_OUT_OF_MEMORY),
+			 errmsg("out of memory"),
+			 errdetail("A Rust allocation of %zu bytes failed in a sutegi-pgext extension.", size)));
+	pg_unreachable();
+}
+
+void
+_PG_init(void)
+{
+	sutegi_pgext_on_load(sx_oom);
 }

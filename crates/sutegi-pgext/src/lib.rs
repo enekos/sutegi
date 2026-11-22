@@ -23,7 +23,7 @@
 //!
 //! #[pg_function(immutable)]
 //! fn series(n: i64) -> SetOf<i64> {
-//!     (1..=n).collect()
+//!     SetOf::new(1..=n)
 //! }
 //! ```
 //!
@@ -42,11 +42,14 @@
 //! error is re-thrown once Rust has returned. A Rust `Err` becomes an
 //! `ERROR` with its SQLSTATE; a panic is caught and becomes an internal
 //! `ERROR` (the backend survives). Results are copied into `palloc` memory
-//! before Rust's values are dropped.
+//! before Rust's values are dropped. A failed allocation, which Rust can only
+//! abort on, ends just the session with `FATAL` (see the global allocator);
+//! deep recursion should call [`check_stack_depth`].
 //!
 //! Don't call into this crate from threads you spawn: PostgreSQL isn't
 //! thread-safe, and every operation here fails outside a SQL function call.
 
+mod alloc;
 mod error;
 mod ffi;
 pub mod spi;
@@ -63,7 +66,7 @@ pub use error::{Error, Result, SqlState};
 pub use sutegi_macros::pg_function;
 pub use value::{FromArg, IntoReturn, SetOf, SqlKind, ToSql};
 
-use ffi::{Call, current};
+use ffi::{Call, with_current};
 
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
     if let Some(s) = payload.downcast_ref::<&'static str>() {
@@ -111,7 +114,7 @@ pub(crate) fn run<'a>(
 ///
 /// See above.
 pub fn notice(message: &str) -> Result<()> {
-    current()?.log(3, message)
+    with_current(|c| c.log(3, message))
 }
 
 /// Logs `message` at `WARNING`.
@@ -120,7 +123,7 @@ pub fn notice(message: &str) -> Result<()> {
 ///
 /// As [`notice`].
 pub fn warning(message: &str) -> Result<()> {
-    current()?.log(4, message)
+    with_current(|c| c.log(4, message))
 }
 
 /// Logs `message` at `INFO` (always sent to the client).
@@ -129,7 +132,7 @@ pub fn warning(message: &str) -> Result<()> {
 ///
 /// As [`notice`].
 pub fn info(message: &str) -> Result<()> {
-    current()?.log(2, message)
+    with_current(|c| c.log(2, message))
 }
 
 /// Logs `message` to the server log only (`LOG`).
@@ -138,7 +141,7 @@ pub fn info(message: &str) -> Result<()> {
 ///
 /// As [`notice`].
 pub fn log(message: &str) -> Result<()> {
-    current()?.log(1, message)
+    with_current(|c| c.log(1, message))
 }
 
 /// Logs `message` at `DEBUG1`.
@@ -147,7 +150,7 @@ pub fn log(message: &str) -> Result<()> {
 ///
 /// As [`notice`].
 pub fn debug(message: &str) -> Result<()> {
-    current()?.log(0, message)
+    with_current(|c| c.log(0, message))
 }
 
 /// Lets PostgreSQL act on a pending cancel or termination request. Call it
@@ -157,11 +160,37 @@ pub fn debug(message: &str) -> Result<()> {
 ///
 /// The pending cancel/termination, or outside a SQL function call.
 pub fn check_for_interrupts() -> Result<()> {
-    current()?.check_interrupts()
+    with_current(|c| c.check_interrupts())
 }
+
+/// Fails when PostgreSQL's `max_stack_depth` is exceeded. Call it at the
+/// top of a recursive Rust function: PostgreSQL only checks the stack when it
+/// runs, and a Rust stack overflow kills the backend with `SIGSEGV`, which
+/// makes the postmaster reset every session.
+///
+/// # Errors
+///
+/// `stack depth limit exceeded` (SQLSTATE `54001`).
+pub fn check_stack_depth() -> Result<()> {
+    if ffi::stack_too_deep() {
+        return Err(Error::new(
+            SqlState::STATEMENT_TOO_COMPLEX,
+            "stack depth limit exceeded",
+        )
+        .hint("Increase max_stack_depth, or recurse less deeply."));
+    }
+    Ok(())
+}
+
+#[cfg(all(panic = "abort", not(feature = "build")))]
+compile_error!(
+    "sutegi-pgext needs panic = \"unwind\": it turns a panic into a SQL error, and with \"abort\" \
+     a panic kills the backend and resets every session. Set panic = \"unwind\" in the profile."
+);
 
 #[doc(hidden)]
 pub mod __private {
+    pub use crate::alloc::sutegi_pgext_on_load;
     pub use crate::ffi::{Call, RawCall};
     pub use crate::value::{FromArg, IntoReturn};
 
@@ -251,6 +280,45 @@ mod tests {
     }
 
     #[test]
+    fn lazy_sets_stream_without_collecting() {
+        let out = FakeCall::new(vec![]).invoke("s", 0, |call| {
+            SetOf::new((1..=3i64).map(|i| (i != 2).then_some(i * 10))).into_return(call)
+        });
+        assert_eq!(
+            out,
+            Outcome::Set(vec![Val::Int(10), Val::Null, Val::Int(30)])
+        );
+    }
+
+    #[test]
+    fn foreign_errors_convert_through_into() {
+        let out = FakeCall::new(vec![Val::Text("x1".into())]).invoke("p", 1, |call| {
+            let s = <&str>::from_arg(call, 0)?;
+            s.parse::<i32>().into_return(call)
+        });
+        assert!(
+            matches!(&out, Outcome::Error(st, m) if st == "P0001" && m.contains("invalid digit"))
+        );
+    }
+
+    #[test]
+    fn nul_in_messages_is_shown_not_truncated() {
+        let out = FakeCall::new(vec![]).invoke("f", 0, |call| {
+            Err::<i32, _>(Error::raise("a\0b")).into_return(call)
+        });
+        assert_eq!(out, Outcome::Error("P0001".into(), "a\\0b".into()));
+    }
+
+    #[test]
+    fn stack_depth_is_reported_as_54001() {
+        fake::set_stack_too_deep(true);
+        let deep = check_stack_depth().map_err(|e| e.sqlstate());
+        fake::set_stack_too_deep(false);
+        assert_eq!(deep, Err(Some(SqlState::STATEMENT_TOO_COMPLEX)));
+        assert!(check_stack_depth().is_ok());
+    }
+
+    #[test]
     fn helpers_fail_outside_a_call() {
         assert!(notice("x").is_err());
         assert!(spi::execute("select 1", &[]).is_err());
@@ -262,6 +330,6 @@ mod tests {
             notice("inside")?;
             ().into_return(call)
         });
-        assert!(current().is_err());
+        assert!(with_current(|_| Ok(())).is_err());
     }
 }
