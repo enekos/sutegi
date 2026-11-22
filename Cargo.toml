@@ -40,6 +40,7 @@ members = [
     "examples/ws-load",
     "examples/http-load",
     "examples/pgext-demo",
+    "examples/pgext-inventory",
     "examples/pgext-mini",
 ]
 # Standalone tooling workspaces, each excluded so normal builds / tests /

@@ -24,6 +24,7 @@ use crate::value::ToSql;
 pub struct Rows {
     columns: Vec<String>,
     cells: Vec<Option<String>>,
+    nrows: usize,
     processed: u64,
 }
 
@@ -35,10 +36,7 @@ impl Rows {
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.cells
-            .len()
-            .checked_div(self.columns.len())
-            .unwrap_or(0)
+        self.nrows
     }
 
     #[must_use]
@@ -54,6 +52,9 @@ impl Rows {
 
     #[must_use]
     pub fn get(&self, row: usize) -> Option<Row<'_>> {
+        if row >= self.nrows {
+            return None;
+        }
         let n = self.columns.len();
         let start = row.checked_mul(n)?;
         let cells = self.cells.get(start..start.checked_add(n)?)?;
@@ -101,6 +102,7 @@ fn exec(sql: &str, params: &[&dyn ToSql], limit: i64) -> Result<Rows> {
     Ok(Rows {
         columns: res.columns,
         cells: res.cells,
+        nrows: res.nrows,
         processed: res.processed,
     })
 }
@@ -157,8 +159,10 @@ pub fn query_scalar(sql: &str, params: &[&dyn ToSql]) -> Result<Option<String>> 
 
 impl From<Rows> for Vec<Vec<Option<String>>> {
     fn from(rows: Rows) -> Self {
-        let n = rows.columns.len().max(1);
-        rows.cells.chunks(n).map(<[_]>::to_vec).collect()
+        let mut cells = rows.cells.into_iter();
+        (0..rows.nrows)
+            .map(|_| cells.by_ref().take(rows.columns.len()).collect())
+            .collect()
     }
 }
 
@@ -185,9 +189,37 @@ mod tests {
                 .iter()
                 .filter_map(|r| r.get(0)?.parse::<i64>().ok())
                 .sum();
+            assert_eq!(
+                Vec::<Vec<Option<String>>>::from(rows),
+                [
+                    vec![Some("1".into()), Some("a".into())],
+                    vec![Some("2".into()), None]
+                ]
+            );
             total.into_return(call)
         });
         assert_eq!(out, Outcome::Value(Val::Int(3)));
+    }
+
+    #[test]
+    fn zero_column_rows_keep_their_cardinality() {
+        for n in [0, 3] {
+            let out = FakeCall::new(vec![])
+                .with_spi(vec![], vec![vec![]; n])
+                .invoke("q", 0, |call| {
+                    let rows = query("SELECT FROM generate_series(1, $1)", &[&i32::try_from(n)?])?;
+                    assert_eq!(rows.len(), n);
+                    assert_eq!(rows.is_empty(), n == 0);
+                    assert_eq!(rows.first().is_some(), n > 0);
+                    assert!(rows.get(n).is_none());
+                    assert!(rows.get(usize::MAX).is_none());
+                    assert_eq!(rows.iter().count(), n);
+                    let owned: Vec<Vec<Option<String>>> = rows.into();
+                    assert_eq!(owned, vec![Vec::<Option<String>>::new(); n]);
+                    ().into_return(call)
+                });
+            assert_eq!(out, Outcome::Value(Val::Null));
+        }
     }
 
     #[test]

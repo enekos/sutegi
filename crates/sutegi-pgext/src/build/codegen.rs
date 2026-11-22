@@ -88,6 +88,14 @@ pub(crate) fn sql_script(
             attrs.push("SET search_path = pg_catalog, pg_temp".into());
         }
         emit!(out, "{};", attrs.join(" "));
+        if f.security_definer {
+            emit!(
+                out,
+                "REVOKE EXECUTE ON FUNCTION {}({}) FROM PUBLIC;",
+                ident(&f.sql_name),
+                signature_types(f)
+            );
+        }
         if !f.doc.is_empty() {
             emit!(
                 out,
@@ -264,6 +272,7 @@ CREATE FUNCTION \"maybe_double\"(\"x\" bigint, \"order\" integer)
 RETURNS bigint
 AS 'MODULE_PATHNAME', 'sx_fn_maybe'
 LANGUAGE C VOLATILE LEAKPROOF SECURITY DEFINER SET search_path = pg_catalog, pg_temp;
+REVOKE EXECUTE ON FUNCTION \"maybe_double\"(bigint, integer) FROM PUBLIC;
 
 -- sql/extra.sql
 SELECT 1;

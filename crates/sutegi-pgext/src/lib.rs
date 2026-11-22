@@ -7,7 +7,7 @@
 //! file — and links the result with PGXS into a loadable module.
 //!
 //! ```ignore
-//! use sutegi_pgext::{pg_function, Error, Result, SetOf};
+//! use sutegi_pgext::{pg_function, Error, Result, SetOf, SqlState};
 //!
 //! /// Returns a greeting for name.
 //! #[pg_function(immutable, parallel_safe)]
@@ -17,8 +17,11 @@
 //!
 //! #[pg_function(immutable, parallel_safe)]
 //! fn safe_div(a: i64, b: i64) -> Result<i64> {
+//!     if b == 0 {
+//!         return Err(Error::new(SqlState::DIVISION_BY_ZERO, "division by zero"));
+//!     }
 //!     a.checked_div(b)
-//!         .ok_or_else(|| Error::new(sutegi_pgext::SqlState::DIVISION_BY_ZERO, "division by zero"))
+//!         .ok_or_else(|| Error::new(SqlState::NUMERIC_VALUE_OUT_OF_RANGE, "bigint out of range"))
 //! }
 //!
 //! #[pg_function(immutable)]
@@ -170,9 +173,9 @@ pub fn check_for_interrupts() -> Result<()> {
 ///
 /// # Errors
 ///
-/// `stack depth limit exceeded` (SQLSTATE `54001`).
+/// `stack depth limit exceeded` (SQLSTATE `54001`), or outside a SQL call.
 pub fn check_stack_depth() -> Result<()> {
-    if ffi::stack_too_deep() {
+    if with_current(|call| Ok(call.stack_too_deep()))? {
         return Err(Error::new(
             SqlState::STATEMENT_TOO_COMPLEX,
             "stack depth limit exceeded",
@@ -311,17 +314,25 @@ mod tests {
 
     #[test]
     fn stack_depth_is_reported_as_54001() {
-        fake::set_stack_too_deep(true);
-        let deep = check_stack_depth().map_err(|e| e.sqlstate());
-        fake::set_stack_too_deep(false);
-        assert_eq!(deep, Err(Some(SqlState::STATEMENT_TOO_COMPLEX)));
-        assert!(check_stack_depth().is_ok());
+        let out = FakeCall::new(vec![]).invoke("depth", 0, |call| {
+            check_stack_depth()?;
+            fake::set_stack_too_deep(true);
+            let deep = check_stack_depth().map_err(|e| e.sqlstate());
+            fake::set_stack_too_deep(false);
+            assert_eq!(deep, Err(Some(SqlState::STATEMENT_TOO_COMPLEX)));
+            ().into_return(call)
+        });
+        assert_eq!(out, Outcome::Value(Val::Null));
     }
 
     #[test]
     fn helpers_fail_outside_a_call() {
         assert!(notice("x").is_err());
         assert!(spi::execute("select 1", &[]).is_err());
+        assert_eq!(
+            check_stack_depth().unwrap_err().sqlstate(),
+            Some(SqlState::FEATURE_NOT_SUPPORTED)
+        );
     }
 
     #[test]

@@ -399,11 +399,15 @@ fn make_safe(path: &Path) -> Result<String, String> {
     let s = path
         .to_str()
         .ok_or_else(|| format!("{} is not UTF-8", path.display()))?;
-    if s.chars()
-        .any(|c| c.is_whitespace() || matches!(c, '$' | '#' | '\'' | '"' | '\\'))
+    // PGXS expands these paths into both Make prerequisites and shell words.
+    if s.is_empty()
+        || s.starts_with('-')
+        || !s
+            .chars()
+            .all(|c| c.is_alphanumeric() || "/._-+@".contains(c))
     {
         return Err(format!(
-            "make can't handle the path {s}: move the target directory"
+            "PGXS needs a plain path, got {s:?}: use letters, digits, / . _ - + or @"
         ));
     }
     Ok(s.to_owned())
@@ -598,8 +602,11 @@ fn hello(name: &str) -> String {
 /// Divides a by b, raising division_by_zero instead of panicking.
 #[pg_function(immutable, parallel_safe)]
 fn safe_div(a: i64, b: i64) -> Result<i64> {
+    if b == 0 {
+        return Err(Error::new(SqlState::DIVISION_BY_ZERO, "division by zero"));
+    }
     a.checked_div(b)
-        .ok_or_else(|| Error::new(SqlState::DIVISION_BY_ZERO, "division by zero"))
+        .ok_or_else(|| Error::new(SqlState::NUMERIC_VALUE_OUT_OF_RANGE, "bigint out of range"))
 }
 
 /// Counts from 1 to n, streaming the rows.
@@ -613,9 +620,14 @@ const NEW_TEST_SQL: &str = r#"-- Asserts by raising: run with psql -v ON_ERROR_S
 CREATE EXTENSION {name};
 DO $$
 BEGIN
-  IF hello('world') <> 'Hello, world!' THEN RAISE 'hello'; END IF;
-  IF safe_div(7, 2) <> 3 THEN RAISE 'safe_div'; END IF;
-  IF (SELECT sum(n) FROM count_to(4) AS n) <> 10 THEN RAISE 'count_to'; END IF;
+  IF hello('world') IS DISTINCT FROM 'Hello, world!' THEN RAISE 'hello'; END IF;
+  IF safe_div(7, 2) IS DISTINCT FROM 3 THEN RAISE 'safe_div'; END IF;
+  BEGIN
+    PERFORM safe_div('-9223372036854775808'::bigint, -1);
+    RAISE 'expected bigint overflow';
+  EXCEPTION WHEN numeric_value_out_of_range THEN NULL;
+  END;
+  IF (SELECT sum(n) FROM count_to(4) AS n) IS DISTINCT FROM 10 THEN RAISE 'count_to'; END IF;
 END $$;
 "#;
 
@@ -643,7 +655,10 @@ mod tests {
     fn make_rejects_paths_it_would_split() {
         assert!(make_safe(Path::new("/tmp/a b")).is_err());
         assert!(make_safe(Path::new("/tmp/a$b")).is_err());
-        assert!(make_safe(Path::new("/tmp/ok-path_1")).is_ok());
+        assert!(make_safe(Path::new("/tmp/R&D/postgres")).is_err());
+        assert!(make_safe(Path::new("/tmp/build[2]")).is_err());
+        assert!(make_safe(Path::new("pg_config")).is_ok());
+        assert!(make_safe(Path::new("/tmp/postgresql@17/ok-path_1")).is_ok());
     }
 
     #[test]

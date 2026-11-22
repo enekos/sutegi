@@ -569,14 +569,14 @@ sx_spi_exec(sx_call *call, const char *sql, size_t sql_len,
 		{
 			TupleDesc	desc = SPI_tuptable->tupdesc;
 
-			res->nrows = SPI_processed;
+			res->nrows = SPI_tuptable->numvals;
 			res->ncols = desc->natts;
-			res->names = MemoryContextAllocZero(cxt, mul_size(sizeof(char *), Max(desc->natts, 1)));
+			res->names = MemoryContextAllocZero(cxt, mul_size(sizeof(char *), desc->natts));
 			for (int c = 0; c < desc->natts; c++)
 				res->names[c] = MemoryContextStrdup(cxt, NameStr(TupleDescAttr(desc, c)->attname));
 			res->values = MemoryContextAllocHuge(cxt,
-												 mul_size(mul_size(sizeof(sx_value), Max(res->nrows, 1)),
-														  Max(desc->natts, 1)));
+												 mul_size(mul_size(res->nrows, desc->natts),
+														  sizeof(sx_value)));
 			for (uint64 r = 0; r < res->nrows; r++)
 			{
 				HeapTuple	tuple = SPI_tuptable->vals[r];
