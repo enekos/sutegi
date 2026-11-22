@@ -159,6 +159,119 @@ fn racing_migrator() -> Migrator {
 }
 
 #[test]
+fn renamed_tables_keep_later_constraint_changes_reversible() {
+    use sutegi_orm::schema_diff::SchemaOp;
+    use sutegi_orm::{ColType, Column, FkAction, ForeignKey, TableSchema};
+
+    let _serial = serial();
+    let Some(pg) = db() else {
+        eprintln!("skipping: SUTEGI_PG_TEST_URL not set");
+        return;
+    };
+    scrub(
+        &pg,
+        "pgmig_rename",
+        &["pgmig_old_items", "pgmig_new_items", "pgmig_parents"],
+    );
+
+    let parent =
+        TableSchema::new("pgmig_parents").column(Column::new("id", ColType::Integer).primary());
+    let original = TableSchema::new("pgmig_old_items")
+        .column(Column::new("id", ColType::Integer).primary())
+        .column(Column::new("slug", ColType::Text).unique())
+        .column(Column::new("parent_id", ColType::Integer))
+        .foreign_key("parent_id", "pgmig_parents", "id", FkAction::Cascade);
+    let migration = Migrator::new().add(Migration::ops(
+        "pgmig_rename_constraints",
+        "rename_constraints",
+        vec![
+            SchemaOp::CreateTable(parent),
+            SchemaOp::CreateTable(original),
+            SchemaOp::RenameTable {
+                from: "pgmig_old_items".into(),
+                to: "pgmig_new_items".into(),
+            },
+            SchemaOp::AlterColumn {
+                table: "pgmig_new_items".into(),
+                from: Column::new("slug", ColType::Text).unique(),
+                to: Column::new("slug", ColType::Text),
+            },
+            SchemaOp::DropForeignKey {
+                table: "pgmig_new_items".into(),
+                fk: ForeignKey {
+                    column: "parent_id".into(),
+                    ref_table: "pgmig_parents".into(),
+                    ref_column: "id".into(),
+                    on_delete: FkAction::Cascade,
+                },
+            },
+        ],
+    ));
+
+    migration.run(&pg).unwrap();
+    let renamed = pg
+        .introspect()
+        .unwrap()
+        .into_iter()
+        .find(|table| table.table == "pgmig_new_items")
+        .unwrap();
+    assert!(!renamed.col("slug").unwrap().unique);
+    assert!(renamed.foreign_keys.is_empty());
+
+    migration.rollback(&pg, 1).unwrap();
+    assert!(
+        pg.introspect()
+            .unwrap()
+            .iter()
+            .all(|table| { table.table != "pgmig_new_items" && table.table != "pgmig_parents" })
+    );
+    scrub(
+        &pg,
+        "pgmig_rename",
+        &["pgmig_old_items", "pgmig_new_items", "pgmig_parents"],
+    );
+}
+
+#[test]
+fn dropping_an_indexed_column_removes_the_index_first() {
+    use sutegi_orm::schema_diff::diff;
+    use sutegi_orm::{ColType, Column, Dialect, TableSchema};
+
+    let _serial = serial();
+    let Some(pg) = db() else {
+        eprintln!("skipping: SUTEGI_PG_TEST_URL not set");
+        return;
+    };
+    scrub(&pg, "pgmig_drop_indexed", &["pgmig_drop_items"]);
+    let original = TableSchema::new("pgmig_drop_items")
+        .column(Column::new("id", ColType::Integer).primary())
+        .column(Column::new("slug", ColType::Text))
+        .index(&["slug"]);
+    let desired =
+        TableSchema::new("pgmig_drop_items").column(Column::new("id", ColType::Integer).primary());
+    let mut ops = diff(&[], std::slice::from_ref(&original), Dialect::Postgres).ops;
+    ops.extend(diff(&[original], &[desired], Dialect::Postgres).ops);
+    let migration = Migrator::new().add(Migration::ops(
+        "pgmig_drop_indexed_column",
+        "drop_indexed_column",
+        ops,
+    ));
+
+    migration.run(&pg).unwrap();
+    assert_eq!(
+        pg.introspect()
+            .unwrap()
+            .into_iter()
+            .find(|table| table.table == "pgmig_drop_items")
+            .unwrap()
+            .columns
+            .len(),
+        1
+    );
+    scrub(&pg, "pgmig_drop_indexed", &["pgmig_drop_items"]);
+}
+
+#[test]
 fn racing_pg_runners_apply_each_migration_exactly_once() {
     let _serial = serial();
     let Some(pg) = db() else {

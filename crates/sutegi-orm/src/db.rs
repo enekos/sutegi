@@ -140,9 +140,21 @@ impl SqlitePool {
     /// `f` stays on one connection.
     fn with<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T, String>) -> Result<T, String> {
         let mut conn = self.checkout()?;
-        let result = f(&mut conn);
-        self.checkin(conn);
-        result
+        let slot = DropGuard::new(self, SqlitePool::discard);
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut conn))) {
+            Ok(result) => {
+                DropGuard::dismiss(slot);
+                self.checkin(conn);
+                result
+            }
+            Err(payload) => {
+                if !conn.is_autocommit() && conn.execute_batch("ROLLBACK").is_ok() {
+                    DropGuard::dismiss(slot);
+                    self.checkin(conn);
+                }
+                std::panic::resume_unwind(payload)
+            }
+        }
     }
 
     fn checkout(&self) -> Result<Connection, String> {
@@ -173,6 +185,13 @@ impl SqlitePool {
         let (lock, cvar) = &self.state;
         let mut inner = lock.lock().unwrap();
         inner.idle.push(conn);
+        cvar.notify_one();
+    }
+
+    fn discard(&self) {
+        let (lock, cvar) = &self.state;
+        let mut inner = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        inner.open = inner.open.saturating_sub(1);
         cvar.notify_one();
     }
 }
@@ -285,11 +304,14 @@ impl Db {
             };
             match f(&tx) {
                 Ok(value) => {
-                    tx.conn
-                        .borrow_mut()
-                        .execute_batch("COMMIT")
-                        .map_err(|e| e.to_string())?;
-                    Ok(value)
+                    let committed = tx.conn.borrow_mut().execute_batch("COMMIT");
+                    match committed {
+                        Ok(()) => Ok(value),
+                        Err(error) => {
+                            let _ = tx.conn.borrow_mut().execute_batch("ROLLBACK");
+                            Err(error.to_string())
+                        }
+                    }
                 }
                 Err(e) => {
                     let _ = tx.conn.borrow_mut().execute_batch("ROLLBACK");
@@ -352,8 +374,9 @@ fn upsert_conn(
     table: &str,
     cols: &[(&str, Value)],
     conflict: &str,
+    pk: &str,
 ) -> Result<i64, String> {
-    crate::builder::validate_write_idents(table, cols, &[conflict])?;
+    crate::builder::validate_write_idents(table, cols, &[conflict, pk])?;
     let names: Vec<&str> = cols.iter().map(|(n, _)| *n).collect();
     let placeholders = vec!["?"; cols.len()].join(", ");
     let updates: Vec<String> = names
@@ -362,18 +385,23 @@ fn upsert_conn(
         .map(|n| format!("{} = excluded.{}", n, n))
         .collect();
     let sql = format!(
-        "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT({}) DO UPDATE SET {}",
+        "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT({}) DO UPDATE SET {} RETURNING {}",
         table,
         names.join(", "),
         placeholders,
         conflict,
-        updates.join(", ")
+        updates.join(", "),
+        pk
     );
-    let bound: Vec<SqlValue> = cols.iter().map(|(_, v)| to_sql(v)).collect();
-    let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
-    stmt.execute(params_from_iter(bound))
-        .map_err(|e| e.to_string())?;
-    Ok(conn.last_insert_rowid())
+    let rows = query_conn(
+        conn,
+        &sql,
+        &cols.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(),
+    )?;
+    rows.first()
+        .and_then(|row| row.get(pk))
+        .and_then(Json::as_i64)
+        .ok_or_else(|| format!("upsert did not return integer primary key `{pk}`"))
 }
 
 /// Map a SQLite declared column type back to a [`ColType`]. JSON- and
@@ -508,10 +536,10 @@ impl Backend for Db {
         table: &str,
         cols: &[(&str, Value)],
         conflict: &str,
-        _pk: &str,
+        pk: &str,
     ) -> Result<i64, String> {
         self.pool
-            .with(|conn| upsert_conn(conn, table, cols, conflict))
+            .with(|conn| upsert_conn(conn, table, cols, conflict, pk))
     }
 
     fn migrate(&self, schema: &TableSchema) -> Result<(), String> {
@@ -615,10 +643,10 @@ impl Backend for Tx<'_> {
         table: &str,
         cols: &[(&str, Value)],
         conflict: &str,
-        _pk: &str,
+        pk: &str,
     ) -> Result<i64, String> {
         let conn = self.conn.borrow();
-        upsert_conn(&conn, table, cols, conflict)
+        upsert_conn(&conn, table, cols, conflict, pk)
     }
 
     fn migrate(&self, schema: &TableSchema) -> Result<(), String> {
@@ -957,6 +985,49 @@ mod tests {
     }
 
     #[test]
+    fn failed_commit_rolls_back_before_returning_the_connection_to_the_pool() {
+        let db = Db::memory().unwrap();
+        db.execute("PRAGMA foreign_keys = ON", &[]).unwrap();
+        db.execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        db.execute(
+            "CREATE TABLE children (parent_id INTEGER REFERENCES parents(id) \
+             DEFERRABLE INITIALLY DEFERRED)",
+            &[],
+        )
+        .unwrap();
+
+        let error = db
+            .transaction(|tx| {
+                tx.execute("INSERT INTO children (parent_id) VALUES (999)", &[])?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.contains("FOREIGN KEY"), "got: {error}");
+        assert_eq!(db.count(&QueryBuilder::table("children")).unwrap(), 0);
+        db.execute("CREATE TABLE after_failed_commit (id INTEGER)", &[])
+            .unwrap();
+    }
+
+    #[test]
+    fn transaction_panic_releases_the_only_pool_slot() {
+        let db = Db::memory().unwrap();
+        db.execute("CREATE TABLE items (id INTEGER)", &[]).unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = db.transaction(|_| -> Result<(), String> { panic!("application panic") });
+        }));
+
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = send.send(db.query("SELECT COUNT(*) FROM items", &[]));
+        });
+        let result = receive
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("panicking transaction leaked the pool's only slot");
+        result.unwrap();
+    }
+
+    #[test]
     fn count_exists_paginate_upsert() {
         let db = Db::memory().unwrap();
         db.migrate(&todos_schema()).unwrap();
@@ -990,17 +1061,19 @@ mod tests {
         assert!(page.has_next() && page.has_prev());
 
         // UPSERT on the primary key: second call updates, doesn't duplicate.
-        db.upsert(
-            "todos",
-            &[
-                ("id", Value::Int(1)),
-                ("title", Value::Text("upserted".into())),
-                ("done", Value::Bool(true)),
-            ],
-            "id",
-            "id",
-        )
-        .unwrap();
+        let upserted_id = db
+            .upsert(
+                "todos",
+                &[
+                    ("id", Value::Int(1)),
+                    ("title", Value::Text("upserted".into())),
+                    ("done", Value::Bool(true)),
+                ],
+                "id",
+                "id",
+            )
+            .unwrap();
+        assert_eq!(upserted_id, 1);
         assert_eq!(db.count(&QueryBuilder::table("todos")).unwrap(), 7);
         let row = db
             .query_one("SELECT title FROM todos WHERE id = 1", &[])

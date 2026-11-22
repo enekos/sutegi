@@ -419,14 +419,16 @@ fn columns_match(a: &Column, b: &Column, dialect: Dialect) -> bool {
 /// so a change that both backends store identically is not reported.
 pub fn diff(current: &[TableSchema], desired: &[TableSchema], dialect: Dialect) -> Plan {
     let mut plan = Plan::default();
+    let current: Vec<TableSchema> = current.iter().map(TableSchema::normalized).collect();
+    let desired: Vec<TableSchema> = desired.iter().map(TableSchema::normalized).collect();
 
     let find = |set: &[TableSchema], name: &str| -> Option<TableSchema> {
         set.iter().find(|t| t.table == name).cloned()
     };
 
     // Dropped tables: in current, gone from desired.
-    for cur in current {
-        if find(desired, &cur.table).is_none() {
+    for cur in &current {
+        if find(&desired, &cur.table).is_none() {
             plan.ops.push(SchemaOp::DropTable(cur.clone()));
             plan.warnings.push(format!(
                 "table `{}` is dropped — this destroys its data (down recreates the table empty)",
@@ -435,8 +437,8 @@ pub fn diff(current: &[TableSchema], desired: &[TableSchema], dialect: Dialect) 
         }
     }
 
-    for want in desired {
-        let Some(cur) = find(current, &want.table) else {
+    for want in &desired {
+        let Some(cur) = find(&current, &want.table) else {
             // Brand-new table: one CreateTable carries columns, indexes, and FKs.
             plan.ops.push(SchemaOp::CreateTable(want.clone()));
             continue;
@@ -476,12 +478,6 @@ fn diff_table(cur: &TableSchema, want: &TableSchema, dialect: Dialect, plan: &mu
         }
     }
 
-    for c in &dropped {
-        plan.ops.push(SchemaOp::DropColumn {
-            table: table.clone(),
-            column: (*c).clone(),
-        });
-    }
     for c in &added {
         let op = SchemaOp::AddColumn {
             table: table.clone(),
@@ -578,6 +574,13 @@ fn diff_table(cur: &TableSchema, want: &TableSchema, dialect: Dialect, plan: &mu
                 fk: want_fk.clone(),
             }),
         }
+    }
+
+    for c in &dropped {
+        plan.ops.push(SchemaOp::DropColumn {
+            table: table.clone(),
+            column: (*c).clone(),
+        });
     }
 }
 
@@ -710,12 +713,12 @@ pub fn render(
     before: &[TableSchema],
 ) -> Result<Vec<String>, String> {
     match dialect {
-        Dialect::Postgres => Ok(render_pg(op)),
+        Dialect::Postgres => Ok(render_pg(op, before)),
         Dialect::Sqlite => render_sqlite(op, before),
     }
 }
 
-fn render_pg(op: &SchemaOp) -> Vec<String> {
+fn render_pg(op: &SchemaOp, before: &[TableSchema]) -> Vec<String> {
     match op {
         SchemaOp::CreateTable(s) => {
             let mut stmts = vec![create_table_only(s, Dialect::Postgres)];
@@ -740,7 +743,24 @@ fn render_pg(op: &SchemaOp) -> Vec<String> {
             vec![format!("ALTER TABLE {table} RENAME COLUMN {from} TO {to}")]
         }
         SchemaOp::RenameTable { from, to } => {
-            vec![format!("ALTER TABLE {from} RENAME TO {to}")]
+            let mut stmts = vec![format!("ALTER TABLE {from} RENAME TO {to}")];
+            if let Some(schema) = before.iter().find(|s| s.table == *from) {
+                for column in schema.columns.iter().filter(|c| c.unique && !c.primary) {
+                    stmts.push(format!(
+                        "ALTER TABLE {to} RENAME CONSTRAINT {} TO {}",
+                        pg_unique_name(from, &column.name),
+                        pg_unique_name(to, &column.name)
+                    ));
+                }
+                for fk in &schema.foreign_keys {
+                    stmts.push(format!(
+                        "ALTER TABLE {to} RENAME CONSTRAINT {} TO {}",
+                        pg_fk_name(from, &fk.column),
+                        pg_fk_name(to, &fk.column)
+                    ));
+                }
+            }
+            stmts
         }
         SchemaOp::CreateIndex { table, index } => vec![create_index_sql(table, index)],
         SchemaOp::DropIndex { index, .. } => vec![format!("DROP INDEX {}", index.name)],
@@ -858,7 +878,23 @@ fn render_sqlite(op: &SchemaOp, before: &[TableSchema]) -> Result<Vec<String>, S
             stmts
         }
         SchemaOp::DropColumn { table, column } => {
-            vec![format!("ALTER TABLE {} DROP COLUMN {}", table, column.name)]
+            let needs_rebuild = before
+                .iter()
+                .find(|schema| schema.table == *table)
+                .is_some_and(|schema| {
+                    schema
+                        .col(&column.name)
+                        .is_some_and(|c| c.primary || c.unique)
+                        || schema
+                            .foreign_keys
+                            .iter()
+                            .any(|fk| fk.column == column.name)
+                });
+            if needs_rebuild {
+                sqlite_rebuild(op, table, before)?
+            } else {
+                vec![format!("ALTER TABLE {} DROP COLUMN {}", table, column.name)]
+            }
         }
         SchemaOp::RenameColumn { table, from, to } => {
             vec![format!("ALTER TABLE {table} RENAME COLUMN {from} TO {to}")]
@@ -1056,6 +1092,32 @@ mod tests {
     }
 
     #[test]
+    fn pg_table_rename_keeps_conventional_constraint_names_in_sync() {
+        let original = TableSchema::new("old_items")
+            .column(Column::new("id", ColType::Integer).primary())
+            .column(Column::new("slug", ColType::Text).unique())
+            .column(Column::new("owner_id", ColType::Integer))
+            .foreign_key("owner_id", "users", "id", FkAction::Cascade);
+        let sql = render(
+            &SchemaOp::RenameTable {
+                from: "old_items".into(),
+                to: "new_items".into(),
+            },
+            Dialect::Postgres,
+            &[original],
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            vec![
+                "ALTER TABLE old_items RENAME TO new_items",
+                "ALTER TABLE new_items RENAME CONSTRAINT old_items_slug_key TO new_items_slug_key",
+                "ALTER TABLE new_items RENAME CONSTRAINT old_items_owner_id_fkey TO new_items_owner_id_fkey",
+            ]
+        );
+    }
+
+    #[test]
     fn rename_shaped_change_warns_but_keeps_drop_add() {
         let a = vec![
             TableSchema::new("t")
@@ -1221,6 +1283,39 @@ mod ddl_tests {
         assert_eq!(rows[0].get("qty").unwrap(), &sutegi_json::Json::int(42));
         // And the schema is now the target.
         assert_eq!(db.introspect().unwrap()[0], altered.normalized());
+    }
+
+    #[test]
+    fn sqlite_drops_indexed_and_inline_unique_columns_without_losing_other_rows() {
+        let db = Db::memory().unwrap();
+        let original = TableSchema::new("items")
+            .column(Column::new("id", ColType::Integer).primary())
+            .column(Column::new("indexed", ColType::Text))
+            .column(Column::new("slug", ColType::Text).unique())
+            .index(&["indexed"]);
+        let desired =
+            TableSchema::new("items").column(Column::new("id", ColType::Integer).primary());
+        let mut shadow = Vec::new();
+        run_plan(
+            &db,
+            &mut shadow,
+            &diff(&[], std::slice::from_ref(&original), Dialect::Sqlite),
+            Dialect::Sqlite,
+        );
+        db.execute(
+            "INSERT INTO items (id, indexed, slug) VALUES (1, 'a', 'b')",
+            &[],
+        )
+        .unwrap();
+
+        run_plan(
+            &db,
+            &mut shadow,
+            &diff(&[original], std::slice::from_ref(&desired), Dialect::Sqlite),
+            Dialect::Sqlite,
+        );
+        assert_eq!(db.introspect().unwrap(), vec![desired.normalized()]);
+        assert_eq!(db.count(&QueryBuilder::table("items")).unwrap(), 1);
     }
 
     #[test]
