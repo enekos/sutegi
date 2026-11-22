@@ -816,6 +816,7 @@ impl Migrator {
         let _guard = self.acquire_lock(conn)?;
         self.ensure_history(conn)?;
         let applied = self.applied(conn)?;
+        self.check_integrity(&applied)?;
         if applied.is_empty() || batches == 0 {
             return Ok(Vec::new());
         }
@@ -1496,6 +1497,31 @@ mod tests {
     }
 
     #[test]
+    fn adding_a_unique_column_leaves_no_false_schema_drift() {
+        let db = Db::memory().unwrap();
+        let initial = Migrator::new().add(Migration::ops(
+            "0001_todos",
+            "create_todos",
+            crate::schema_diff::diff(&[], &[todos_v1()], Dialect::Sqlite).ops,
+        ));
+        initial.run(&db).unwrap();
+
+        let desired = TableSchema::new("todos")
+            .column(Column::new("id", ColType::Integer).primary())
+            .column(Column::new("title", ColType::Text))
+            .column(Column::new("slug", ColType::Text).nullable().unique());
+        let plan = generate(&initial, std::slice::from_ref(&desired), Dialect::Sqlite).unwrap();
+        let migrator = initial.add(Migration::ops("0002_add_slug", "add_slug", plan.ops));
+        migrator.run(&db).unwrap();
+        assert_eq!(db.introspect().unwrap(), vec![desired.normalized()]);
+        assert!(
+            generate(&migrator, std::slice::from_ref(&desired), Dialect::Sqlite)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn edited_applied_migration_trips_the_checksum_guard() {
         let db = Db::memory().unwrap();
         let v1 = crate::schema_diff::diff(&[], &[todos_v1()], Dialect::Sqlite);
@@ -1509,6 +1535,13 @@ mod tests {
         let m2 = Migrator::new().add(Migration::ops("0001_todos", "create_todos", tampered.ops));
         let err = m2.run(&db).unwrap_err();
         assert!(err.contains("modified after being applied"), "got: {err}");
+
+        // The down body is just as safety-critical: a changed migration may not
+        // run during rollback either, and the failed attempt must preserve both.
+        let err = m2.rollback(&db, 1).unwrap_err();
+        assert!(err.contains("modified after being applied"), "got: {err}");
+        assert_eq!(db.introspect().unwrap()[0], todos_v1().normalized());
+        assert!(m2.status(&db).unwrap()[0].applied);
 
         // repair re-stamps, and then run is clean again.
         m2.repair(&db).unwrap();
