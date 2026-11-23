@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Tiny zero-dependency JSON value, serializer, and parser for the sutegi framework."
+description = "JSON value type, parser, and serializer built on the Rust standard library for Sutegi applications."
 
 [dependencies]
 

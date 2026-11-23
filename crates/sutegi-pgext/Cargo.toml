@@ -6,8 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "PostgreSQL extensions in plain Rust: #[pg_function] + `sutegi pgext build`. A small C runtime keeps PostgreSQL errors from unwinding Rust frames. No bindgen, no third-party runtime crates."
-include = ["src/**", "csrc/**", "Cargo.toml"]
+description = "Write PostgreSQL extensions in Rust with #[pg_function], set-returning SQL functions, and parameterized queries through SPI."
+readme = "README.md"
+include = ["src/**", "csrc/**", "Cargo.toml", "README.md"]
 
 [features]
 # The extension build pipeline (scan, codegen, cargo + PGXS) used by the
@@ -15,8 +16,8 @@ include = ["src/**", "csrc/**", "Cargo.toml"]
 build = ["dep:sutegi-json"]
 
 [dependencies]
-sutegi-macros = { path = "../sutegi-macros", version = "0.15.0" }
-sutegi-json = { path = "../sutegi-json", version = "0.15.0", optional = true }
+sutegi-macros = { path = "../sutegi-macros", version = "0.16.0" }
+sutegi-json = { path = "../sutegi-json", version = "0.16.0", optional = true }
 
 [lints]
 workspace = true

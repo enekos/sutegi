@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-23
+
+### Added
+
+- `sutegi-pgext` and the `sutegi pgext` CLI commands build PostgreSQL extensions from Rust functions annotated with `#[pg_function]`. Extensions support scalar and set-returning functions, SQL errors, and parameterized SPI queries. The integration suite runs on PostgreSQL 14, 17, and 19. [Extension guide](docs/PGEXT.md)
+
+### Fixed
+
+- The extension builder preserves escaped SQL function names and Rust integer literals in planner hints, and generates distinct SQL argument names after PostgreSQL identifier truncation.
+- The ORM releases pooled connections after transaction panics, rolls back failed commits, and handles unique columns and renamed constraints in schema migrations. Batch rollback selects migrations belonging to the current migrator.
+
 ### Security
 
 - pgext now revokes `PUBLIC EXECUTE` on newly installed `security_definer` functions. Existing installations need an explicit privilege migration. [Migration SQL and example grants](docs/PGEXT.md#grant-access-to-a-definer-function)

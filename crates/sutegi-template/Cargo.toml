@@ -6,12 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "A small Blade-style template engine for sutegi: {{ escaped }} / {!! raw !!} interpolation, @if/@else, @foreach with loop metadata, @include partials — compiled once, rendered over JSON contexts. Zero third-party dependencies."
+description = "Compile and render Blade-style templates over JSON with HTML escaping, conditionals, loops, and partials."
 keywords = ["template", "blade", "html", "zero-dependency"]
 categories = ["template-engine", "web-programming"]
 
 [dependencies]
-sutegi-json = { path = "../sutegi-json", version = "0.15.0" }
+sutegi-json = { path = "../sutegi-json", version = "0.16.0" }
 
 [lints]
 workspace = true
