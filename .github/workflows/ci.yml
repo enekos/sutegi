@@ -150,17 +150,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      # benches/Cargo.toml path-depends on the sibling ../aatxe checkout, so
-      # both repos land side by side under the workspace.
       - uses: actions/checkout@v4
         with:
           path: sutegi
           fetch-depth: 0
-      - uses: actions/checkout@v4
-        with:
-          repository: enekos/aatxe
-          path: aatxe
-
       # Pinned by sutegi/rust-toolchain.toml, so HEAD and base bench on the
       # same compiler (once the base ref carries the file too).
       - name: Install Rust toolchain
@@ -172,10 +165,8 @@ jobs:
           workspaces: sutegi/benches
 
       - name: Install aatxe CLI
-        # The installer is a bash script (pipefail); dash chokes on it.
-        run: |
-          curl -fsSL https://raw.githubusercontent.com/enekos/aatxe/master/scripts/install.sh | bash
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        working-directory: sutegi
+        run: make install-bench-cli check-bench-cli
 
       - name: Bench HEAD
         run: |
@@ -190,7 +181,11 @@ jobs:
         if: github.event_name == 'pull_request'
         run: |
           cd sutegi
+          # Older base commits require a sibling SDK checkout. Use the registry
+          # SDK selected for HEAD when comparing across that migration.
+          sdk_pin=$(sed -n '/^aatxe-bench = "=/p' benches/Cargo.toml)
           git checkout "origin/${{ github.base_ref }}"
+          sed -i "s|^aatxe-bench = { path = \"../../aatxe/sdk/rust\" }$|$sdk_pin|" benches/Cargo.toml
           make -s bench > /tmp/base.json
 
       - name: Compare (fail on regression)
