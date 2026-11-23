@@ -9,6 +9,7 @@ use std::fmt;
 enum Tok {
     Ident(String),
     Punct(char),
+    Str { body: String, raw: bool },
     Lit(String),
     Lifetime,
     Doc(String),
@@ -92,19 +93,12 @@ fn lex(src: &str) -> Result<Vec<Token>, (usize, String)> {
         } else if c == '"' {
             let start_line = line;
             i += 1;
-            let mut s = String::new();
+            let begin = i;
             loop {
                 match at(i) {
                     Some('\\') => {
-                        if let Some(n) = at(i + 1) {
-                            s.push(match n {
-                                'n' => '\n',
-                                't' => '\t',
-                                other => other,
-                            });
-                            if n == '\n' {
-                                line += 1;
-                            }
+                        if at(i + 1) == Some('\n') {
+                            line += 1;
                         }
                         i += 2;
                     }
@@ -116,14 +110,16 @@ fn lex(src: &str) -> Result<Vec<Token>, (usize, String)> {
                         if ch == '\n' {
                             line += 1;
                         }
-                        s.push(ch);
                         i += 1;
                     }
                     None => return Err((start_line, "unterminated string".into())),
                 }
             }
             out.push(Token {
-                tok: Tok::Lit(s),
+                tok: Tok::Str {
+                    body: chars[begin..i - 1].iter().collect(),
+                    raw: false,
+                },
                 line: start_line,
             });
         } else if c == '\'' {
@@ -207,7 +203,7 @@ fn lex(src: &str) -> Result<Vec<Token>, (usize, String)> {
                 let s: String = chars[begin..i].iter().collect();
                 i += 1 + hashes;
                 out.push(Token {
-                    tok: Tok::Lit(s),
+                    tok: Tok::Str { body: s, raw: true },
                     line: start_line,
                 });
             } else if matches!(word.as_str(), "b" | "c") && at(i) == Some('"') {
@@ -464,6 +460,57 @@ struct Options {
     rows: Option<u32>,
 }
 
+/// The macro permits only SQL identifier characters in the decoded name.
+/// Hex, Unicode and line continuation are the Rust escapes that can produce one.
+fn sql_name(mut body: &str) -> Option<String> {
+    let mut name = String::new();
+    while let Some((prefix, escape)) = body.split_once('\\') {
+        name.push_str(prefix);
+        if let Some(rest) = escape.strip_prefix('x') {
+            let (hex, tail) = rest.split_at_checked(2)?;
+            name.push(char::from(u8::from_str_radix(hex, 16).ok()?));
+            body = tail;
+        } else if let Some(rest) = escape.strip_prefix("u{") {
+            let (hex, tail) = rest.split_once('}')?;
+            let value = u32::from_str_radix(&hex.replace('_', ""), 16).ok()?;
+            name.push(char::from_u32(value)?);
+            body = tail;
+        } else {
+            let tail = escape
+                .strip_prefix("\r\n")
+                .or_else(|| escape.strip_prefix('\n'))?;
+            body = tail.trim_start_matches([' ', '\t', '\r', '\n']);
+        }
+    }
+    name.push_str(body);
+    Some(name)
+}
+
+/// Read the numeric value independently of its Rust radix, separators and suffix.
+/// The attribute macro validates the literal syntax before the extension is linked.
+fn planner_hint(literal: &str) -> Option<u32> {
+    let (radix, digits) = match literal.as_bytes() {
+        [b'0', b'x', ..] => (16, &literal[2..]),
+        [b'0', b'o', ..] => (8, &literal[2..]),
+        [b'0', b'b', ..] => (2, &literal[2..]),
+        _ => (10, literal),
+    };
+    let end = digits
+        .find(|c: char| c != '_' && !c.is_digit(radix))
+        .unwrap_or(digits.len());
+    let (digits, suffix) = digits.split_at(end);
+    // An exponent is part of a decimal float, even without a decimal point.
+    let exponent = radix == 10
+        && suffix.strip_prefix(['e', 'E']).is_some_and(|s| {
+            s.trim_start_matches('_')
+                .starts_with(|c: char| c.is_ascii_digit())
+        });
+    if exponent || (!suffix.is_empty() && !suffix.starts_with(char::is_alphabetic)) {
+        return None;
+    }
+    u32::from_str_radix(&digits.replace('_', ""), radix).ok()
+}
+
 fn options(p: &Parser<'_>, toks: &[Token]) -> Result<Options, ScanError> {
     let mut o = Options::default();
     for part in toks.split(|t| t.tok == Tok::Punct(',')) {
@@ -481,12 +528,24 @@ fn options(p: &Parser<'_>, toks: &[Token]) -> Result<Options, ScanError> {
                 "security_definer" => o.security_definer = true,
                 other => return Err(p.err(format!("unknown pg_function option '{other}'"))),
             },
-            [Tok::Ident(k), Tok::Punct('='), Tok::Lit(v)] => match k.as_str() {
-                "name" => o.name = Some(v.clone()),
-                "cost" => o.cost = Some(v.parse().map_err(|_| p.err("cost must be an integer"))?),
-                "rows" => o.rows = Some(v.parse().map_err(|_| p.err("rows must be an integer"))?),
-                other => return Err(p.err(format!("unknown pg_function option '{other}'"))),
-            },
+            [Tok::Ident(k), Tok::Punct('='), Tok::Str { body, raw }] if k == "name" => {
+                o.name = Some(if *raw {
+                    body.clone()
+                } else {
+                    sql_name(body).ok_or_else(|| p.err("invalid escape in SQL function name"))?
+                });
+            }
+            [Tok::Ident(k), Tok::Punct('='), Tok::Lit(v)] => {
+                let hint = match k.as_str() {
+                    "cost" => &mut o.cost,
+                    "rows" => &mut o.rows,
+                    other => return Err(p.err(format!("unknown pg_function option '{other}'"))),
+                };
+                *hint =
+                    Some(planner_hint(v).ok_or_else(|| {
+                        p.err(format!("{k} must be an integer in the u32 range"))
+                    })?);
+            }
             _ => return Err(p.err("can't read the pg_function options")),
         }
     }
@@ -562,7 +621,7 @@ fn signature(p: &mut Parser<'_>, opts: Options, doc: String) -> Result<Function,
                 message: "a pg_function can't take self".into(),
             });
         };
-        let name = match &chunk[..colon] {
+        let mut name = match &chunk[..colon] {
             [
                 Token {
                     tok: Tok::Ident(n), ..
@@ -578,11 +637,14 @@ fn signature(p: &mut Parser<'_>, opts: Options, doc: String) -> Result<Function,
             ] if n != "_" => n.trim_start_matches('_').to_owned(),
             _ => String::new(),
         };
-        let name = if name.is_empty() {
-            format!("arg{}", index + 1)
-        } else {
-            name
-        };
+        // PostgreSQL truncates identifiers to 63 bytes at a character boundary.
+        // Compare the names callers will actually see, including prior fallbacks.
+        name.truncate(name.floor_char_boundary(63));
+        let mut position = index + 1;
+        while name.is_empty() || params.iter().any(|p: &Param| p.name == name) {
+            name = format!("arg{position}");
+            position += 1;
+        }
         let mut sub = Parser {
             toks: &chunk[colon + 1..],
             pos: 0,
@@ -594,11 +656,6 @@ fn signature(p: &mut Parser<'_>, opts: Options, doc: String) -> Result<Function,
             line: chunk[colon].line,
             message: format!("parameter '{name}' has an unsupported type; {TYPES_HINT}"),
         })?;
-        let name = if params.iter().any(|p: &Param| p.name == name) {
-            format!("arg{}", index + 1)
-        } else {
-            name
-        };
         params.push(Param {
             name,
             sql_type,
@@ -827,6 +884,47 @@ mod tests {
         let f = one("#[pg_function] fn f(_a: i32, a: i32) {}");
         let names: Vec<_> = f.params.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["a", "arg2"]);
+    }
+
+    #[test]
+    fn generated_parameter_names_skip_occupied_positions() {
+        let f = one("#[pg_function] fn f(arg4: i32, arg5: i32, arg6: i32, _arg4: i32, _: i32) {}");
+        let names: Vec<_> = f.params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["arg4", "arg5", "arg6", "arg7", "arg8"]);
+    }
+
+    #[test]
+    fn parameter_names_stay_distinct_after_postgres_truncation() {
+        let prefix = "a".repeat(62);
+        let f = one(&format!(
+            "#[pg_function] fn f({prefix}é: i32, {prefix}ê: i32) {{}}"
+        ));
+        assert_eq!(f.params[0].name, prefix);
+        assert_eq!(f.params[1].name, "arg2");
+    }
+
+    #[test]
+    fn escaped_sql_names_match_rust_strings() {
+        let f = one(r#"#[pg_function(name = "line\x5f\u{74}o\
+                           tal")] fn f() {}"#);
+        assert_eq!(f.sql_name, "line_total");
+        assert_eq!(
+            one(r##"#[pg_function(name = r#"raw_name"#)] fn f() {}"##).sql_name,
+            "raw_name"
+        );
+    }
+
+    #[test]
+    fn planner_hints_match_rust_integers() {
+        let f = one("#[pg_function(rows = 1_000, cost = 0x1_f4u32)] fn f() -> SetOf<i32> {}");
+        assert_eq!((f.rows, f.cost), (Some(1000), Some(500)));
+        let f = one("#[pg_function(rows = 0b1_01, cost = 0o12)] fn f() -> SetOf<i32> {}");
+        assert_eq!((f.rows, f.cost), (Some(5), Some(10)));
+        for invalid in ["4_294_967_296", "1.5", "1e3"] {
+            assert!(
+                fails(&format!("#[pg_function(cost = {invalid})] fn f() {{}}")).contains("cost")
+            );
+        }
     }
 
     #[test]
