@@ -171,6 +171,8 @@ jobs:
           echo "$PWD/benches/target/aatxe/bin" >> "$GITHUB_PATH"
 
       - name: Bench HEAD
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/bench-head
         run: |
           cd sutegi
           # Stash the accepted-regressions list now, while the PR tree is
@@ -181,6 +183,8 @@ jobs:
 
       - name: Bench base
         if: github.event_name == 'pull_request'
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/bench-base
         run: |
           cd sutegi
           # Older base commits require a sibling SDK checkout. Use the registry
@@ -188,16 +192,26 @@ jobs:
           sdk_pin=$(sed -n '/^aatxe-bench = "=/p' benches/Cargo.toml)
           git checkout "origin/${{ github.base_ref }}"
           sed -i "s|^aatxe-bench = { path = \"../../aatxe/sdk/rust\" }$|$sdk_pin|" benches/Cargo.toml
-          make -s bench > /tmp/base.json
+          make -s bench > /dev/null
 
       - name: Compare (fail on regression)
         if: github.event_name == 'pull_request'
         run: |
           set -euo pipefail
+          # Both release binaries are warm. Alternate which one runs first so
+          # time-dependent host load affects both sides of the comparison.
+          for round in 1 2 3 4 5; do
+            sides=(base head)
+            if (( round % 2 == 0 )); then sides=(head base); fi
+            for side in "${sides[@]}"; do
+              "$RUNNER_TEMP/bench-$side/release/sutegi-bench" > "/tmp/$side-$round.json"
+            done
+          done
+
           # Produce the report without --fail-on-regression; we decide the exit
           # code ourselves so accepted regressions (benches/perf-accepted.txt)
           # don't fail the gate while everything else still does.
-          aatxe compare --base /tmp/base.json --head /tmp/head.json \
+          aatxe compare --base /tmp/base-{1..5}.json --head /tmp/head-{1..5}.json \
             --out /tmp/compare.json --markdown /tmp/compare.md \
             --threshold 0.10
           # Print to the job log *and* the step summary, so a regression is
