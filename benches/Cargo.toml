@@ -1,6 +1,6 @@
 # Standalone bench runner — its own workspace so it doesn't perturb sutegi's
 # build/test/publish. Uses Eneko's aatxe statistical-microbenchmark SDK
-# (path dependency on the sibling repo). Run with: `make bench` (see below) or
+# from crates.io. Run with `make bench` or
 #   cargo run --release --bin sutegi-bench
 [workspace]
 
@@ -19,7 +19,7 @@ path = "src/main.rs"
 # the pure-std Postgres driver for the (env-gated) pg_* benches.
 sutegi = { path = "../crates/sutegi", features = ["sqlite", "postgres", "ws"] }
 # aatxe statistical microbench SDK (adaptive sampling, CV-gated, JSON RunReport).
-aatxe-bench = { path = "../../aatxe/sdk/rust" }
+aatxe-bench = "=0.2.0"
 
 [features]
 # Mirrors the facade feature so `#[cfg(feature = "postgres")]` gates the pg_*

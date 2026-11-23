@@ -150,17 +150,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      # benches/Cargo.toml path-depends on the sibling ../aatxe checkout, so
-      # both repos land side by side under the workspace.
       - uses: actions/checkout@v4
         with:
           path: sutegi
           fetch-depth: 0
-      - uses: actions/checkout@v4
-        with:
-          repository: enekos/aatxe
-          path: aatxe
-
       # Pinned by sutegi/rust-toolchain.toml, so HEAD and base bench on the
       # same compiler (once the base ref carries the file too).
       - name: Install Rust toolchain
@@ -172,12 +165,14 @@ jobs:
           workspaces: sutegi/benches
 
       - name: Install aatxe CLI
-        # The installer is a bash script (pipefail); dash chokes on it.
+        working-directory: sutegi
         run: |
-          curl -fsSL https://raw.githubusercontent.com/enekos/aatxe/master/scripts/install.sh | bash
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          make install-bench-cli check-bench-cli
+          echo "$PWD/benches/target/aatxe/bin" >> "$GITHUB_PATH"
 
       - name: Bench HEAD
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/bench-head
         run: |
           cd sutegi
           # Stash the accepted-regressions list now, while the PR tree is
@@ -188,19 +183,35 @@ jobs:
 
       - name: Bench base
         if: github.event_name == 'pull_request'
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/bench-base
         run: |
           cd sutegi
+          # Older base commits require a sibling SDK checkout. Use the registry
+          # SDK selected for HEAD when comparing across that migration.
+          sdk_pin=$(sed -n '/^aatxe-bench = "=/p' benches/Cargo.toml)
           git checkout "origin/${{ github.base_ref }}"
-          make -s bench > /tmp/base.json
+          sed -i "s|^aatxe-bench = { path = \"../../aatxe/sdk/rust\" }$|$sdk_pin|" benches/Cargo.toml
+          make -s bench > /dev/null
 
       - name: Compare (fail on regression)
         if: github.event_name == 'pull_request'
         run: |
           set -euo pipefail
+          # Both release binaries are warm. Alternate which one runs first so
+          # time-dependent host load affects both sides of the comparison.
+          for round in 1 2 3 4 5; do
+            sides=(base head)
+            if (( round % 2 == 0 )); then sides=(head base); fi
+            for side in "${sides[@]}"; do
+              "$RUNNER_TEMP/bench-$side/release/sutegi-bench" > "/tmp/$side-$round.json"
+            done
+          done
+
           # Produce the report without --fail-on-regression; we decide the exit
           # code ourselves so accepted regressions (benches/perf-accepted.txt)
           # don't fail the gate while everything else still does.
-          aatxe compare --base /tmp/base.json --head /tmp/head.json \
+          aatxe compare --base /tmp/base-{1..5}.json --head /tmp/head-{1..5}.json \
             --out /tmp/compare.json --markdown /tmp/compare.md \
             --threshold 0.10
           # Print to the job log *and* the step summary, so a regression is
