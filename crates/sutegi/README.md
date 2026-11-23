@@ -1,37 +1,41 @@
-# sutegi
+# Sutegi
 
-A **zero-dependency, agent-native web framework for Rust** — batteries-included
-ergonomics, built from `std` up. No tokio, no serde, no hyper.
+Sutegi is a Rust web framework for building HTTP services and exposing application
+tools to AI agents. Its HTTP/1.1 server, router, and JSON codec use the standard
+library. An application can publish its route and tool descriptions as JSON
+through guarded discovery endpoints.
+
+## Quickstart
+
+With Rust 1.100 or newer, add Sutegi to a binary crate.
+
+```toml
+[dependencies]
+sutegi = "0.16"
+```
 
 ```rust
 use sutegi::prelude::*;
 
 fn main() -> std::io::Result<()> {
     App::new("hello")
-        .get("/", "Health check", |_req, _p| text(200, "sutegi up"))
-        .run_graceful("0.0.0.0:8080")
+        .get("/", "Greet the caller", |_| "Hello from Sutegi!")
+        .serve()
 }
 ```
 
-- **Zero runtime dependencies.** Hand-built HTTP/1.1 server, JSON, and router on
-  `std`. Core binary ~362 KB.
-- **Agent-native.** `GET /__introspect` (full app surface), `GET /__tools`
-  (LLM tool-calling manifest), `POST /__tools/:name[/stream]` (invoke / SSE).
-- **Composable.** Every pillar is an opt-in feature: `orm`, `derive`,
-  `validate`, `ai`, `queue` (default) + `sqlite`, `graceful`, `hex`.
+Run `cargo run -- 127.0.0.1:8080` and open `http://127.0.0.1:8080/`.
 
-```toml
-# minimal HTTP service:
-sutegi = { version = "0.1", default-features = false }
-# with the runnable SQLite ORM + graceful shutdown:
-sutegi = { version = "0.1", features = ["sqlite", "graceful"] }
-```
+The default features are `derive`, `orm`, and `validate`. Enable `sqlite` or
+`postgres` to run database queries, `queue` for durable background jobs, or `ws`
+for WebSockets. For a service that only needs the HTTP core, set
+`default-features = false`.
 
-Pillars: routing & middleware · ORM + query builder + `#[derive(Model)]` ·
-validation · streaming/SSE · background jobs · hexagonal toolkit · built-in
-health/readiness/metrics + graceful shutdown.
+To write a function that runs inside PostgreSQL, use the companion
+[sutegi-pgext crate](https://crates.io/crates/sutegi-pgext).
 
-Full docs, examples, and the agent contract:
-<https://github.com/enekos/sutegi>
+[Tutorial](https://github.com/enekos/sutegi/blob/v0.16.0/docs/TUTORIAL.md) ·
+[Feature reference](https://docs.rs/sutegi/0.16.0/sutegi/) ·
+[Agent API](https://github.com/enekos/sutegi/blob/v0.16.0/AGENTS.md)
 
 MIT © 2026 Eneko Sarasola

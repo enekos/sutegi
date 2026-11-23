@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Structured, context-carrying logging for sutegi: levels, per-target filters, JSON or text lines, request/job scopes."
+description = "Structured logging for Sutegi with JSON and text output, per-target filters, and request and job context."
 
 [dependencies]
 

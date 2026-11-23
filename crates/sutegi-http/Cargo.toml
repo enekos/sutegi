@@ -2,13 +2,13 @@
 name = "sutegi-http"
 # 0.1.1: server hardening (Limits, panic isolation, timeouts) added after the
 # 0.1.0 publish. Dependents request "^0.1.0" and resolve up to this.
-version = "0.15.0"
+version = "0.16.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Zero-dependency HTTP/1.1 parser and thread-pool server (std::net only) for sutegi."
+description = "HTTP/1.1 parser and blocking server built on std::net, with a bounded worker pool and streaming request and response bodies."
 
 [dependencies]
 

@@ -6,12 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Actor processes and supervision trees for sutegi: typed mailboxes over std mpsc, crash capture, OTP-style restart strategies, zero third-party dependencies."
+description = "Typed actor mailboxes and supervision trees with configurable restart strategies for Sutegi applications."
 keywords = ["actors", "supervision", "fault-tolerance", "zero-dependency"]
 categories = ["concurrency"]
 
 [dependencies]
-sutegi-json = { path = "../sutegi-json", version = "0.15.0" }
+sutegi-json = { path = "../sutegi-json", version = "0.16.0" }
 
 [lints]
 workspace = true

@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Derive macros for sutegi (#[derive(Model)]). Compile-time only — adds nothing to your runtime binary."
+description = "Procedural macros for Sutegi models, validation rules, and Rust functions exported to PostgreSQL with #[pg_function]."
 
 [lib]
 proc-macro = true

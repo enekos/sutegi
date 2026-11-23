@@ -1,6 +1,6 @@
 [package]
 name = "sutegi-ws"
-description = "WebSockets for sutegi: RFC 6455 codec + a sharded kqueue/epoll reactor that holds each idle connection in a few hundred bytes instead of a thread"
+description = "WebSocket framing and connection handling for Sutegi, with a sharded epoll or kqueue reactor and bounded send queues."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,9 +9,9 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-sutegi-crypto = { version = "0.15.0", path = "../sutegi-crypto" }
-sutegi-http = { version = "0.15.0", path = "../sutegi-http" }
-sutegi-log = { path = "../sutegi-log", version = "0.15.0" }
+sutegi-crypto = { version = "0.16.0", path = "../sutegi-crypto" }
+sutegi-http = { version = "0.16.0", path = "../sutegi-http" }
+sutegi-log = { path = "../sutegi-log", version = "0.16.0" }
 # The one non-Rust-std ingredient: raw kqueue/epoll/pipe syscalls. Same
 # posture as sutegi-web's `graceful` feature — libc is a binding, not a
 # framework, and there is no std API for readiness-based I/O.
