@@ -797,7 +797,8 @@ so an LLM can extend a sutegi app correctly with minimal context.
 
 Hot-path microbenchmarks via [aatxe](https://github.com/enekos/aatxe) (adaptive,
 CV-gated sampling; emits a statistical `RunReport`). Run with `make bench`. For comparisons,
-install the matching CLI with `make install-bench-cli` and run `make bench-compare`.
+run `make install-bench-cli` to install the matching CLI under `benches/target`,
+then run `make bench-compare`.
 Indicative `--release` numbers from a dev machine:
 
 | Bench | Median | ops/sec |

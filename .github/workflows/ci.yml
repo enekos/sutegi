@@ -166,7 +166,9 @@ jobs:
 
       - name: Install aatxe CLI
         working-directory: sutegi
-        run: make install-bench-cli check-bench-cli
+        run: |
+          make install-bench-cli check-bench-cli
+          echo "$PWD/benches/target/aatxe/bin" >> "$GITHUB_PATH"
 
       - name: Bench HEAD
         run: |

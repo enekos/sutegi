@@ -1,4 +1,5 @@
-AATXE_BIN ?= aatxe
+AATXE_ROOT := benches/target/aatxe
+AATXE_BIN ?= $(or $(wildcard $(AATXE_ROOT)/bin/aatxe),aatxe)
 AATXE_CLI_VERSION := 0.2.0
 
 .PHONY: build test run release size install-hooks install-bench-cli check-bench-cli bench bench-baseline bench-compare clean
@@ -33,7 +34,7 @@ bench-baseline:
 	@echo "baseline written to benches/baselines/local.json"
 
 install-bench-cli:
-	cargo install aatxe --locked --version '=$(AATXE_CLI_VERSION)'
+	cargo install --root "$(AATXE_ROOT)" aatxe --locked --version '=$(AATXE_CLI_VERSION)'
 
 check-bench-cli:
 	@version=$$("$(AATXE_BIN)" --version) && [ "$$version" = "aatxe $(AATXE_CLI_VERSION)" ] || { \
